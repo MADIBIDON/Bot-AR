@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import ForeignKey, Index, func, text
+from sqlalchemy import CheckConstraint, ForeignKey, Index, func, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -63,6 +63,9 @@ class Product(Base):
     listings: Mapped[list[Listing]] = relationship(
         back_populates="product", cascade="all, delete-orphan"
     )
+    watch_rules: Mapped[list[WatchRule]] = relationship(
+        back_populates="product", cascade="all, delete-orphan"
+    )
 
     def __repr__(self) -> str:
         return f"Product(id={self.id!r}, name={self.name!r}, ean={self.ean!r})"
@@ -110,9 +113,61 @@ class Listing(Base):
 
     product: Mapped[Product] = relationship(back_populates="listings")
     merchant: Mapped[Merchant] = relationship(back_populates="listings")
+    watch_rules: Mapped[list[WatchRule]] = relationship(back_populates="listing")
 
     def __repr__(self) -> str:
         return (
             f"Listing(id={self.id!r}, product_id={self.product_id!r}, "
             f"merchant_id={self.merchant_id!r})"
+        )
+
+
+class WatchRule(Base):
+    """A monitoring rule: which product (optionally scoped to one listing) to
+    watch, at what price targets, how often, and whether it is active.
+
+    No scraping, Discord, or purchase logic here — the monitoring engine
+    reads these rules in a later phase; this model only stores and validates
+    them. Cross-field validation (listing must belong to the same product)
+    cannot be expressed as a column constraint and is enforced in
+    database/crud.py instead.
+    """
+
+    __tablename__ = "watch_rules"
+    __table_args__ = (
+        CheckConstraint(
+            "target_price IS NULL OR target_price > 0",
+            name="ck_watch_rule_target_price_positive",
+        ),
+        CheckConstraint(
+            "max_price IS NULL OR max_price > 0",
+            name="ck_watch_rule_max_price_positive",
+        ),
+        CheckConstraint("check_interval > 0", name="ck_watch_rule_check_interval_positive"),
+        CheckConstraint("max_quantity > 0", name="ck_watch_rule_max_quantity_positive"),
+        CheckConstraint("priority >= 0 AND priority <= 10", name="ck_watch_rule_priority_range"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), nullable=False)
+    listing_id: Mapped[int | None] = mapped_column(ForeignKey("listings.id"), default=None)
+
+    target_price: Mapped[float | None] = mapped_column(default=None)
+    max_price: Mapped[float | None] = mapped_column(default=None)
+
+    enabled: Mapped[bool] = mapped_column(default=True, nullable=False)
+    check_interval: Mapped[int] = mapped_column(nullable=False)
+    max_quantity: Mapped[int] = mapped_column(nullable=False)
+    priority: Mapped[int] = mapped_column(default=5, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+    product: Mapped[Product] = relationship(back_populates="watch_rules")
+    listing: Mapped[Listing | None] = relationship(back_populates="watch_rules")
+
+    def __repr__(self) -> str:
+        return (
+            f"WatchRule(id={self.id!r}, product_id={self.product_id!r}, "
+            f"listing_id={self.listing_id!r}, enabled={self.enabled!r})"
         )

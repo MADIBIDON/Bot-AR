@@ -4,7 +4,7 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from database.models import Listing, Merchant, Product
+from database.models import Listing, Merchant, Product, WatchRule
 
 
 def test_create_merchant_product_listing(session: Session) -> None:
@@ -190,3 +190,93 @@ def test_listing_url_can_change_when_external_id_known(session: Session) -> None
     session.refresh(listing)
     assert listing.url == "https://a.example/new-slug"
     assert listing.external_id == "SKU-123"
+
+
+def test_watch_rule_requires_a_product(session: Session) -> None:
+    session.add(WatchRule(check_interval=300, max_quantity=1))
+    with pytest.raises(IntegrityError):
+        session.commit()
+
+
+def test_watch_rule_global_without_listing(session: Session) -> None:
+    product = Product(name="Duopack Evoli 30 ans")
+    session.add(product)
+    session.commit()
+
+    rule = WatchRule(product_id=product.id, check_interval=300, max_quantity=2)
+    session.add(rule)
+    session.commit()
+
+    assert rule.listing_id is None
+    assert rule in product.watch_rules
+
+
+def test_watch_rule_targeted_on_listing(session: Session) -> None:
+    merchant = Merchant(name="RetailerA")
+    product = Product(name="Duopack Evoli 30 ans")
+    session.add_all([merchant, product])
+    session.commit()
+    listing = Listing(product_id=product.id, merchant_id=merchant.id, url="https://a.example/p/1")
+    session.add(listing)
+    session.commit()
+
+    rule = WatchRule(
+        product_id=product.id, listing_id=listing.id, check_interval=300, max_quantity=1
+    )
+    session.add(rule)
+    session.commit()
+
+    assert rule in listing.watch_rules
+    assert rule.listing.id == listing.id
+
+
+def test_watch_rule_target_price_must_be_positive(session: Session) -> None:
+    product = Product(name="Duopack Evoli 30 ans")
+    session.add(product)
+    session.commit()
+
+    session.add(
+        WatchRule(product_id=product.id, target_price=0, check_interval=300, max_quantity=1)
+    )
+    with pytest.raises(IntegrityError):
+        session.commit()
+
+
+def test_watch_rule_max_price_must_be_positive(session: Session) -> None:
+    product = Product(name="Duopack Evoli 30 ans")
+    session.add(product)
+    session.commit()
+
+    session.add(WatchRule(product_id=product.id, max_price=-1, check_interval=300, max_quantity=1))
+    with pytest.raises(IntegrityError):
+        session.commit()
+
+
+def test_watch_rule_check_interval_must_be_positive(session: Session) -> None:
+    product = Product(name="Duopack Evoli 30 ans")
+    session.add(product)
+    session.commit()
+
+    session.add(WatchRule(product_id=product.id, check_interval=0, max_quantity=1))
+    with pytest.raises(IntegrityError):
+        session.commit()
+
+
+def test_watch_rule_max_quantity_must_be_positive(session: Session) -> None:
+    product = Product(name="Duopack Evoli 30 ans")
+    session.add(product)
+    session.commit()
+
+    session.add(WatchRule(product_id=product.id, check_interval=300, max_quantity=0))
+    with pytest.raises(IntegrityError):
+        session.commit()
+
+
+def test_watch_rule_priority_must_be_within_bounds(session: Session) -> None:
+    product = Product(name="Duopack Evoli 30 ans")
+    session.add(product)
+    session.commit()
+
+    session.add(WatchRule(product_id=product.id, check_interval=300, max_quantity=1, priority=11))
+    with pytest.raises(IntegrityError):
+        session.commit()
