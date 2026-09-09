@@ -9,6 +9,8 @@ description = "Retail opportunity monitoring and assisted-purchase system."
 requires-python = ">=3.11"
 dependencies = [
     "sqlalchemy>=2.0",
+    "discord.py>=2.4,<3",
+    "python-dotenv>=1.0,<2",
 ]
 
 [project.optional-dependencies]
