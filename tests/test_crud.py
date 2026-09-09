@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pytest
 from sqlalchemy.orm import Session
 
@@ -40,17 +42,17 @@ def test_list_products_filtered_by_status(session: Session) -> None:
 
 
 def test_update_product(session: Session) -> None:
-    product = crud.create_product(session, "Duopack Evoli 30 ans", max_price=14.99)
+    product = crud.create_product(session, "Duopack Evoli 30 ans", max_price=Decimal("14.99"))
 
-    updated = crud.update_product(session, product.id, max_price=12.99, status="paused")
+    updated = crud.update_product(session, product.id, max_price=Decimal("12.99"), status="paused")
 
     assert updated is not None
-    assert updated.max_price == 12.99
+    assert updated.max_price == Decimal("12.99")
     assert updated.status == "paused"
 
 
 def test_update_product_missing_returns_none(session: Session) -> None:
-    assert crud.update_product(session, 999, max_price=1.0) is None
+    assert crud.update_product(session, 999, max_price=Decimal("1.0")) is None
 
 
 def test_create_merchant(session: Session) -> None:
@@ -105,8 +107,8 @@ def test_create_watch_rule_valid(session: Session) -> None:
     rule = crud.create_watch_rule(
         session,
         product_id=product.id,
-        target_price=13.99,
-        max_price=14.99,
+        target_price=Decimal("13.99"),
+        max_price=Decimal("14.99"),
         check_interval=300,
         max_quantity=4,
         priority=7,
@@ -114,8 +116,8 @@ def test_create_watch_rule_valid(session: Session) -> None:
 
     fetched = crud.get_watch_rule(session, rule.id)
     assert fetched is not None
-    assert fetched.target_price == 13.99
-    assert fetched.max_price == 14.99
+    assert fetched.target_price == Decimal("13.99")
+    assert fetched.max_price == Decimal("14.99")
     assert fetched.priority == 7
     assert fetched.enabled is True
 
@@ -203,13 +205,17 @@ def test_enable_watch_rule_missing_returns_none(session: Session) -> None:
 def test_update_watch_rule(session: Session) -> None:
     product = crud.create_product(session, "Duopack Evoli 30 ans")
     rule = crud.create_watch_rule(
-        session, product_id=product.id, target_price=13.99, check_interval=300, max_quantity=1
+        session,
+        product_id=product.id,
+        target_price=Decimal("13.99"),
+        check_interval=300,
+        max_quantity=1,
     )
 
-    updated = crud.update_watch_rule(session, rule.id, target_price=12.49, priority=9)
+    updated = crud.update_watch_rule(session, rule.id, target_price=Decimal("12.49"), priority=9)
 
     assert updated is not None
-    assert updated.target_price == 12.49
+    assert updated.target_price == Decimal("12.49")
     assert updated.priority == 9
 
 

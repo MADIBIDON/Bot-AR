@@ -5,10 +5,16 @@ Every function takes an explicit Session — no global/implicit session state.
 
 from __future__ import annotations
 
+from decimal import Decimal
+from typing import TYPE_CHECKING
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from database.models import Listing, Merchant, Product, WatchRule
+from database.models import Listing, Merchant, ObservationRecord, Product, WatchRule
+
+if TYPE_CHECKING:
+    from products.observation import ProductObservation
 
 
 def create_merchant(session: Session, name: str, website_url: str | None = None) -> Merchant:
@@ -34,9 +40,9 @@ def create_product(
     mpn: str | None = None,
     keywords: str | None = None,
     image_url: str | None = None,
-    target_price: float | None = None,
-    max_price: float | None = None,
-    estimated_resale_price: float | None = None,
+    target_price: Decimal | None = None,
+    max_price: Decimal | None = None,
+    estimated_resale_price: Decimal | None = None,
     max_quantity: int | None = None,
     priority: int = 0,
     status: str = "active",
@@ -138,8 +144,8 @@ def create_watch_rule(
     check_interval: int,
     max_quantity: int,
     listing_id: int | None = None,
-    target_price: float | None = None,
-    max_price: float | None = None,
+    target_price: Decimal | None = None,
+    max_price: Decimal | None = None,
     priority: int = 5,
     enabled: bool = True,
 ) -> WatchRule:
@@ -201,3 +207,35 @@ def enable_watch_rule(session: Session, watch_rule_id: int) -> WatchRule | None:
 
 def disable_watch_rule(session: Session, watch_rule_id: int) -> WatchRule | None:
     return update_watch_rule(session, watch_rule_id, enabled=False)
+
+
+def create_observation_record(
+    session: Session, *, listing_id: int, observation: ProductObservation
+) -> ObservationRecord:
+    record = ObservationRecord(
+        listing_id=listing_id,
+        external_id=observation.external_id,
+        name=observation.name,
+        price=observation.price,
+        currency=observation.currency,
+        available=observation.available,
+        seller=observation.seller,
+        ean=observation.ean,
+        mpn=observation.mpn,
+        observed_at=observation.observed_at,
+    )
+    session.add(record)
+    session.commit()
+    session.refresh(record)
+    return record
+
+
+def list_observation_records_for_listing(
+    session: Session, listing_id: int
+) -> list[ObservationRecord]:
+    stmt = (
+        select(ObservationRecord)
+        .where(ObservationRecord.listing_id == listing_id)
+        .order_by(ObservationRecord.observed_at)
+    )
+    return list(session.scalars(stmt))

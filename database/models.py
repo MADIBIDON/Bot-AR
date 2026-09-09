@@ -8,8 +8,9 @@ added in a later phase.
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 
-from sqlalchemy import CheckConstraint, ForeignKey, Index, func, text
+from sqlalchemy import CheckConstraint, ForeignKey, Index, Numeric, func, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -49,9 +50,9 @@ class Product(Base):
     keywords: Mapped[str | None] = mapped_column(default=None)
     image_url: Mapped[str | None] = mapped_column(default=None)
 
-    target_price: Mapped[float | None] = mapped_column(default=None)
-    max_price: Mapped[float | None] = mapped_column(default=None)
-    estimated_resale_price: Mapped[float | None] = mapped_column(default=None)
+    target_price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), default=None)
+    max_price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), default=None)
+    estimated_resale_price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), default=None)
     max_quantity: Mapped[int | None] = mapped_column(default=None)
 
     priority: Mapped[int] = mapped_column(default=0, nullable=False)
@@ -152,8 +153,8 @@ class WatchRule(Base):
     product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), nullable=False)
     listing_id: Mapped[int | None] = mapped_column(ForeignKey("listings.id"), default=None)
 
-    target_price: Mapped[float | None] = mapped_column(default=None)
-    max_price: Mapped[float | None] = mapped_column(default=None)
+    target_price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), default=None)
+    max_price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), default=None)
 
     enabled: Mapped[bool] = mapped_column(default=True, nullable=False)
     check_interval: Mapped[int] = mapped_column(nullable=False)
@@ -170,4 +171,37 @@ class WatchRule(Base):
         return (
             f"WatchRule(id={self.id!r}, product_id={self.product_id!r}, "
             f"listing_id={self.listing_id!r}, enabled={self.enabled!r})"
+        )
+
+
+class ObservationRecord(Base):
+    """Historical, append-only record of one ProductObservation.
+
+    Deliberately separate from the business `ProductObservation` dataclass
+    (products/observation.py) — this is the persistence representation,
+    written once per successful monitoring check. Change detection between
+    successive records is a later phase; this model only stores them.
+    """
+
+    __tablename__ = "observation_records"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    listing_id: Mapped[int] = mapped_column(ForeignKey("listings.id"), nullable=False)
+
+    external_id: Mapped[str] = mapped_column(nullable=False)
+    name: Mapped[str] = mapped_column(nullable=False)
+    price: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
+    currency: Mapped[str] = mapped_column(nullable=False)
+    available: Mapped[bool] = mapped_column(nullable=False)
+    seller: Mapped[str | None] = mapped_column(default=None)
+    ean: Mapped[str | None] = mapped_column(default=None)
+    mpn: Mapped[str | None] = mapped_column(default=None)
+
+    observed_at: Mapped[datetime] = mapped_column(nullable=False)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    def __repr__(self) -> str:
+        return (
+            f"ObservationRecord(id={self.id!r}, listing_id={self.listing_id!r}, "
+            f"observed_at={self.observed_at!r})"
         )

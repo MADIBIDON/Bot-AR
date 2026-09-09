@@ -1,0 +1,151 @@
+"""Monitoring engine: runs a WatchRule, produces a ProductObservation.
+
+Layers stay separate on purpose:
+    connector (raw fetch) -> normalization (ProductObservation) ->
+    matching (MatchResult) -> [optional] storage (ObservationRecord)
+
+`run_check` is pure — no database access, no side effects — so it can be
+tested without a session. `run_check_and_store` composes it with
+persistence. `run_all_active_watch_rules` is the single entry point a real
+scheduler would call on each tick; no APScheduler/interval logic lives here
+yet since nothing consumes it in this phase (no Discord bot, no app
+entrypoint running continuously) — wiring one now would be untested dead
+code. Not coupled to Discord or purchasing.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING
+
+from connectors.base import ConnectorError, ProductNotFoundError
+from database import crud
+from products.matcher import match_product
+from products.observation import ProductObservation
+
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
+
+    from connectors.registry import ConnectorRegistry
+    from database.models import WatchRule
+    from products.matcher import MatchResult
+
+
+@dataclass(frozen=True, slots=True)
+class MonitoringResult:
+    """Explains what happened for one WatchRule check, success or failure."""
+
+    watch_rule_id: int
+    observation: ProductObservation | None
+    match_result: MatchResult | None
+    success: bool
+    error: str | None
+    checked_at: datetime
+
+
+def run_check(watch_rule: WatchRule, registry: ConnectorRegistry) -> MonitoringResult:
+    """Execute a single WatchRule check right now. No database access."""
+    checked_at = datetime.now(UTC)
+
+    if not watch_rule.enabled:
+        return MonitoringResult(
+            watch_rule_id=watch_rule.id,
+            observation=None,
+            match_result=None,
+            success=False,
+            error=f"watch rule {watch_rule.id} is disabled",
+            checked_at=checked_at,
+        )
+
+    listing = watch_rule.listing
+    if listing is None:
+        return MonitoringResult(
+            watch_rule_id=watch_rule.id,
+            observation=None,
+            match_result=None,
+            success=False,
+            error=(
+                "watch rule has no listing; global-rule listing resolution is not implemented yet"
+            ),
+            checked_at=checked_at,
+        )
+
+    if not listing.external_id:
+        return MonitoringResult(
+            watch_rule_id=watch_rule.id,
+            observation=None,
+            match_result=None,
+            success=False,
+            error=f"listing {listing.id} has no external_id; cannot query connector",
+            checked_at=checked_at,
+        )
+
+    try:
+        connector = registry.get(listing.merchant.name)
+    except ConnectorError as exc:
+        return MonitoringResult(
+            watch_rule_id=watch_rule.id,
+            observation=None,
+            match_result=None,
+            success=False,
+            error=str(exc),
+            checked_at=checked_at,
+        )
+
+    try:
+        connector_product = connector.get_product(listing.external_id)
+    except (ProductNotFoundError, ConnectorError) as exc:
+        return MonitoringResult(
+            watch_rule_id=watch_rule.id,
+            observation=None,
+            match_result=None,
+            success=False,
+            error=str(exc),
+            checked_at=checked_at,
+        )
+
+    try:
+        observation = ProductObservation.from_connector_product(
+            connector_product, merchant=listing.merchant.name, observed_at=checked_at
+        )
+    except ValueError as exc:
+        return MonitoringResult(
+            watch_rule_id=watch_rule.id,
+            observation=None,
+            match_result=None,
+            success=False,
+            error=f"invalid observation data: {exc}",
+            checked_at=checked_at,
+        )
+
+    match_result = match_product(watch_rule.product, observation, expected_listing=listing)
+
+    return MonitoringResult(
+        watch_rule_id=watch_rule.id,
+        observation=observation,
+        match_result=match_result,
+        success=True,
+        error=None,
+        checked_at=checked_at,
+    )
+
+
+def run_check_and_store(
+    session: Session, watch_rule: WatchRule, registry: ConnectorRegistry
+) -> MonitoringResult:
+    """Run a check and, only on success, persist the observation."""
+    result = run_check(watch_rule, registry)
+    if result.success and result.observation is not None:
+        crud.create_observation_record(
+            session, listing_id=watch_rule.listing_id, observation=result.observation
+        )
+    return result
+
+
+def run_all_active_watch_rules(
+    session: Session, registry: ConnectorRegistry
+) -> list[MonitoringResult]:
+    """One check pass over every enabled WatchRule — call this on each tick."""
+    rules = crud.list_watch_rules(session, enabled=True)
+    return [run_check_and_store(session, rule, registry) for rule in rules]
