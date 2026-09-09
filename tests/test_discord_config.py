@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from notifications.discord.config import MissingDiscordConfigError, load_discord_config
+from notifications.discord.config import (
+    MissingDiscordConfigError,
+    describe_config_presence,
+    format_config_presence_report,
+    load_discord_config,
+)
 
 _SECRET_TOKEN = "super-secret-token-value-should-never-leak"
 
@@ -54,3 +59,56 @@ def test_non_numeric_guild_id_raises_without_leaking_token(
         load_discord_config()
 
     assert _SECRET_TOKEN not in str(excinfo.value)
+
+
+def test_surrounding_quotes_are_stripped(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", f'"{_SECRET_TOKEN}"')
+    monkeypatch.setenv("DISCORD_GUILD_ID", "123456789012345678")
+    monkeypatch.setenv("DISCORD_ALERT_CHANNEL_ID", "987654321098765432")
+
+    config = load_discord_config()
+
+    assert config.bot_token == _SECRET_TOKEN
+
+
+def test_surrounding_whitespace_is_stripped(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", f"  {_SECRET_TOKEN}  ")
+    monkeypatch.setenv("DISCORD_GUILD_ID", " 123456789012345678 ")
+    monkeypatch.setenv("DISCORD_ALERT_CHANNEL_ID", "987654321098765432")
+
+    config = load_discord_config()
+
+    assert config.bot_token == _SECRET_TOKEN
+    assert config.guild_id == 123456789012345678
+
+
+def test_describe_config_presence_never_exposes_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", _SECRET_TOKEN)
+    monkeypatch.delenv("DISCORD_GUILD_ID", raising=False)
+    monkeypatch.setenv("DISCORD_ALERT_CHANNEL_ID", "987654321098765432")
+
+    presence = describe_config_presence()
+
+    assert presence == {
+        "DISCORD_BOT_TOKEN": True,
+        "DISCORD_GUILD_ID": False,
+        "DISCORD_ALERT_CHANNEL_ID": True,
+    }
+    assert _SECRET_TOKEN not in str(presence)
+
+
+def test_format_config_presence_report_is_safe_to_print(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", _SECRET_TOKEN)
+    monkeypatch.setenv("DISCORD_GUILD_ID", "123456789012345678")
+    monkeypatch.delenv("DISCORD_ALERT_CHANNEL_ID", raising=False)
+
+    report = format_config_presence_report()
+
+    assert "token present: yes" in report
+    assert "guild id present: yes" in report
+    assert "channel id present: no" in report
+    assert _SECRET_TOKEN not in report

@@ -3,6 +3,11 @@ __pycache__/
 .venv/
 venv/
 .env
+.env.*
+!.env.example
+*.save
+*.swp
+*.bak
 *.db
 *.sqlite3
 .pytest_cache/

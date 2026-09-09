@@ -27,7 +27,10 @@ from products.observation import ProductObservation
 
 
 async def main() -> None:
-    load_dotenv()
+    # override=True: a stale value already exported in the current shell
+    # (e.g. a leftover manual `export DISCORD_BOT_TOKEN=...`) must never
+    # shadow what's actually in .env.
+    load_dotenv(override=True)
     config = load_discord_config()
 
     observation = ProductObservation(
