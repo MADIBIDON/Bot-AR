@@ -15,12 +15,13 @@ code. Not coupled to Discord or purchasing.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from connectors.base import ConnectorError, ProductNotFoundError
 from database import crud
+from engine.change_detection import MonitoringEvent, detect_changes
 from products.matcher import match_product
 from products.observation import ProductObservation
 
@@ -42,6 +43,7 @@ class MonitoringResult:
     success: bool
     error: str | None
     checked_at: datetime
+    events: tuple[MonitoringEvent, ...] = ()
 
 
 def run_check(watch_rule: WatchRule, registry: ConnectorRegistry) -> MonitoringResult:
@@ -134,13 +136,45 @@ def run_check(watch_rule: WatchRule, registry: ConnectorRegistry) -> MonitoringR
 def run_check_and_store(
     session: Session, watch_rule: WatchRule, registry: ConnectorRegistry
 ) -> MonitoringResult:
-    """Run a check and, only on success, persist the observation."""
+    """Run a check, persist the observation, detect and persist events.
+
+    Order matters: the previous observation is fetched *before* the new one
+    is persisted, otherwise "previous" would be the record we just wrote.
+    Change detection only runs if the product was actually matched — a
+    misidentified product is still recorded for audit, but never produces
+    a STOCK_AVAILABLE/PRICE_DROP/... event.
+    """
     result = run_check(watch_rule, registry)
-    if result.success and result.observation is not None:
-        crud.create_observation_record(
-            session, listing_id=watch_rule.listing_id, observation=result.observation
-        )
-    return result
+    if not (result.success and result.observation is not None):
+        return result
+
+    previous_records = crud.list_observation_records_for_listing(session, watch_rule.listing_id)
+    previous_record = previous_records[-1] if previous_records else None
+
+    current_record = crud.create_observation_record(
+        session, listing_id=watch_rule.listing_id, observation=result.observation
+    )
+
+    events: tuple[MonitoringEvent, ...] = ()
+    if result.match_result is not None and result.match_result.matched:
+        detected = detect_changes(previous_record, current_record, watch_rule)
+        persisted = []
+        for event in detected:
+            record = crud.create_event_record(
+                session,
+                event_type=event.event_type.value,
+                listing_id=event.listing_id,
+                watch_rule_id=event.watch_rule_id,
+                observation_record_id=current_record.id,
+                occurred_at=event.occurred_at,
+                previous_value=event.previous_value,
+                current_value=event.current_value,
+            )
+            if record is not None:
+                persisted.append(event)
+        events = tuple(persisted)
+
+    return replace(result, events=events)
 
 
 def run_all_active_watch_rules(

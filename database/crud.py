@@ -5,13 +5,15 @@ Every function takes an explicit Session — no global/implicit session state.
 
 from __future__ import annotations
 
+from datetime import datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from database.models import Listing, Merchant, ObservationRecord, Product, WatchRule
+from database.models import EventRecord, Listing, Merchant, ObservationRecord, Product, WatchRule
 
 if TYPE_CHECKING:
     from products.observation import ProductObservation
@@ -237,5 +239,51 @@ def list_observation_records_for_listing(
         select(ObservationRecord)
         .where(ObservationRecord.listing_id == listing_id)
         .order_by(ObservationRecord.observed_at)
+    )
+    return list(session.scalars(stmt))
+
+
+def create_event_record(
+    session: Session,
+    *,
+    event_type: str,
+    listing_id: int,
+    watch_rule_id: int,
+    observation_record_id: int,
+    occurred_at: datetime,
+    previous_value: str | None = None,
+    current_value: str | None = None,
+) -> EventRecord | None:
+    """Persist one event.
+
+    Returns None if an identical event (same event_type, watch_rule_id, and
+    observation_record_id) already exists — that is the dedup contract, not
+    an unexpected failure: reprocessing the same observation can never
+    create a duplicate row.
+    """
+    record = EventRecord(
+        event_type=event_type,
+        listing_id=listing_id,
+        watch_rule_id=watch_rule_id,
+        observation_record_id=observation_record_id,
+        previous_value=previous_value,
+        current_value=current_value,
+        occurred_at=occurred_at,
+    )
+    session.add(record)
+    try:
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        return None
+    session.refresh(record)
+    return record
+
+
+def list_event_records_for_listing(session: Session, listing_id: int) -> list[EventRecord]:
+    stmt = (
+        select(EventRecord)
+        .where(EventRecord.listing_id == listing_id)
+        .order_by(EventRecord.occurred_at)
     )
     return list(session.scalars(stmt))

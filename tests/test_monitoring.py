@@ -8,6 +8,7 @@ from connectors.base import ConnectorError
 from connectors.fake_store import FakeStoreConnector
 from connectors.registry import ConnectorRegistry
 from database import crud
+from engine.change_detection import EventType
 from engine.monitoring import run_all_active_watch_rules, run_check, run_check_and_store
 
 
@@ -406,3 +407,95 @@ def test_run_all_active_watch_rules_skips_disabled(session: Session) -> None:
     assert len(results) == 1
     assert results[0].watch_rule_id == rule_active.id
     assert results[0].success is True
+
+
+def test_events_are_persisted_and_returned(session: Session) -> None:
+    _, _, listing, rule = _setup_rule(session)
+    connector = FakeStoreConnector(
+        products={
+            "fake-123": {
+                "name": "Duopack Evoli 30 ans",
+                "price": 69.99,
+                "available": False,
+                "seller": "RetailerA",
+                "url": "https://a.example/p/1",
+            }
+        }
+    )
+    registry = ConnectorRegistry()
+    registry.register("RetailerA", connector)
+
+    first = run_check_and_store(session, rule, registry)
+    assert first.events == ()
+
+    connector.update_product("fake-123", price=59.99, available=True)
+    second = run_check_and_store(session, rule, registry)
+
+    event_types = {e.event_type for e in second.events}
+    assert event_types == {EventType.PRICE_DROP, EventType.STOCK_AVAILABLE}
+
+    persisted = crud.list_event_records_for_listing(session, listing.id)
+    assert len(persisted) == 2
+    assert {r.event_type for r in persisted} == {
+        EventType.PRICE_DROP.value,
+        EventType.STOCK_AVAILABLE.value,
+    }
+
+
+def test_connector_error_produces_no_events(session: Session) -> None:
+    _, _, listing, rule = _setup_rule(session)
+    registry = _registry_with_fake_store(
+        "RetailerA", errors={"fake-123": ConnectorError("merchant is down")}
+    )
+
+    result = run_check_and_store(session, rule, registry)
+
+    assert result.success is False
+    assert result.events == ()
+    assert crud.list_event_records_for_listing(session, listing.id) == []
+
+
+def test_bad_match_suppresses_events_but_keeps_observation_history(session: Session) -> None:
+    product = crud.create_product(session, "Duopack Evoli 30 ans", ean="1234567890123")
+    merchant = crud.create_merchant(session, "RetailerA")
+    listing = crud.create_listing(
+        session,
+        product_id=product.id,
+        merchant_id=merchant.id,
+        url="https://a.example/p/1",
+        external_id="fake-123",
+    )
+    rule = crud.create_watch_rule(
+        session, product_id=product.id, listing_id=listing.id, check_interval=300, max_quantity=1
+    )
+    connector = FakeStoreConnector(
+        products={
+            "fake-123": {
+                "name": "Duopack Evoli 30 ans",
+                "price": 13.99,
+                "available": True,
+                "seller": "RetailerA",
+                "url": "https://a.example/p/1",
+                "ean": "1234567890123",
+            }
+        }
+    )
+    registry = ConnectorRegistry()
+    registry.register("RetailerA", connector)
+
+    first = run_check_and_store(session, rule, registry)
+    assert first.match_result.matched is True
+    assert first.events == ()
+
+    connector.update_product("fake-123", price=9.99, ean="9999999999999")
+    second = run_check_and_store(session, rule, registry)
+
+    assert second.success is True
+    assert second.match_result.matched is False
+    assert second.events == ()
+
+    observations = crud.list_observation_records_for_listing(session, listing.id)
+    assert len(observations) == 2
+
+    events = crud.list_event_records_for_listing(session, listing.id)
+    assert events == []

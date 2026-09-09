@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import CheckConstraint, ForeignKey, Index, Numeric, func, text
+from sqlalchemy import CheckConstraint, ForeignKey, Index, Numeric, UniqueConstraint, func, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -204,4 +204,44 @@ class ObservationRecord(Base):
         return (
             f"ObservationRecord(id={self.id!r}, listing_id={self.listing_id!r}, "
             f"observed_at={self.observed_at!r})"
+        )
+
+
+class EventRecord(Base):
+    """One persisted MonitoringEvent (engine/change_detection.py).
+
+    Deduplicated on (event_type, watch_rule_id, observation_record_id): the
+    same observation can never produce the same event twice, even if a check
+    is reprocessed. No `processed`/dispatch-tracking field yet — that
+    belongs to whichever later phase adds Discord delivery.
+    """
+
+    __tablename__ = "event_records"
+    __table_args__ = (
+        UniqueConstraint(
+            "event_type",
+            "watch_rule_id",
+            "observation_record_id",
+            name="uq_event_type_watch_rule_observation",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    event_type: Mapped[str] = mapped_column(nullable=False)
+    listing_id: Mapped[int] = mapped_column(ForeignKey("listings.id"), nullable=False)
+    watch_rule_id: Mapped[int] = mapped_column(ForeignKey("watch_rules.id"), nullable=False)
+    observation_record_id: Mapped[int] = mapped_column(
+        ForeignKey("observation_records.id"), nullable=False
+    )
+
+    previous_value: Mapped[str | None] = mapped_column(default=None)
+    current_value: Mapped[str | None] = mapped_column(default=None)
+
+    occurred_at: Mapped[datetime] = mapped_column(nullable=False)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    def __repr__(self) -> str:
+        return (
+            f"EventRecord(id={self.id!r}, event_type={self.event_type!r}, "
+            f"watch_rule_id={self.watch_rule_id!r})"
         )
