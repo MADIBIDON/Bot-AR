@@ -31,6 +31,11 @@ def get_merchant(session: Session, merchant_id: int) -> Merchant | None:
     return session.get(Merchant, merchant_id)
 
 
+def get_merchant_by_name(session: Session, name: str) -> Merchant | None:
+    stmt = select(Merchant).where(Merchant.name == name)
+    return session.scalars(stmt).first()
+
+
 def create_product(
     session: Session,
     name: str,
@@ -124,6 +129,15 @@ def list_listings_for_product(session: Session, product_id: int) -> list[Listing
     return list(session.scalars(stmt))
 
 
+def get_listing_by_merchant_and_external_id(
+    session: Session, merchant_id: int, external_id: str
+) -> Listing | None:
+    stmt = select(Listing).where(
+        Listing.merchant_id == merchant_id, Listing.external_id == external_id
+    )
+    return session.scalars(stmt).first()
+
+
 def _validate_listing_belongs_to_product(
     session: Session, product_id: int, listing_id: int | None
 ) -> None:
@@ -209,6 +223,18 @@ def enable_watch_rule(session: Session, watch_rule_id: int) -> WatchRule | None:
 
 def disable_watch_rule(session: Session, watch_rule_id: int) -> WatchRule | None:
     return update_watch_rule(session, watch_rule_id, enabled=False)
+
+
+def delete_watch_rule(session: Session, watch_rule_id: int) -> bool:
+    """Deletes the rule itself. Raises IntegrityError (uncaught, on the
+    caller to handle) if EventRecords still reference it — disable instead
+    of deleting to preserve that audit history."""
+    rule = session.get(WatchRule, watch_rule_id)
+    if rule is None:
+        return False
+    session.delete(rule)
+    session.commit()
+    return True
 
 
 def create_observation_record(

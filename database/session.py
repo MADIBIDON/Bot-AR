@@ -6,15 +6,28 @@ call into this module, so pytest can never touch the real database file.
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 from sqlalchemy import Engine, create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 
 from config.settings import get_database_url
 from database.models import Base
 
+_SQLITE_FILE_URL_RE = re.compile(r"^sqlite:///(?!:memory:)(.+)$")
+
+
+def _ensure_sqlite_parent_dir(url: str) -> None:
+    match = _SQLITE_FILE_URL_RE.match(url)
+    if match is None:
+        return
+    Path(match.group(1)).parent.mkdir(parents=True, exist_ok=True)
+
 
 def get_engine(database_url: str | None = None) -> Engine:
     url = database_url or get_database_url()
+    _ensure_sqlite_parent_dir(url)
     engine = create_engine(url)
     if url.startswith("sqlite"):
 
