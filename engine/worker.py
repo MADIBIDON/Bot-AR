@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from database import crud
+from engine.backoff import BackoffTracker
 from engine.monitoring import run_check_and_store
 
 if TYPE_CHECKING:
@@ -28,14 +29,36 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+MIN_CHECK_INTERVAL_SECONDS = 30
+
+_JITTER_MAX_SECONDS = 5.0
+_JITTER_MAX_FRACTION = 0.1
+_JITTER_HASH_MULTIPLIER = 2654435761  # Knuth's multiplicative hash constant
+
+
+def jitter_seconds(watch_rule_id: int, check_interval: int) -> float:
+    """Deterministic, per-rule offset so rules sharing a check_interval
+    don't all fire on the exact same tick. Bounded to at most 5s or 10% of
+    the interval, whichever is smaller — enough to spread load across
+    rules, never enough to meaningfully delay a check."""
+    max_jitter = min(_JITTER_MAX_SECONDS, check_interval * _JITTER_MAX_FRACTION)
+    if max_jitter <= 0:
+        return 0.0
+    fraction = (watch_rule_id * _JITTER_HASH_MULTIPLIER) % 1000 / 1000
+    return fraction * max_jitter
+
 
 def is_due(watch_rule: WatchRule, last_observed_at: datetime | None, now: datetime) -> bool:
-    """True if `check_interval` seconds have elapsed since the last
-    observation — or if there has never been one (first run)."""
+    """True if `check_interval` seconds (plus this rule's small jitter)
+    have elapsed since the last observation — or if there has never been
+    one (first run)."""
     if last_observed_at is None:
         return True
+    effective_interval = watch_rule.check_interval + jitter_seconds(
+        watch_rule.id, watch_rule.check_interval
+    )
     elapsed = (now - last_observed_at).total_seconds()
-    return elapsed >= watch_rule.check_interval
+    return elapsed >= effective_interval
 
 
 def _last_observed_at(session: Session, watch_rule: WatchRule) -> datetime | None:
@@ -59,29 +82,52 @@ def run_monitoring_tick(
     registry: ConnectorRegistry,
     *,
     now: datetime | None = None,
+    backoff: BackoffTracker | None = None,
 ) -> list[tuple[WatchRule, MonitoringResult]]:
-    """Run every enabled WatchRule that is due right now.
+    """Run every enabled WatchRule that is due right now and not currently
+    backed off after recent retryable failures (429/timeout/network/5xx).
 
     A single rule raising is logged and skipped — it never stops the
     others from being checked. run_check_and_store already never raises
     for expected connector/observation failures (it returns
     success=False); this try/except guards only against a genuine bug.
+
+    Pass the *same* BackoffTracker across ticks for it to mean anything —
+    a fresh default here (no memory across calls) is fine for a one-off
+    check but not for a running worker.
     """
     now = now or datetime.now(UTC)
+    backoff = backoff or BackoffTracker()
     results: list[tuple[WatchRule, MonitoringResult]] = []
     for rule in crud.list_watch_rules(session, enabled=True):
         try:
             last_observed_at = _last_observed_at(session, rule)
             if not is_due(rule, last_observed_at, now):
                 continue
-            merchant_name = rule.listing.merchant.name if rule.listing else "?"
-            logger.info("checking watch_rule=%s merchant=%s", rule.id, merchant_name)
+            if backoff.is_blocked(rule.id, now):
+                logger.info(
+                    "rule=%s skipped (backing off %.0fs after recent failures)",
+                    rule.id,
+                    backoff.current_delay_seconds(rule.id),
+                )
+                continue
+
+            logger.info("rule=%s check started", rule.id)
             result = run_check_and_store(session, rule, registry)
             results.append((rule, result))
+
             if result.success:
-                logger.info("check succeeded watch_rule=%s", rule.id)
+                backoff.record_success(rule.id)
+                obs = result.observation
+                logger.info(
+                    "rule=%s price=%.2f stock=%s",
+                    rule.id,
+                    obs.price,
+                    str(obs.available).lower(),
+                )
             else:
-                logger.warning("check failed watch_rule=%s: %s", rule.id, result.error)
+                backoff.record_failure(rule.id, result.error or "", now)
+                logger.warning("rule=%s check failed: %s", rule.id, result.error)
         except Exception:
             logger.exception("unexpected error checking watch_rule=%s", rule.id)
     return results

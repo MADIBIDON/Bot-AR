@@ -1,39 +1,41 @@
-"""Continuous monitoring worker entrypoint.
+"""Continuous monitoring worker entrypoint. Runs indefinitely.
 
-Populate WatchRules/Listings/Products via database/crud.py before running
-this (see scripts/demo_worker.py for a full FakeStore-seeded example).
-Registering a merchant with ConnectorRegistry only wires up *which*
-connector answers for that merchant name — for Kairyu, a real Shopify
-storefront, that means a real HTTP GET per check
-(connectors/shopify.py); for a WatchRule targeting Kairyu, set
-Listing.external_id to the product's URL handle (see
-connectors/shopify.py's docstring for the `handle:variant_sku` format).
+Populate WatchRules/Listings/Products via database/crud.py (or
+scripts/watch.py add) before running this. See connectors/defaults.py for
+which merchants are wired up.
 
 Usage:
     python -m app.main_worker
 
 Stops cleanly on Ctrl-C (SIGINT) or SIGTERM: the current tick always
-finishes, then Discord and the database session are closed.
+finishes, then Discord, the database session, and the PID file are
+cleaned up.
+
+Writes its PID to data/worker.pid on startup and removes it on clean
+shutdown, so `scripts/watch.py status` can report whether a worker looks
+to be running — a plain PID file, not a process manager.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
+from pathlib import Path
 
 from dotenv import load_dotenv
 
 from app.worker import DEFAULT_POLL_INTERVAL_SECONDS, run_forever
-from connectors.fake_store import FakeStoreConnector
-from connectors.registry import ConnectorRegistry
-from connectors.shopify import ShopifyConnector
+from connectors.defaults import build_default_registry
 from database.session import create_all, get_engine, get_session_factory
 from notifications.discord.client import DiscordNotifier
 from notifications.discord.config import load_discord_config
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
+
+PID_FILE = Path("data") / "worker.pid"
 
 
 async def main() -> None:
@@ -44,14 +46,15 @@ async def main() -> None:
     create_all(engine)
     session = get_session_factory(engine)()
 
-    registry = ConnectorRegistry()
-    registry.register("FakeStore", FakeStoreConnector())
-    registry.register("Kairyu", ShopifyConnector(shop_domain="kairyu.fr", merchant_name="Kairyu"))
+    registry = build_default_registry()
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop_event.set)
+
+    PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    PID_FILE.write_text(str(os.getpid()))
 
     try:
         async with DiscordNotifier(config) as notifier:
@@ -64,6 +67,7 @@ async def main() -> None:
             )
     finally:
         session.close()
+        PID_FILE.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

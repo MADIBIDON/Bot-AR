@@ -5,12 +5,15 @@ Usage:
                                  [--external-id ID] [--target-price X]
                                  [--max-price X] [--check-interval N]
                                  [--max-quantity N] [--yes]
+    python scripts/watch.py edit <id> [--target-price X] [--max-price X]
+                                       [--check-interval N] [--max-quantity N]
     python scripts/watch.py list [--status enabled|disabled|all]
     python scripts/watch.py show <id>
     python scripts/watch.py enable <id>
     python scripts/watch.py disable <id>
     python scripts/watch.py delete <id>
     python scripts/watch.py test <id>
+    python scripts/watch.py status
 
 `add` with a Shopify product URL (any shop, not just Kairyu) tries
 ShopifyConnector.get_product() first, so you don't have to type in what
@@ -28,9 +31,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
@@ -39,24 +44,23 @@ from sqlalchemy.orm import Session
 
 from app.notify import notify_events_if_allowed
 from connectors.base import ConnectorError, ConnectorProduct, ProductNotFoundError
-from connectors.fake_store import FakeStoreConnector
-from connectors.registry import ConnectorRegistry
+from connectors.defaults import build_default_registry
 from connectors.shopify import ShopifyConnector
 from database import crud
 from database.models import WatchRule
 from database.session import create_all, get_engine, get_session_factory
 from engine.monitoring import run_check_and_store
+from engine.worker import MIN_CHECK_INTERVAL_SECONDS
 from notifications.discord.client import DiscordNotifier
 from notifications.discord.config import load_discord_config
 
+PID_FILE = Path("data") / "worker.pid"
 
-def _build_registry() -> ConnectorRegistry:
-    """Same merchants as app/main_worker.py — kept independent on purpose
-    so this script never depends on (or has to import) the worker."""
-    registry = ConnectorRegistry()
-    registry.register("FakeStore", FakeStoreConnector())
-    registry.register("Kairyu", ShopifyConnector(shop_domain="kairyu.fr", merchant_name="Kairyu"))
-    return registry
+
+def _build_registry():
+    """Thin alias kept for tests to monkeypatch a per-test registry
+    without touching connectors/defaults.py."""
+    return build_default_registry()
 
 
 def _get_session() -> Session:
@@ -98,6 +102,20 @@ def _parse_positive_int(label: str, raw: str) -> int:
     if value <= 0:
         raise ValueError(f"{label} must be strictly positive, got {value}")
     return value
+
+
+def _parse_check_interval(raw: str) -> int:
+    value = _parse_positive_int("check_interval", raw)
+    if value < MIN_CHECK_INTERVAL_SECONDS:
+        raise ValueError(
+            f"check_interval must be at least {MIN_CHECK_INTERVAL_SECONDS}s, got {value}"
+        )
+    return value
+
+
+def _validate_price_order(target_price: Decimal | None, max_price: Decimal | None) -> None:
+    if target_price is not None and max_price is not None and max_price < target_price:
+        raise ValueError(f"max_price ({max_price}) must be >= target_price ({target_price})")
 
 
 @dataclass
@@ -175,10 +193,12 @@ def cmd_add(args: argparse.Namespace) -> int:
         check_interval_raw = args.check_interval or (
             "300" if args.yes else _prompt("Check interval (seconds)", "300")
         )
-        check_interval = _parse_positive_int("check_interval", check_interval_raw)
+        check_interval = _parse_check_interval(check_interval_raw)
 
         max_quantity_raw = args.max_quantity or ("1" if args.yes else _prompt("Max quantity", "1"))
         max_quantity = _parse_positive_int("max_quantity", max_quantity_raw)
+
+        _validate_price_order(target_price, max_price)
     except ValueError as exc:
         print(f"Invalid value: {exc}")
         return 1
@@ -292,16 +312,52 @@ def cmd_disable(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_edit(args: argparse.Namespace) -> int:
+    session = _get_session()
+    rule = crud.get_watch_rule(session, args.id)
+    if rule is None:
+        print(f"No watch_rule={args.id}")
+        return 1
+
+    fields: dict[str, object] = {}
+    try:
+        if args.target_price is not None:
+            fields["target_price"] = _parse_positive_decimal("target_price", args.target_price)
+        if args.max_price is not None:
+            fields["max_price"] = _parse_positive_decimal("max_price", args.max_price)
+        if args.check_interval is not None:
+            fields["check_interval"] = _parse_check_interval(args.check_interval)
+        if args.max_quantity is not None:
+            fields["max_quantity"] = _parse_positive_int("max_quantity", args.max_quantity)
+
+        effective_target = fields.get("target_price", rule.target_price)
+        effective_max = fields.get("max_price", rule.max_price)
+        _validate_price_order(effective_target, effective_max)
+    except ValueError as exc:
+        print(f"Invalid value: {exc}")
+        return 1
+
+    if not fields:
+        print(
+            "Nothing to update — pass at least one of "
+            "--target-price/--max-price/--check-interval/--max-quantity."
+        )
+        return 1
+
+    updated = crud.update_watch_rule(session, args.id, **fields)
+    changes = ", ".join(f"{key}={value}" for key, value in fields.items())
+    print(f"watch_rule={updated.id} updated: {changes}")
+    return 0
+
+
 def cmd_delete(args: argparse.Namespace) -> int:
     session = _get_session()
     try:
         deleted = crud.delete_watch_rule(session, args.id)
     except IntegrityError:
         session.rollback()
-        print(
-            f"Cannot delete watch_rule={args.id}: it has recorded events (audit history). "
-            "Disable it instead."
-        )
+        print("Cannot delete watch rule because historical events exist.")
+        print(f"Use `disable {args.id}` to stop monitoring while preserving history.")
         return 1
     if not deleted:
         print(f"No watch_rule={args.id}")
@@ -352,6 +408,49 @@ def cmd_test(args: argparse.Namespace) -> int:
     return asyncio.run(_run_test(session, rule))
 
 
+def _worker_status() -> str:
+    if not PID_FILE.exists():
+        return "not running"
+    try:
+        pid = int(PID_FILE.read_text().strip())
+    except ValueError:
+        return "unknown (invalid pid file)"
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return "not running (stale pid file)"
+    return f"running (pid={pid})"
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    session = _get_session()
+    active = crud.list_watch_rules(session, enabled=True)
+    disabled = crud.list_watch_rules(session, enabled=False)
+    print(f"active rules:   {len(active)}")
+    print(f"disabled rules: {len(disabled)}")
+
+    last_observation = crud.get_most_recent_observation(session)
+    if last_observation is not None:
+        print(
+            f"last check:     {last_observation.observed_at.isoformat()} "
+            f"(listing={last_observation.listing_id}, price={last_observation.price})"
+        )
+    else:
+        print("last check:     never")
+
+    last_event = crud.get_most_recent_event(session)
+    if last_event is not None:
+        print(
+            f"last event:     {last_event.event_type} at {last_event.occurred_at.isoformat()} "
+            f"(watch_rule={last_event.watch_rule_id})"
+        )
+    else:
+        print("last event:     none")
+
+    print(f"worker:         {_worker_status()}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Manage real WatchRules.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -368,6 +467,14 @@ def build_parser() -> argparse.ArgumentParser:
     add_parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation prompt")
     add_parser.set_defaults(func=cmd_add)
 
+    edit_parser = subparsers.add_parser("edit", help="Edit an existing watch rule.")
+    edit_parser.add_argument("id", type=int)
+    edit_parser.add_argument("--target-price", dest="target_price")
+    edit_parser.add_argument("--max-price", dest="max_price")
+    edit_parser.add_argument("--check-interval", dest="check_interval")
+    edit_parser.add_argument("--max-quantity", dest="max_quantity")
+    edit_parser.set_defaults(func=cmd_edit)
+
     list_parser = subparsers.add_parser("list", help="List watch rules.")
     list_parser.add_argument("--status", choices=["enabled", "disabled", "all"], default="all")
     list_parser.set_defaults(func=cmd_list)
@@ -382,6 +489,9 @@ def build_parser() -> argparse.ArgumentParser:
         sub = subparsers.add_parser(name, help=help_text)
         sub.add_argument("id", type=int)
         sub.set_defaults(func=func)
+
+    status_parser = subparsers.add_parser("status", help="Show overall system status.")
+    status_parser.set_defaults(func=cmd_status)
 
     return parser
 

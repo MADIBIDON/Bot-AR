@@ -313,3 +313,13 @@ def list_event_records_for_listing(session: Session, listing_id: int) -> list[Ev
         .order_by(EventRecord.occurred_at)
     )
     return list(session.scalars(stmt))
+
+
+def get_most_recent_observation(session: Session) -> ObservationRecord | None:
+    stmt = select(ObservationRecord).order_by(ObservationRecord.observed_at.desc()).limit(1)
+    return session.scalars(stmt).first()
+
+
+def get_most_recent_event(session: Session) -> EventRecord | None:
+    stmt = select(EventRecord).order_by(EventRecord.occurred_at.desc()).limit(1)
+    return session.scalars(stmt).first()

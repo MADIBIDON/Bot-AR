@@ -11,7 +11,8 @@ from connectors.base import ConnectorError
 from connectors.fake_store import FakeStoreConnector
 from connectors.registry import ConnectorRegistry
 from database import crud
-from engine.worker import is_due, run_monitoring_tick
+from engine.backoff import BackoffTracker
+from engine.worker import is_due, jitter_seconds, run_monitoring_tick
 
 
 class FakeNotifier:
@@ -75,8 +76,12 @@ def test_is_due_when_never_observed() -> None:
 
 
 def test_is_due_when_interval_elapsed() -> None:
+    # +30s margin, comfortably past the max possible jitter (Phase 13:
+    # is_due adds a small deterministic per-rule jitter, at most 5s or 10%
+    # of the interval) so this stays a "clearly elapsed" check rather than
+    # an exact-boundary one (see tests/test_worker.py jitter tests for that).
     now = datetime.now(UTC)
-    last = now - timedelta(seconds=301)
+    last = now - timedelta(seconds=330)
     assert is_due(_dummy_rule(check_interval=300), last, now) is True
 
 
@@ -243,3 +248,86 @@ def test_run_forever_stops_cleanly_without_real_wait(session: Session) -> None:
 
 def test_default_poll_interval_is_reasonable() -> None:
     assert 10 <= DEFAULT_POLL_INTERVAL_SECONDS <= 30
+
+
+# --- jitter ------------------------------------------------------------
+
+
+def test_jitter_is_deterministic() -> None:
+    assert jitter_seconds(42, 300) == jitter_seconds(42, 300)
+
+
+def test_jitter_is_bounded() -> None:
+    for rule_id in range(20):
+        j = jitter_seconds(rule_id, 300)
+        assert 0 <= j <= 5.0
+
+
+def test_jitter_scales_down_for_short_intervals() -> None:
+    # interval=10 -> max jitter is 10% of 10 = 1.0s, not the 5s ceiling
+    for rule_id in range(20):
+        assert jitter_seconds(rule_id, 10) <= 1.0
+
+
+def test_jitter_differs_across_rule_ids() -> None:
+    values = {jitter_seconds(rule_id, 300) for rule_id in range(10)}
+    assert len(values) > 1  # not all identical
+
+
+def test_is_due_respects_computed_jitter() -> None:
+    rule = _dummy_rule(check_interval=300)
+    rule.id = 7
+    j = jitter_seconds(7, 300)
+    now = datetime.now(UTC)
+
+    just_under = now - timedelta(seconds=300 + j - 1)
+    just_over = now - timedelta(seconds=300 + j + 1)
+
+    assert is_due(rule, just_under, now) is False
+    assert is_due(rule, just_over, now) is True
+
+
+# --- backoff integration in run_monitoring_tick -------------------------
+
+
+def test_backoff_skips_rule_after_retryable_failure(session: Session) -> None:
+    _, _, listing, rule = _setup_rule(session, external_id="fake-123", check_interval=1)
+    registry = ConnectorRegistry()
+    registry.register(
+        "RetailerA",
+        FakeStoreConnector(errors={"fake-123": ConnectorError("rate limited (429) fetching x")}),
+    )
+    backoff = BackoffTracker(base_seconds=100, max_seconds=1000)
+    t0 = datetime.now(UTC)
+
+    first = run_monitoring_tick(session, registry, now=t0, backoff=backoff)
+    assert len(first) == 1
+    assert first[0][1].success is False
+
+    # Immediately due again by check_interval (1s and no observation was
+    # ever persisted, since the check failed) but backed off for ~100s.
+    second = run_monitoring_tick(session, registry, now=t0 + timedelta(seconds=5), backoff=backoff)
+    assert second == []
+
+
+def test_backoff_resets_after_success(session: Session) -> None:
+    _, _, listing, rule = _setup_rule(session, external_id="fake-123", check_interval=1)
+    connector = FakeStoreConnector(
+        errors={"fake-123": ConnectorError("timeout fetching x")},
+    )
+    registry = ConnectorRegistry()
+    registry.register("RetailerA", connector)
+    backoff = BackoffTracker(base_seconds=100, max_seconds=1000)
+    t0 = datetime.now(UTC)
+
+    run_monitoring_tick(session, registry, now=t0, backoff=backoff)
+    assert backoff.is_blocked(rule.id, t0 + timedelta(seconds=1)) is True
+
+    # Swap in a working connector and let the backoff window pass.
+    registry.register("RetailerA", FakeStoreConnector(products={"fake-123": _fake_product()}))
+    later = t0 + timedelta(seconds=150)
+    results = run_monitoring_tick(session, registry, now=later, backoff=backoff)
+
+    assert len(results) == 1
+    assert results[0][1].success is True
+    assert backoff.is_blocked(rule.id, later) is False
