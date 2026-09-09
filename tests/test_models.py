@@ -1,0 +1,99 @@
+from __future__ import annotations
+
+import pytest
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from database.models import Listing, Merchant, Product
+
+
+def test_create_merchant_product_listing(session: Session) -> None:
+    merchant = Merchant(name="RetailerA")
+    product = Product(name="Duopack Evoli 30 ans", ean="1234567890123")
+    session.add_all([merchant, product])
+    session.commit()
+
+    listing = Listing(product_id=product.id, merchant_id=merchant.id, url="https://a.example/p/1")
+    session.add(listing)
+    session.commit()
+
+    assert listing.id is not None
+    assert listing.product_id == product.id
+    assert listing.merchant_id == merchant.id
+
+
+def test_product_to_listing_relationship(session: Session) -> None:
+    merchant_a = Merchant(name="RetailerA")
+    merchant_b = Merchant(name="RetailerB")
+    product = Product(name="ETB Pokemon 30 ans")
+    session.add_all([merchant_a, merchant_b, product])
+    session.commit()
+
+    listing_a = Listing(
+        product_id=product.id, merchant_id=merchant_a.id, url="https://a.example/p/1"
+    )
+    listing_b = Listing(
+        product_id=product.id, merchant_id=merchant_b.id, url="https://b.example/p/1"
+    )
+    session.add_all([listing_a, listing_b])
+    session.commit()
+    session.refresh(product)
+
+    assert len(product.listings) == 2
+    assert {listing.merchant.name for listing in product.listings} == {"RetailerA", "RetailerB"}
+
+
+def test_listing_belongs_to_one_merchant(session: Session) -> None:
+    merchant = Merchant(name="RetailerA")
+    product = Product(name="Duopack Evoli 30 ans")
+    session.add_all([merchant, product])
+    session.commit()
+
+    listing = Listing(product_id=product.id, merchant_id=merchant.id, url="https://a.example/p/1")
+    session.add(listing)
+    session.commit()
+    session.refresh(merchant)
+
+    assert listing.merchant.id == merchant.id
+    assert listing in merchant.listings
+
+
+def test_product_ean_must_be_unique(session: Session) -> None:
+    session.add(Product(name="Product A", ean="1234567890123"))
+    session.commit()
+
+    session.add(Product(name="Product B", ean="1234567890123"))
+    with pytest.raises(IntegrityError):
+        session.commit()
+
+
+def test_product_ean_can_be_null_for_multiple_products(session: Session) -> None:
+    session.add_all([Product(name="Product A"), Product(name="Product B")])
+    session.commit()  # must not raise: NULL is not considered a duplicate
+
+
+def test_merchant_name_must_be_unique(session: Session) -> None:
+    session.add(Merchant(name="RetailerA"))
+    session.commit()
+
+    session.add(Merchant(name="RetailerA"))
+    with pytest.raises(IntegrityError):
+        session.commit()
+
+
+def test_listing_unique_per_merchant_and_url(session: Session) -> None:
+    merchant = Merchant(name="RetailerA")
+    product = Product(name="Duopack Evoli 30 ans")
+    session.add_all([merchant, product])
+    session.commit()
+
+    session.add(
+        Listing(product_id=product.id, merchant_id=merchant.id, url="https://a.example/p/1")
+    )
+    session.commit()
+
+    session.add(
+        Listing(product_id=product.id, merchant_id=merchant.id, url="https://a.example/p/1")
+    )
+    with pytest.raises(IntegrityError):
+        session.commit()

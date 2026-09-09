@@ -7,7 +7,9 @@ name = "retail-opportunity-assistant"
 version = "0.0.1"
 description = "Retail opportunity monitoring and assisted-purchase system."
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "sqlalchemy>=2.0",
+]
 
 [project.optional-dependencies]
 dev = [
