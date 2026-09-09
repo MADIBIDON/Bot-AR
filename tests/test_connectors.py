@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pytest
 
 from connectors.base import BaseConnector, ConnectorError, ConnectorProduct, ProductNotFoundError
@@ -68,7 +70,7 @@ def test_product_unavailable() -> None:
 
 def test_product_price() -> None:
     connector = FakeStoreConnector(products=_sample_products())
-    assert connector.get_product("fake-123").price == 13.99
+    assert connector.get_product("fake-123").price == Decimal("13.99")
 
 
 def test_product_currency() -> None:
@@ -125,7 +127,7 @@ def test_product_without_mpn_defaults_to_none() -> None:
 def test_update_product_simulates_price_change() -> None:
     connector = FakeStoreConnector(products=_sample_products())
     connector.update_product("fake-123", price=12.49)
-    assert connector.get_product("fake-123").price == 12.49
+    assert connector.get_product("fake-123").price == Decimal("12.49")
 
 
 def test_update_product_simulates_stock_change() -> None:

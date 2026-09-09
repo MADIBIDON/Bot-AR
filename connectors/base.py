@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from decimal import Decimal
 
 
 class ConnectorError(Exception):
@@ -26,17 +27,25 @@ class ConnectorProduct:
     This is raw observed data, not a validated domain object — a connector
     mirrors what the merchant actually returns, including nonsensical values.
     Validation belongs to later stages (matcher, decision engine).
+
+    `price` is always coerced to `Decimal` (via `str()` first, never straight
+    from a float) so binary float artifacts never enter the system, no
+    matter which type a connector implementation happens to pass in.
     """
 
     external_id: str
     name: str
-    price: float
+    price: Decimal
     currency: str
     available: bool
     seller: str
     url: str
     ean: str | None = None
     mpn: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.price, Decimal):
+            object.__setattr__(self, "price", Decimal(str(self.price)))
 
 
 class BaseConnector(ABC):
