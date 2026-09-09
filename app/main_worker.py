@@ -1,11 +1,13 @@
-"""Continuous monitoring worker entrypoint. FakeStore only — no real
-merchant connector exists yet.
+"""Continuous monitoring worker entrypoint.
 
 Populate WatchRules/Listings/Products via database/crud.py before running
-this (see scripts/demo_worker.py for a full seeded example). Registering a
-merchant with ConnectorRegistry only wires up *which* connector answers
-for that merchant name — the product data itself lives wherever that
-connector gets it (FakeStoreConnector's `products=` dict for now).
+this (see scripts/demo_worker.py for a full FakeStore-seeded example).
+Registering a merchant with ConnectorRegistry only wires up *which*
+connector answers for that merchant name — for Kairyu, a real Shopify
+storefront, that means a real HTTP GET per check
+(connectors/shopify.py); for a WatchRule targeting Kairyu, set
+Listing.external_id to the product's URL handle (see
+connectors/shopify.py's docstring for the `handle:variant_sku` format).
 
 Usage:
     python -m app.main_worker
@@ -25,6 +27,7 @@ from dotenv import load_dotenv
 from app.worker import DEFAULT_POLL_INTERVAL_SECONDS, run_forever
 from connectors.fake_store import FakeStoreConnector
 from connectors.registry import ConnectorRegistry
+from connectors.shopify import ShopifyConnector
 from database.session import create_all, get_engine, get_session_factory
 from notifications.discord.client import DiscordNotifier
 from notifications.discord.config import load_discord_config
@@ -43,6 +46,7 @@ async def main() -> None:
 
     registry = ConnectorRegistry()
     registry.register("FakeStore", FakeStoreConnector())
+    registry.register("Kairyu", ShopifyConnector(shop_domain="kairyu.fr", merchant_name="Kairyu"))
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
