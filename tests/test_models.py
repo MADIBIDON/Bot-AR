@@ -81,7 +81,7 @@ def test_merchant_name_must_be_unique(session: Session) -> None:
         session.commit()
 
 
-def test_listing_unique_per_merchant_and_url(session: Session) -> None:
+def test_listing_without_external_id_unique_per_merchant_and_url(session: Session) -> None:
     merchant = Merchant(name="RetailerA")
     product = Product(name="Duopack Evoli 30 ans")
     session.add_all([merchant, product])
@@ -97,3 +97,96 @@ def test_listing_unique_per_merchant_and_url(session: Session) -> None:
     )
     with pytest.raises(IntegrityError):
         session.commit()
+
+
+def test_listing_without_external_id_same_url_allowed_across_merchants(session: Session) -> None:
+    merchant_a = Merchant(name="RetailerA")
+    merchant_b = Merchant(name="RetailerB")
+    product = Product(name="Duopack Evoli 30 ans")
+    session.add_all([merchant_a, merchant_b, product])
+    session.commit()
+
+    session.add(
+        Listing(product_id=product.id, merchant_id=merchant_a.id, url="https://shared.example/p/1")
+    )
+    session.add(
+        Listing(product_id=product.id, merchant_id=merchant_b.id, url="https://shared.example/p/1")
+    )
+    session.commit()  # must not raise: different merchants, no external_id to collide on
+
+
+def test_listing_external_id_must_be_unique_per_merchant(session: Session) -> None:
+    merchant = Merchant(name="RetailerA")
+    product = Product(name="Duopack Evoli 30 ans")
+    session.add_all([merchant, product])
+    session.commit()
+
+    session.add(
+        Listing(
+            product_id=product.id,
+            merchant_id=merchant.id,
+            url="https://a.example/p/1",
+            external_id="SKU-123",
+        )
+    )
+    session.commit()
+
+    session.add(
+        Listing(
+            product_id=product.id,
+            merchant_id=merchant.id,
+            url="https://a.example/p/2",
+            external_id="SKU-123",
+        )
+    )
+    with pytest.raises(IntegrityError):
+        session.commit()
+
+
+def test_listing_same_external_id_allowed_across_merchants(session: Session) -> None:
+    merchant_a = Merchant(name="RetailerA")
+    merchant_b = Merchant(name="RetailerB")
+    product = Product(name="Duopack Evoli 30 ans")
+    session.add_all([merchant_a, merchant_b, product])
+    session.commit()
+
+    session.add(
+        Listing(
+            product_id=product.id,
+            merchant_id=merchant_a.id,
+            url="https://a.example/p/1",
+            external_id="SHARED-ID",
+        )
+    )
+    session.add(
+        Listing(
+            product_id=product.id,
+            merchant_id=merchant_b.id,
+            url="https://b.example/p/1",
+            external_id="SHARED-ID",
+        )
+    )
+    session.commit()  # must not raise: external_id scoped per merchant
+
+
+def test_listing_url_can_change_when_external_id_known(session: Session) -> None:
+    merchant = Merchant(name="RetailerA")
+    product = Product(name="Duopack Evoli 30 ans")
+    session.add_all([merchant, product])
+    session.commit()
+
+    listing = Listing(
+        product_id=product.id,
+        merchant_id=merchant.id,
+        url="https://a.example/old-slug",
+        external_id="SKU-123",
+    )
+    session.add(listing)
+    session.commit()
+
+    listing.url = "https://a.example/new-slug"
+    session.commit()  # must not raise: identity is external_id, url is mutable
+
+    session.refresh(listing)
+    assert listing.url == "https://a.example/new-slug"
+    assert listing.external_id == "SKU-123"

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import ForeignKey, UniqueConstraint, func
+from sqlalchemy import ForeignKey, Index, func, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -44,8 +44,7 @@ class Product(Base):
 
     ean: Mapped[str | None] = mapped_column(unique=True, default=None)
     gtin: Mapped[str | None] = mapped_column(default=None)
-    sku: Mapped[str | None] = mapped_column(default=None)
-    asin: Mapped[str | None] = mapped_column(default=None)
+    mpn: Mapped[str | None] = mapped_column(default=None)
 
     keywords: Mapped[str | None] = mapped_column(default=None)
     image_url: Mapped[str | None] = mapped_column(default=None)
@@ -70,8 +69,34 @@ class Product(Base):
 
 
 class Listing(Base):
+    """A merchant's page for a product.
+
+    Identity depends on what the merchant exposes:
+    - if `external_id` is known, it is the stable identity and `url` may be
+      updated in place (site redesigns, slug changes) without creating a
+      duplicate row;
+    - if `external_id` is absent, `url` is the only available identity.
+    """
+
     __tablename__ = "listings"
-    __table_args__ = (UniqueConstraint("merchant_id", "url", name="uq_listing_merchant_url"),)
+    __table_args__ = (
+        Index(
+            "uq_listing_merchant_external_id",
+            "merchant_id",
+            "external_id",
+            unique=True,
+            sqlite_where=text("external_id IS NOT NULL"),
+            postgresql_where=text("external_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_listing_merchant_url_no_external_id",
+            "merchant_id",
+            "url",
+            unique=True,
+            sqlite_where=text("external_id IS NULL"),
+            postgresql_where=text("external_id IS NULL"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), nullable=False)
