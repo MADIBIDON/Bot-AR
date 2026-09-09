@@ -206,3 +206,19 @@ def test_request_uses_explicit_user_agent_and_short_timeout(
     assert "User-Agent" in captured["headers"]
     assert captured["timeout"] <= 10
     assert captured["url"] == "https://example-shop.test/products/elite-trainer-box-test-fr"
+
+
+def test_duplicate_ld_json_blocks_picks_real_data_not_placeholder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: a real page (RelicTCG) shipped a generic theme
+    placeholder Product block (price=21000, currency=USD) alongside the
+    real one. Must never return the placeholder."""
+    connector = ShopifyConnector(shop_domain="example-shopify-shop.test", merchant_name="Example")
+    html = _load_fixture("schema_org_duplicate_product_blocks.html")
+    monkeypatch.setattr(connector, "_fetch", lambda url: html)
+
+    product = connector.get_product("duplicate-blocks-test-fr")
+
+    assert product.price == Decimal("210.0")
+    assert product.currency == "EUR"

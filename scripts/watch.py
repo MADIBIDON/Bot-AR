@@ -15,12 +15,13 @@ Usage:
     python scripts/watch.py test <id>
     python scripts/watch.py status
 
-`add` with a Shopify product URL (any shop, not just Kairyu) tries
-ShopifyConnector.get_product() first, so you don't have to type in what
-can be detected (name, price, currency, stock, external_id, GTIN/MPN). If
-detection fails (not Shopify, network error, page changed), it falls back
-to asking for everything manually. Either way you confirm before anything
-is written, unless --yes is passed.
+`add --url` identifies the merchant/connector automatically from the
+URL's hostname (see connectors/defaults.py for the supported list) and
+fetches name/price/currency/stock/external_id/GTIN/MPN, so you don't have
+to type in what can be detected. An unsupported hostname, or a detection
+failure on a supported one (network error, page changed), falls back to
+asking for everything manually. Either way you confirm before anything is
+written, unless --yes is passed.
 
 Reusing an existing Listing when one already exists for the same
 (merchant, external_id) is the only deduplication this does — no
@@ -44,8 +45,11 @@ from sqlalchemy.orm import Session
 
 from app.notify import notify_events_if_allowed
 from connectors.base import ConnectorError, ConnectorProduct, ProductNotFoundError
-from connectors.defaults import build_default_registry
-from connectors.shopify import ShopifyConnector
+from connectors.defaults import (
+    build_default_registry,
+    find_merchant_for_domain,
+    supported_domains_summary,
+)
 from database import crud
 from database.models import WatchRule
 from database.session import create_all, get_engine, get_session_factory
@@ -121,6 +125,7 @@ def _validate_price_order(target_price: Decimal | None, max_price: Decimal | Non
 @dataclass
 class DetectedProduct:
     merchant_name: str
+    connector_name: str | None
     shop_domain: str
     handle: str
     connector_product: ConnectorProduct | None
@@ -128,11 +133,24 @@ class DetectedProduct:
 
 def _detect_from_url(url: str, merchant_override: str | None) -> DetectedProduct:
     parsed = urlparse(url)
-    shop_domain = parsed.netloc
+    hostname = parsed.netloc
     handle = parsed.path.rstrip("/").rsplit("/", 1)[-1]
-    merchant_name = merchant_override or shop_domain
 
-    connector = ShopifyConnector(shop_domain=shop_domain, merchant_name=merchant_name)
+    merchant_def = find_merchant_for_domain(hostname)
+    if merchant_def is None:
+        print(f"Unsupported domain: {hostname!r}")
+        print("Supported merchants:")
+        print(supported_domains_summary())
+        return DetectedProduct(
+            merchant_name=merchant_override or hostname,
+            connector_name=None,
+            shop_domain=hostname,
+            handle=handle,
+            connector_product=None,
+        )
+
+    merchant_name = merchant_override or merchant_def.name
+    connector = merchant_def.build_connector()
     try:
         product = connector.get_product(handle)
     except (ConnectorError, ProductNotFoundError) as exc:
@@ -140,7 +158,8 @@ def _detect_from_url(url: str, merchant_override: str | None) -> DetectedProduct
         product = None
     return DetectedProduct(
         merchant_name=merchant_name,
-        shop_domain=shop_domain,
+        connector_name=type(connector).__name__,
+        shop_domain=hostname,
         handle=handle,
         connector_product=product,
     )
@@ -158,14 +177,16 @@ def cmd_add(args: argparse.Namespace) -> int:
     product_data = detected.connector_product
 
     merchant_name = args.merchant or detected.merchant_name
+    print(f"URL detected: {url}")
+    print(f"Merchant: {merchant_name}")
+    print(f"Connector: {detected.connector_name or 'none (unsupported domain)'}")
     if product_data is not None:
-        print("Detected product:")
-        print(f"  name:        {product_data.name}")
-        print(f"  price:       {product_data.price} {product_data.currency}")
-        print(f"  in stock:    {product_data.available}")
-        print(f"  external_id: {product_data.external_id}")
-        print(f"  ean/gtin:    {product_data.ean}")
-        print(f"  mpn:         {product_data.mpn}")
+        print(f"Product: {product_data.name}")
+        print(f"Price: {product_data.price} {product_data.currency}")
+        print(f"Stock: {'in stock' if product_data.available else 'out of stock'}")
+        print(f"external_id: {product_data.external_id}")
+        print(f"ean/gtin:    {product_data.ean}")
+        print(f"mpn:         {product_data.mpn}")
 
     name = args.name or (product_data.name if product_data else None) or _prompt("Product name")
     external_id = args.external_id or (

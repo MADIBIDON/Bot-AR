@@ -1,5 +1,6 @@
-"""No real network, no real Discord: ShopifyConnector, _build_registry and
-DiscordNotifier are all monkeypatched inside the scripts.watch namespace.
+"""No real network, no real Discord: merchant detection, _build_registry
+and DiscordNotifier are all monkeypatched inside the scripts.watch
+namespace.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from sqlalchemy.orm import Session
 
 import scripts.watch as watch
 from connectors.base import ConnectorError, ConnectorProduct
+from connectors.defaults import MerchantDefinition
 from connectors.fake_store import FakeStoreConnector
 from connectors.registry import ConnectorRegistry
 from database import crud
@@ -33,9 +35,8 @@ class _FakeAsyncNotifier:
         self.sent.append(embed)
 
 
-class _FakeShopifyConnectorSuccess:
-    def __init__(self, *, shop_domain: str, merchant_name: str) -> None:
-        self.shop_domain = shop_domain
+class _FakeConnectorSuccess:
+    def __init__(self, *, merchant_name: str) -> None:
         self.merchant_name = merchant_name
 
     def get_product(self, external_id: str) -> ConnectorProduct:
@@ -52,12 +53,23 @@ class _FakeShopifyConnectorSuccess:
         )
 
 
-class _FakeShopifyConnectorFailure:
-    def __init__(self, *, shop_domain: str, merchant_name: str) -> None:
-        pass
-
+class _FakeConnectorFailure:
     def get_product(self, external_id: str) -> ConnectorProduct:
-        raise ConnectorError("simulated: not a shopify page")
+        raise ConnectorError("simulated: page structure changed")
+
+
+def _fake_merchant_success(name: str = "Kairyu") -> MerchantDefinition:
+    return MerchantDefinition(
+        name=name,
+        domains=("kairyu.fr",),
+        build_connector=lambda: _FakeConnectorSuccess(merchant_name=name),
+    )
+
+
+def _fake_merchant_failure() -> MerchantDefinition:
+    return MerchantDefinition(
+        name="Kairyu", domains=("kairyu.fr",), build_connector=_FakeConnectorFailure
+    )
 
 
 def _patch_session(monkeypatch: pytest.MonkeyPatch, session: Session) -> None:
@@ -80,13 +92,11 @@ def _args(**overrides: object) -> argparse.Namespace:
     return argparse.Namespace(**defaults)
 
 
-def test_add_with_detected_shopify_product(
-    session: Session, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_add_with_detected_product(session: Session, monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_session(monkeypatch, session)
-    monkeypatch.setattr(watch, "ShopifyConnector", _FakeShopifyConnectorSuccess)
+    monkeypatch.setattr(watch, "find_merchant_for_domain", lambda host: _fake_merchant_success())
 
-    rc = watch.cmd_add(_args(url="https://kairyu.fr/products/some-handle", merchant="Kairyu"))
+    rc = watch.cmd_add(_args(url="https://kairyu.fr/products/some-handle"))
 
     assert rc == 0
     rules = crud.list_watch_rules(session)
@@ -97,16 +107,40 @@ def test_add_with_detected_shopify_product(
     assert rules[0].listing.merchant.name == "Kairyu"
 
 
-def test_add_falls_back_to_manual_when_detection_fails(
-    session: Session, monkeypatch: pytest.MonkeyPatch
+def test_add_falls_back_to_manual_on_unsupported_domain(
+    session: Session, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _patch_session(monkeypatch, session)
-    monkeypatch.setattr(watch, "ShopifyConnector", _FakeShopifyConnectorFailure)
+    monkeypatch.setattr(watch, "find_merchant_for_domain", lambda host: None)
 
     rc = watch.cmd_add(
         _args(
-            url="https://not-shopify.test/p/1",
+            url="https://not-supported.test/p/1",
             merchant="ManualShop",
+            name="Manual Product",
+            external_id="manual-1",
+        )
+    )
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "Unsupported domain" in output
+    assert "not-supported.test" in output
+    rules = crud.list_watch_rules(session)
+    assert rules[0].product.name == "Manual Product"
+    assert rules[0].product.ean is None
+    assert rules[0].listing.external_id == "manual-1"
+
+
+def test_add_falls_back_to_manual_when_connector_fails(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_session(monkeypatch, session)
+    monkeypatch.setattr(watch, "find_merchant_for_domain", lambda host: _fake_merchant_failure())
+
+    rc = watch.cmd_add(
+        _args(
+            url="https://kairyu.fr/products/some-handle",
             name="Manual Product",
             external_id="manual-1",
         )
@@ -116,23 +150,16 @@ def test_add_falls_back_to_manual_when_detection_fails(
     rules = crud.list_watch_rules(session)
     assert rules[0].product.name == "Manual Product"
     assert rules[0].product.ean is None
-    assert rules[0].listing.external_id == "manual-1"
 
 
 def test_add_reuses_existing_listing_for_same_merchant_and_external_id(
     session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _patch_session(monkeypatch, session)
-    monkeypatch.setattr(watch, "ShopifyConnector", _FakeShopifyConnectorSuccess)
+    monkeypatch.setattr(watch, "find_merchant_for_domain", lambda host: _fake_merchant_success())
 
-    watch.cmd_add(_args(url="https://kairyu.fr/products/some-handle", merchant="Kairyu"))
-    watch.cmd_add(
-        _args(
-            url="https://kairyu.fr/products/some-handle",
-            merchant="Kairyu",
-            target_price="10",
-        )
-    )
+    watch.cmd_add(_args(url="https://kairyu.fr/products/some-handle"))
+    watch.cmd_add(_args(url="https://kairyu.fr/products/some-handle", target_price="10"))
 
     listings = crud.list_listings_for_product(session, crud.list_watch_rules(session)[0].product_id)
     assert len(listings) == 1  # reused, not duplicated
@@ -143,11 +170,9 @@ def test_add_rejects_negative_target_price(
     session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _patch_session(monkeypatch, session)
-    monkeypatch.setattr(watch, "ShopifyConnector", _FakeShopifyConnectorSuccess)
+    monkeypatch.setattr(watch, "find_merchant_for_domain", lambda host: _fake_merchant_success())
 
-    rc = watch.cmd_add(
-        _args(url="https://kairyu.fr/products/some-handle", merchant="Kairyu", target_price="-5")
-    )
+    rc = watch.cmd_add(_args(url="https://kairyu.fr/products/some-handle", target_price="-5"))
 
     assert rc == 1
     assert crud.list_watch_rules(session) == []
@@ -155,15 +180,9 @@ def test_add_rejects_negative_target_price(
 
 def test_add_rejects_zero_check_interval(session: Session, monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_session(monkeypatch, session)
-    monkeypatch.setattr(watch, "ShopifyConnector", _FakeShopifyConnectorSuccess)
+    monkeypatch.setattr(watch, "find_merchant_for_domain", lambda host: _fake_merchant_success())
 
-    rc = watch.cmd_add(
-        _args(
-            url="https://kairyu.fr/products/some-handle",
-            merchant="Kairyu",
-            check_interval="0",
-        )
-    )
+    rc = watch.cmd_add(_args(url="https://kairyu.fr/products/some-handle", check_interval="0"))
 
     assert rc == 1
     assert crud.list_watch_rules(session) == []

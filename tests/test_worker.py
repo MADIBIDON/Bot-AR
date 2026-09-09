@@ -145,6 +145,39 @@ def test_one_failing_rule_does_not_block_the_other(session: Session) -> None:
     assert results_by_rule[rule_bad.id].success is False
 
 
+def test_one_merchant_failing_does_not_block_the_other_two(session: Session) -> None:
+    """Phase 14: three real-shaped merchants in the same registry — a
+    connector error on one must never stop the other two from being
+    checked in the same tick."""
+    merchant_a, _, listing_a, rule_a = _setup_rule(
+        session, merchant_name="MerchantA", external_id="a-1", check_interval=1
+    )
+    _, _, listing_b, rule_b = _setup_rule(
+        session, merchant_name="MerchantB", external_id="b-1", check_interval=1
+    )
+    _, _, listing_c, rule_c = _setup_rule(
+        session, merchant_name="MerchantC", external_id="c-1", check_interval=1
+    )
+
+    registry = ConnectorRegistry()
+    registry.register(
+        "MerchantA", FakeStoreConnector(products={"a-1": _fake_product(url="https://a.example/1")})
+    )
+    registry.register(
+        "MerchantB", FakeStoreConnector(errors={"b-1": ConnectorError("HTTP 503 fetching x")})
+    )
+    registry.register(
+        "MerchantC", FakeStoreConnector(products={"c-1": _fake_product(url="https://c.example/1")})
+    )
+
+    pairs = run_monitoring_tick(session, registry)
+    results_by_rule = {rule.id: result for rule, result in pairs}
+
+    assert results_by_rule[rule_a.id].success is True
+    assert results_by_rule[rule_b.id].success is False
+    assert results_by_rule[rule_c.id].success is True
+
+
 # --- app.worker: tick() adds decision + notification ----------------------
 
 
