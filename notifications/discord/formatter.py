@@ -17,6 +17,7 @@ from engine.change_detection import EventType
 if TYPE_CHECKING:
     from engine.change_detection import MonitoringEvent
     from engine.opportunity import OpportunityResult
+    from market_data.estimator import ResaleEstimate
     from products.matcher import MatchResult
     from products.observation import ProductObservation
 
@@ -51,6 +52,7 @@ def format_event_embed(
     match_result: MatchResult,
     *,
     opportunity: OpportunityResult | None = None,
+    resale_estimate: ResaleEstimate | None = None,
 ) -> discord.Embed:
     embed = discord.Embed(
         title=_EVENT_TITLES.get(event.event_type, str(event.event_type)),
@@ -83,4 +85,12 @@ def format_event_embed(
         embed.add_field(name="ROI", value=f"{opportunity.roi_pct}%", inline=True)
         embed.add_field(name="Margin", value=f"{opportunity.net_margin_pct}%", inline=True)
         embed.add_field(name="Opportunity", value=opportunity.status.value, inline=True)
+    if resale_estimate is not None and resale_estimate.sample_size > 0:
+        embed.add_field(name="Market source", value=resale_estimate.source, inline=True)
+        embed.add_field(
+            name="Market sample size", value=str(resale_estimate.sample_size), inline=True
+        )
+        embed.add_field(
+            name="Market confidence", value=resale_estimate.confidence.value, inline=True
+        )
     return embed

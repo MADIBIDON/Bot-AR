@@ -163,3 +163,73 @@ def test_multiple_events_send_one_embed_each() -> None:
     asyncio.run(notify_events_if_allowed(_rule(), _observation(), _match(), events, notifier))
 
     assert len(notifier.sent_embeds) == 2
+
+
+def test_market_mode_without_registry_sends_embed_with_no_opportunity() -> None:
+    """Phase 16: a market-mode rule with no registry provided (e.g. eBay
+    not configured) must never crash the pipeline — the embed is still
+    sent for the event, just without opportunity/market enrichment."""
+    from database.models import Product
+
+    notifier = FakeNotifier()
+    rule = _rule(resale_price_mode="market", market_source="ebay", product=Product(id=1, name="X"))
+
+    decision = asyncio.run(
+        notify_events_if_allowed(rule, _observation(), _match(), (_event(),), notifier)
+    )
+
+    assert decision.allowed is True
+    assert len(notifier.sent_embeds) == 1
+    field_names = {field.name for field in notifier.sent_embeds[0].fields}
+    assert "Opportunity" not in field_names
+    assert "Market source" not in field_names
+
+
+def test_market_mode_with_registry_enriches_embed() -> None:
+    from database.models import Product
+    from market_data.base import MarketDataSource
+    from market_data.cache import TTLCache
+    from market_data.models import MarketObservation
+    from market_data.registry import MarketDataRegistry
+
+    class FakeSource(MarketDataSource):
+        def search(self, query: str, *, limit: int = 20) -> list[MarketObservation]:
+            return [
+                MarketObservation(
+                    source="ebay",
+                    product_name="Pokemon ETB Test",
+                    price=Decimal(p),
+                    currency="EUR",
+                    listing_url="https://ebay.example/1",
+                    external_id="1",
+                    observed_at=datetime.now(UTC),
+                )
+                for p in ("90", "100", "110")
+            ]
+
+    registry = MarketDataRegistry()
+    registry.register("ebay", FakeSource())
+
+    notifier = FakeNotifier()
+    rule = _rule(
+        resale_price_mode="market",
+        market_source="ebay",
+        product=Product(id=1, name="Pokemon ETB Test"),
+    )
+
+    asyncio.run(
+        notify_events_if_allowed(
+            rule,
+            _observation(price=Decimal("74.90")),
+            _match(),
+            (_event(),),
+            notifier,
+            registry,
+            TTLCache(),
+        )
+    )
+
+    assert len(notifier.sent_embeds) == 1
+    field_names = {field.name for field in notifier.sent_embeds[0].fields}
+    assert "Market source" in field_names
+    assert "Opportunity" in field_names

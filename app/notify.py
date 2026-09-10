@@ -18,6 +18,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import TYPE_CHECKING, Protocol
 
+from app.resale import resolve_resale_price_for_opportunity
 from engine.decision import DecisionResult, evaluate
 from engine.opportunity import OpportunityConfig, OpportunityResult, evaluate_opportunity
 from notifications.discord.formatter import format_event_embed
@@ -27,6 +28,9 @@ if TYPE_CHECKING:
 
     from database.models import WatchRule
     from engine.change_detection import MonitoringEvent
+    from market_data.cache import TTLCache
+    from market_data.estimator import ResaleEstimate
+    from market_data.registry import MarketDataRegistry
     from products.matcher import MatchResult
     from products.observation import ProductObservation
 
@@ -38,17 +42,25 @@ class EmbedSender(Protocol):
     async def send_embed(self, embed: discord.Embed) -> None: ...
 
 
-def _opportunity_for(watch_rule: WatchRule, purchase_price: Decimal) -> OpportunityResult | None:
-    if watch_rule.estimated_resale_price is None:
-        return None
+def _opportunity_for(
+    watch_rule: WatchRule,
+    purchase_price: Decimal,
+    market_registry: MarketDataRegistry | None,
+    cache: TTLCache | None,
+) -> tuple[OpportunityResult | None, ResaleEstimate | None]:
+    resale_price, resale_estimate = resolve_resale_price_for_opportunity(
+        watch_rule, market_registry, cache
+    )
+    if resale_price is None:
+        return None, resale_estimate
     config = OpportunityConfig(
-        estimated_resale_price=watch_rule.estimated_resale_price,
+        estimated_resale_price=resale_price,
         platform_fee_pct=watch_rule.platform_fee_pct or Decimal("0"),
         fixed_fee=watch_rule.fixed_fee or Decimal("0"),
         shipping_cost=watch_rule.shipping_cost or Decimal("0"),
         other_costs=watch_rule.other_costs or Decimal("0"),
     )
-    return evaluate_opportunity(purchase_price, config)
+    return evaluate_opportunity(purchase_price, config), resale_estimate
 
 
 async def notify_events_if_allowed(
@@ -57,17 +69,29 @@ async def notify_events_if_allowed(
     match_result: MatchResult,
     events: tuple[MonitoringEvent, ...],
     notifier: EmbedSender,
+    market_registry: MarketDataRegistry | None = None,
+    cache: TTLCache | None = None,
 ) -> DecisionResult:
     """Evaluate current state once; notify one embed per event only if allowed.
 
     No events -> nothing to report even when allowed (avoids notifying on
     every unchanged check). Not allowed -> never notifies, regardless of
-    what changed.
+    what changed. market_registry/cache default to None so every existing
+    caller and test (manual resale mode only) is unaffected; they are only
+    needed when a WatchRule has resale_price_mode="market".
     """
     decision = evaluate(watch_rule, observation, match_result)
     if decision.allowed:
-        opportunity = _opportunity_for(watch_rule, observation.price)
+        opportunity, resale_estimate = _opportunity_for(
+            watch_rule, observation.price, market_registry, cache
+        )
         for event in events:
-            embed = format_event_embed(event, observation, match_result, opportunity=opportunity)
+            embed = format_event_embed(
+                event,
+                observation,
+                match_result,
+                opportunity=opportunity,
+                resale_estimate=resale_estimate,
+            )
             await notifier.send_embed(embed)
     return decision

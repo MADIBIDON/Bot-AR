@@ -166,6 +166,10 @@ class WatchRule(Base):
             "other_costs IS NULL OR other_costs >= 0",
             name="ck_watch_rule_other_costs_non_negative",
         ),
+        CheckConstraint(
+            "resale_price_mode IN ('manual', 'market')",
+            name="ck_watch_rule_resale_price_mode_valid",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -183,6 +187,14 @@ class WatchRule(Base):
     fixed_fee: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), default=None)
     shipping_cost: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), default=None)
     other_costs: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), default=None)
+
+    # Phase 16 — how to source the resale price for the Opportunity Engine.
+    # "manual" (default) preserves Phase 15 behavior exactly: use
+    # estimated_resale_price as-is. "market" fetches live market_data/
+    # observations for market_source instead; estimated_resale_price is
+    # then ignored (kept as an optional fallback value only).
+    resale_price_mode: Mapped[str] = mapped_column(default="manual", nullable=False)
+    market_source: Mapped[str | None] = mapped_column(default=None)
 
     enabled: Mapped[bool] = mapped_column(default=True, nullable=False)
     check_interval: Mapped[int] = mapped_column(nullable=False)

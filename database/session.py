@@ -51,6 +51,12 @@ _WATCH_RULE_OPPORTUNITY_COLUMNS = {
 }
 
 
+_WATCH_RULE_MARKET_DATA_COLUMNS = {
+    "resale_price_mode": "TEXT NOT NULL DEFAULT 'manual'",
+    "market_source": "TEXT",
+}
+
+
 def _ensure_watch_rule_opportunity_columns(engine: Engine) -> None:
     """Lightweight, idempotent patch for a SQLite database created before
     Phase 15 added these columns to WatchRule.
@@ -67,6 +73,9 @@ def _ensure_watch_rule_opportunity_columns(engine: Engine) -> None:
     with engine.connect() as conn:
         existing = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(watch_rules)")}
         for column, sql_type in _WATCH_RULE_OPPORTUNITY_COLUMNS.items():
+            if column not in existing:
+                conn.exec_driver_sql(f"ALTER TABLE watch_rules ADD COLUMN {column} {sql_type}")
+        for column, sql_type in _WATCH_RULE_MARKET_DATA_COLUMNS.items():
             if column not in existing:
                 conn.exec_driver_sql(f"ALTER TABLE watch_rules ADD COLUMN {column} {sql_type}")
         conn.commit()

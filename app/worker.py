@@ -29,6 +29,8 @@ if TYPE_CHECKING:
     from app.notify import EmbedSender
     from connectors.registry import ConnectorRegistry
     from engine.monitoring import MonitoringResult
+    from market_data.cache import TTLCache
+    from market_data.registry import MarketDataRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +44,8 @@ async def tick(
     *,
     now: datetime | None = None,
     backoff: BackoffTracker | None = None,
+    market_registry: MarketDataRegistry | None = None,
+    market_cache: TTLCache | None = None,
 ) -> list[MonitoringResult]:
     """One full pass: run due checks, notify for whatever the Decision
     Engine allows. Never notifies when a check failed, when there are no
@@ -63,7 +67,13 @@ async def tick(
 
         try:
             decision = await notify_events_if_allowed(
-                watch_rule, result.observation, result.match_result, result.events, notifier
+                watch_rule,
+                result.observation,
+                result.match_result,
+                result.events,
+                notifier,
+                market_registry,
+                market_cache,
             )
         except Exception:
             logger.exception("notification failed watch_rule=%s", watch_rule.id)
@@ -87,12 +97,17 @@ async def run_forever(
     *,
     poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS,
     stop_event: asyncio.Event | None = None,
+    market_registry: MarketDataRegistry | None = None,
+    market_cache: TTLCache | None = None,
 ) -> None:
     """Runs `tick()` in a loop until `stop_event` is set.
 
     One BackoffTracker is created here and reused for every tick of this
     run, so a rule that starts failing actually backs off across ticks
-    instead of being retried every single poll.
+    instead of being retried every single poll. market_registry/market_cache
+    are similarly created once by the caller (app/main_worker.py) and
+    reused across ticks so the TTL cache actually avoids re-fetching; both
+    default to None so manual-mode-only setups need neither.
 
     Waits on the stop event with a timeout instead of a plain sleep, so
     shutdown is immediate rather than waiting out the rest of the poll
@@ -105,7 +120,14 @@ async def run_forever(
     logger.info("worker started")
     try:
         while not stop_event.is_set():
-            await tick(session, registry, notifier, backoff=backoff)
+            await tick(
+                session,
+                registry,
+                notifier,
+                backoff=backoff,
+                market_registry=market_registry,
+                market_cache=market_cache,
+            )
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(stop_event.wait(), timeout=poll_interval)
     finally:

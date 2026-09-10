@@ -372,9 +372,9 @@ def test_test_command_displays_opportunity_when_configured(
     assert rc == 0
     output = capsys.readouterr().out
     assert "Opportunity:" in output
-    assert "net profit:       18.70 EUR" in output
-    assert "ROI:              24.97%" in output
-    assert "status:           buy_candidate" in output
+    assert "net profit: 18.70 EUR" in output
+    assert "ROI: 24.97%" in output
+    assert "status: buy_candidate" in output
 
 
 def test_test_command_reports_opportunity_not_configured(
@@ -439,6 +439,8 @@ def _edit_args(id: int, **overrides: object) -> argparse.Namespace:
         fixed_fee=None,
         shipping_cost=None,
         other_costs=None,
+        resale_price_mode=None,
+        market_source=None,
     )
     defaults.update(overrides)
     return argparse.Namespace(id=id, **defaults)
@@ -697,3 +699,453 @@ def test_status_reports_last_check_and_event(
     assert "never" not in output.split("last check:")[1].splitlines()[0]
     assert "last event:" in output
     assert "price_drop" in output
+
+
+# --- market data (Phase 16) -------------------------------------------
+
+from market_data.base import MarketDataError, MarketDataSource  # noqa: E402
+from market_data.ebay import MissingEbayConfigError  # noqa: E402
+from market_data.models import MarketObservation  # noqa: E402
+from market_data.registry import MarketDataRegistry  # noqa: E402
+
+
+class _FakeMarketSource(MarketDataSource):
+    def __init__(
+        self, observations: list[MarketObservation] | None = None, *, error: bool = False
+    ) -> None:
+        self._observations = observations or []
+        self._error = error
+
+    def search(self, query: str, *, limit: int = 20) -> list[MarketObservation]:
+        if self._error:
+            raise MarketDataError("simulated")
+        return self._observations
+
+
+@pytest.fixture(autouse=True)
+def _clear_market_cache() -> None:
+    """The CLI's module-level TTLCache is process-lifetime by design (see
+    scripts/watch.py), but that means tests must not leak cached estimates
+    into each other via the shared "source:product_name" cache key."""
+    watch._market_cache.clear()
+    yield
+    watch._market_cache.clear()
+
+
+def _market_obs(price: str, name: str = "Duopack Evoli") -> MarketObservation:
+    from datetime import UTC, datetime
+
+    return MarketObservation(
+        source="ebay",
+        product_name=name,
+        price=Decimal(price),
+        currency="EUR",
+        listing_url="https://ebay.example/1",
+        external_id="1",
+        observed_at=datetime.now(UTC),
+    )
+
+
+def test_edit_sets_market_mode_and_source(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_session(monkeypatch, session)
+    rule_id = _seed_rule(session)
+
+    rc = watch.cmd_edit(_edit_args(rule_id, resale_price_mode="market", market_source="ebay"))
+
+    assert rc == 0
+    rule = crud.get_watch_rule(session, rule_id)
+    assert rule.resale_price_mode == "market"
+    assert rule.market_source == "ebay"
+
+
+def test_edit_market_mode_without_source_is_rejected(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_session(monkeypatch, session)
+    rule_id = _seed_rule(session)
+
+    rc = watch.cmd_edit(_edit_args(rule_id, resale_price_mode="market"))
+
+    assert rc == 1
+
+
+def test_edit_rejects_unsupported_market_source(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_session(monkeypatch, session)
+    rule_id = _seed_rule(session)
+
+    rc = watch.cmd_edit(_edit_args(rule_id, market_source="cardmarket"))
+
+    assert rc == 1
+
+
+def test_market_command_requires_market_mode(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_session(monkeypatch, session)
+    rule_id = _seed_rule(session)
+
+    rc = watch.cmd_market(argparse.Namespace(id=rule_id))
+
+    assert rc == 1
+
+
+def test_market_command_reports_diagnostics(
+    session: Session, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _patch_session(monkeypatch, session)
+    rule_id = _seed_rule(session)
+    watch.cmd_edit(_edit_args(rule_id, resale_price_mode="market", market_source="ebay"))
+
+    registry = MarketDataRegistry()
+    registry.register(
+        "ebay", _FakeMarketSource([_market_obs("90"), _market_obs("100"), _market_obs("110")])
+    )
+    monkeypatch.setattr(watch, "_build_market_registry", lambda: registry)
+
+    rc = watch.cmd_market(argparse.Namespace(id=rule_id))
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "Market source: ebay" in output
+    assert "Matched observations: 3" in output
+    assert "Median: 100" in output
+
+
+def test_market_command_missing_config_reports_error(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_session(monkeypatch, session)
+    rule_id = _seed_rule(session)
+    watch.cmd_edit(_edit_args(rule_id, resale_price_mode="market", market_source="ebay"))
+
+    def raise_missing() -> None:
+        raise MissingEbayConfigError("Missing required environment variable(s): EBAY_APP_ID")
+
+    monkeypatch.setattr(watch, "_build_market_registry", raise_missing)
+
+    rc = watch.cmd_market(argparse.Namespace(id=rule_id))
+
+    assert rc == 1
+
+
+def test_test_command_market_mode_shows_market_estimate(
+    session: Session, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _patch_session(monkeypatch, session)
+
+    product = crud.create_product(session, "Duopack Evoli")
+    merchant = crud.create_merchant(session, "FakeStore")
+    listing = crud.create_listing(
+        session,
+        product_id=product.id,
+        merchant_id=merchant.id,
+        url="https://a.example/p/1",
+        external_id="fake-1",
+    )
+    rule = crud.create_watch_rule(
+        session, product_id=product.id, listing_id=listing.id, check_interval=1, max_quantity=1
+    )
+    crud.update_watch_rule(session, rule.id, resale_price_mode="market", market_source="ebay")
+
+    def fake_registry() -> ConnectorRegistry:
+        registry = ConnectorRegistry()
+        registry.register(
+            "FakeStore",
+            FakeStoreConnector(
+                products={
+                    "fake-1": {
+                        "name": "Duopack Evoli",
+                        "price": 60.0,
+                        "available": True,
+                        "seller": "FakeStore",
+                        "url": "https://a.example/p/1",
+                    }
+                }
+            ),
+        )
+        return registry
+
+    market_registry = MarketDataRegistry()
+    market_registry.register(
+        "ebay", _FakeMarketSource([_market_obs("90"), _market_obs("100"), _market_obs("110")])
+    )
+
+    monkeypatch.setattr(watch, "_build_registry", fake_registry)
+    monkeypatch.setattr(watch, "_build_market_registry", lambda: market_registry)
+    monkeypatch.setattr(watch, "load_discord_config", lambda: DiscordConfig("x", 1, 1))
+    monkeypatch.setattr(watch, "DiscordNotifier", _FakeAsyncNotifier)
+
+    rc = watch.cmd_test(argparse.Namespace(id=rule.id))
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "Market estimate:" in output
+    assert "source: ebay" in output
+    assert "Opportunity:" in output
+    assert "purchase price: 60.0 EUR" in output
+
+
+def test_test_command_market_mode_unavailable_falls_back_gracefully(
+    session: Session, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _patch_session(monkeypatch, session)
+
+    product = crud.create_product(session, "Duopack Evoli")
+    merchant = crud.create_merchant(session, "FakeStore")
+    listing = crud.create_listing(
+        session,
+        product_id=product.id,
+        merchant_id=merchant.id,
+        url="https://a.example/p/1",
+        external_id="fake-1",
+    )
+    rule = crud.create_watch_rule(
+        session, product_id=product.id, listing_id=listing.id, check_interval=1, max_quantity=1
+    )
+    crud.update_watch_rule(session, rule.id, resale_price_mode="market", market_source="ebay")
+
+    def fake_registry() -> ConnectorRegistry:
+        registry = ConnectorRegistry()
+        registry.register(
+            "FakeStore",
+            FakeStoreConnector(
+                products={
+                    "fake-1": {
+                        "name": "Duopack Evoli",
+                        "price": 60.0,
+                        "available": True,
+                        "seller": "FakeStore",
+                        "url": "https://a.example/p/1",
+                    }
+                }
+            ),
+        )
+        return registry
+
+    def raise_missing() -> None:
+        raise MissingEbayConfigError("Missing required environment variable(s): EBAY_APP_ID")
+
+    monkeypatch.setattr(watch, "_build_registry", fake_registry)
+    monkeypatch.setattr(watch, "_build_market_registry", raise_missing)
+    monkeypatch.setattr(watch, "load_discord_config", lambda: DiscordConfig("x", 1, 1))
+    monkeypatch.setattr(watch, "DiscordNotifier", _FakeAsyncNotifier)
+
+    rc = watch.cmd_test(argparse.Namespace(id=rule.id))
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "market data unavailable" in output
+
+
+# --- opportunities (Phase 17) -------------------------------------------
+
+
+def _opportunities_args(**overrides: object) -> argparse.Namespace:
+    defaults = dict(top=None, min_priority=None)
+    defaults.update(overrides)
+    return argparse.Namespace(**defaults)
+
+
+def _seed_rule_with_observation(
+    session: Session,
+    *,
+    product_name: str,
+    external_id: str,
+    price: str,
+    merchant_name: str = "RetailerA",
+) -> int:
+    from datetime import UTC, datetime
+
+    from products.observation import ProductObservation
+
+    product = crud.create_product(session, product_name)
+    merchant = crud.get_merchant_by_name(session, merchant_name)
+    if merchant is None:
+        merchant = crud.create_merchant(session, merchant_name)
+    listing = crud.create_listing(
+        session,
+        product_id=product.id,
+        merchant_id=merchant.id,
+        url=f"https://a.example/p/{external_id}",
+        external_id=external_id,
+    )
+    rule = crud.create_watch_rule(
+        session, product_id=product.id, listing_id=listing.id, check_interval=60, max_quantity=1
+    )
+    obs = ProductObservation(
+        merchant=merchant_name,
+        external_id=external_id,
+        name=product_name,
+        price=Decimal(price),
+        currency="EUR",
+        available=True,
+        url=f"https://a.example/p/{external_id}",
+        observed_at=datetime.now(UTC),
+    )
+    crud.create_observation_record(session, listing_id=listing.id, observation=obs)
+    return rule.id
+
+
+def test_opportunities_with_no_rules_reports_nothing(
+    session: Session, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _patch_session(monkeypatch, session)
+
+    rc = watch.cmd_opportunities(_opportunities_args())
+
+    assert rc == 0
+    assert "No rankable opportunities." in capsys.readouterr().out
+
+
+def test_opportunities_ranks_manual_mode_rules(
+    session: Session, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _patch_session(monkeypatch, session)
+
+    good_id = _seed_rule_with_observation(
+        session, product_name="Great Deal", external_id="good-1", price="50"
+    )
+    crud.update_watch_rule(session, good_id, estimated_resale_price=Decimal("150"))
+
+    bad_id = _seed_rule_with_observation(
+        session, product_name="Bad Deal", external_id="bad-1", price="90"
+    )
+    crud.update_watch_rule(session, bad_id, estimated_resale_price=Decimal("95"))
+
+    rc = watch.cmd_opportunities(_opportunities_args())
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "Great Deal" in output
+    assert "Bad Deal" in output
+    # Better ROI should be listed first.
+    assert output.index("Great Deal") < output.index("Bad Deal")
+
+
+def test_opportunities_skips_rules_without_estimate(
+    session: Session, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _patch_session(monkeypatch, session)
+    _seed_rule_with_observation(
+        session, product_name="No Estimate", external_id="none-1", price="50"
+    )
+
+    rc = watch.cmd_opportunities(_opportunities_args())
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "No Estimate" in output
+    assert "no resale estimate available" in output
+
+
+def test_opportunities_skips_rules_with_no_data_yet(
+    session: Session, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _patch_session(monkeypatch, session)
+    product = crud.create_product(session, "Never Checked")
+    merchant = crud.create_merchant(session, "RetailerB")
+    listing = crud.create_listing(
+        session,
+        product_id=product.id,
+        merchant_id=merchant.id,
+        url="https://a.example/p/never",
+        external_id="never-1",
+    )
+    crud.create_watch_rule(
+        session, product_id=product.id, listing_id=listing.id, check_interval=60, max_quantity=1
+    )
+
+    rc = watch.cmd_opportunities(_opportunities_args())
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "1 rule(s) skipped: no monitoring data yet." in output
+    assert "No rankable opportunities." in output
+
+
+def test_opportunities_top_limits_results(
+    session: Session, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _patch_session(monkeypatch, session)
+    for i in range(3):
+        rule_id = _seed_rule_with_observation(
+            session, product_name=f"Product {i}", external_id=f"p-{i}", price="50"
+        )
+        crud.update_watch_rule(session, rule_id, estimated_resale_price=Decimal(str(100 + i * 10)))
+
+    rc = watch.cmd_opportunities(_opportunities_args(top=1))
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    lines = [line for line in output.splitlines() if " | " in line]
+    # header + exactly one data row
+    assert len(lines) == 2
+
+
+def test_opportunities_min_priority_filters_low_scores(
+    session: Session, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _patch_session(monkeypatch, session)
+    weak_id = _seed_rule_with_observation(
+        session, product_name="Barely Profitable", external_id="weak-1", price="95"
+    )
+    crud.update_watch_rule(session, weak_id, estimated_resale_price=Decimal("96"))
+
+    rc = watch.cmd_opportunities(_opportunities_args(min_priority="top"))
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "No rankable opportunities." in output
+
+
+def test_opportunities_market_mode_without_credentials_shows_market_unavailable(
+    session: Session, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _patch_session(monkeypatch, session)
+    rule_id = _seed_rule_with_observation(
+        session, product_name="Market Product", external_id="market-1", price="50"
+    )
+    crud.update_watch_rule(session, rule_id, resale_price_mode="market", market_source="ebay")
+
+    def raise_missing() -> None:
+        raise MissingEbayConfigError("Missing required environment variable(s): EBAY_APP_ID")
+
+    monkeypatch.setattr(watch, "_build_market_registry", raise_missing)
+
+    rc = watch.cmd_opportunities(_opportunities_args())
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "market unavailable" in output
+    assert "Market Product" in output
+
+
+def test_opportunities_does_not_crash_without_ebay_and_mixes_manual_rules(
+    session: Session, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _patch_session(monkeypatch, session)
+    manual_id = _seed_rule_with_observation(
+        session, product_name="Manual Product", external_id="manual-1", price="50"
+    )
+    crud.update_watch_rule(session, manual_id, estimated_resale_price=Decimal("150"))
+
+    market_id = _seed_rule_with_observation(
+        session, product_name="Market Product", external_id="market-2", price="50"
+    )
+    crud.update_watch_rule(session, market_id, resale_price_mode="market", market_source="ebay")
+
+    def raise_missing() -> None:
+        raise MissingEbayConfigError("Missing required environment variable(s): EBAY_APP_ID")
+
+    monkeypatch.setattr(watch, "_build_market_registry", raise_missing)
+
+    rc = watch.cmd_opportunities(_opportunities_args())
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "Manual Product" in output
+    assert "Market Product" in output

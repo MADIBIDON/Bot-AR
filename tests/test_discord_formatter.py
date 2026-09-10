@@ -125,3 +125,58 @@ def test_embed_with_opportunity_adds_metrics_fields() -> None:
     assert _field(embed, "ROI") == "24.97%"
     assert _field(embed, "Margin") == "17.00%"
     assert _field(embed, "Opportunity") == "buy_candidate"
+
+
+def test_embed_without_resale_estimate_has_no_market_fields() -> None:
+    embed = format_event_embed(_event(EventType.PRICE_DROP), _observation(), _match())
+    assert _field(embed, "Market source") is None
+
+
+def test_embed_with_resale_estimate_adds_market_fields() -> None:
+    from market_data.estimator import Confidence, ResaleEstimate
+
+    estimate = ResaleEstimate(
+        estimated_price=Decimal("100"),
+        sample_size=5,
+        min_price=Decimal("90"),
+        max_price=Decimal("110"),
+        median_price=Decimal("100"),
+        mean_price=Decimal("100"),
+        confidence=Confidence.MEDIUM,
+        source="ebay",
+        method="median",
+        based_on_sold_data=False,
+        reason="test",
+    )
+
+    embed = format_event_embed(
+        _event(EventType.PRICE_DROP), _observation(), _match(), resale_estimate=estimate
+    )
+
+    assert _field(embed, "Market source") == "ebay"
+    assert _field(embed, "Market sample size") == "5"
+    assert _field(embed, "Market confidence") == "medium"
+
+
+def test_embed_with_empty_resale_estimate_has_no_market_fields() -> None:
+    from market_data.estimator import Confidence, ResaleEstimate
+
+    estimate = ResaleEstimate(
+        estimated_price=None,
+        sample_size=0,
+        min_price=None,
+        max_price=None,
+        median_price=None,
+        mean_price=None,
+        confidence=Confidence.LOW,
+        source="unknown",
+        method="none",
+        based_on_sold_data=False,
+        reason="no observations",
+    )
+
+    embed = format_event_embed(
+        _event(EventType.PRICE_DROP), _observation(), _match(), resale_estimate=estimate
+    )
+
+    assert _field(embed, "Market source") is None

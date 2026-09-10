@@ -29,6 +29,10 @@ from dotenv import load_dotenv
 from app.worker import DEFAULT_POLL_INTERVAL_SECONDS, run_forever
 from connectors.defaults import build_default_registry
 from database.session import create_all, get_engine, get_session_factory
+from market_data.cache import TTLCache
+from market_data.defaults import build_default_market_registry
+from market_data.ebay import MissingEbayConfigError
+from market_data.registry import MarketDataRegistry
 from notifications.discord.client import DiscordNotifier
 from notifications.discord.config import load_discord_config
 
@@ -36,6 +40,19 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 PID_FILE = Path("data") / "worker.pid"
+
+
+def _build_market_registry() -> MarketDataRegistry | None:
+    """None (not an empty registry) when no market source is configured, so
+    resolve_resale_price_for_opportunity's None-check falls back cleanly —
+    WatchRules in "manual" mode are entirely unaffected either way, and a
+    "market" mode rule just gets no estimate (logged) instead of a crash.
+    """
+    try:
+        return build_default_market_registry()
+    except MissingEbayConfigError as exc:
+        logger.warning("market data disabled: %s", exc)
+        return None
 
 
 async def main() -> None:
@@ -47,6 +64,8 @@ async def main() -> None:
     session = get_session_factory(engine)()
 
     registry = build_default_registry()
+    market_registry = _build_market_registry()
+    market_cache = TTLCache()
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -64,6 +83,8 @@ async def main() -> None:
                 notifier,
                 poll_interval=DEFAULT_POLL_INTERVAL_SECONDS,
                 stop_event=stop_event,
+                market_registry=market_registry,
+                market_cache=market_cache,
             )
     finally:
         session.close()

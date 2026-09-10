@@ -7,12 +7,16 @@ Usage:
                                  [--max-quantity N] [--yes]
     python scripts/watch.py edit <id> [--target-price X] [--max-price X]
                                        [--check-interval N] [--max-quantity N]
+                                       [--resale-price-mode manual|market]
+                                       [--market-source ebay]
     python scripts/watch.py list [--status enabled|disabled|all]
     python scripts/watch.py show <id>
     python scripts/watch.py enable <id>
     python scripts/watch.py disable <id>
     python scripts/watch.py delete <id>
     python scripts/watch.py test <id>
+    python scripts/watch.py market <id>
+    python scripts/watch.py opportunities [--top N] [--min-priority LOW|MEDIUM|HIGH|TOP]
     python scripts/watch.py status
 
 `add --url` identifies the merchant/connector automatically from the
@@ -44,6 +48,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.notify import notify_events_if_allowed
+from app.opportunity_snapshot import build_opportunity_candidate
+from app.resale import resolve_resale_estimate
 from connectors.base import ConnectorError, ConnectorProduct, ProductNotFoundError
 from connectors.defaults import (
     build_default_registry,
@@ -55,17 +61,29 @@ from database.models import WatchRule
 from database.session import create_all, get_engine, get_session_factory
 from engine.monitoring import run_check_and_store
 from engine.opportunity import OpportunityConfig, evaluate_opportunity
+from engine.ranking import Priority, RankingConfig, RankingThresholds, rank_opportunities
 from engine.worker import MIN_CHECK_INTERVAL_SECONDS
+from market_data.cache import TTLCache
+from market_data.defaults import SUPPORTED_MARKET_SOURCES, build_default_market_registry
+from market_data.ebay import MissingEbayConfigError
 from notifications.discord.client import DiscordNotifier
 from notifications.discord.config import load_discord_config
 
 PID_FILE = Path("data") / "worker.pid"
+
+_market_cache = TTLCache()
 
 
 def _build_registry():
     """Thin alias kept for tests to monkeypatch a per-test registry
     without touching connectors/defaults.py."""
     return build_default_registry()
+
+
+def _build_market_registry():
+    """Thin alias kept for tests to monkeypatch, same reasoning as
+    _build_registry(). Callers must handle MissingEbayConfigError."""
+    return build_default_market_registry()
 
 
 def _get_session() -> Session:
@@ -138,6 +156,14 @@ def _parse_fee_pct(raw: str) -> Decimal:
     if value >= 100:
         raise ValueError(f"platform_fee_pct must be less than 100, got {value}")
     return value
+
+
+def _parse_market_source(raw: str) -> str:
+    if raw not in SUPPORTED_MARKET_SOURCES:
+        raise ValueError(
+            f"market_source must be one of {', '.join(SUPPORTED_MARKET_SOURCES)}, got {raw!r}"
+        )
+    return raw
 
 
 @dataclass
@@ -328,6 +354,11 @@ def cmd_show(args: argparse.Namespace) -> int:
     print(f"max_price:      {rule.max_price}")
     print(f"check_interval: {rule.check_interval}s")
     print(f"max_quantity:   {rule.max_quantity}")
+    print(f"resale mode:    {rule.resale_price_mode}")
+    if rule.resale_price_mode == "market":
+        print(f"market source:  {rule.market_source}")
+    else:
+        print(f"resale price:   {rule.estimated_resale_price}")
     return 0
 
 
@@ -382,10 +413,19 @@ def cmd_edit(args: argparse.Namespace) -> int:
             )
         if args.other_costs is not None:
             fields["other_costs"] = _parse_non_negative_decimal("other_costs", args.other_costs)
+        if args.resale_price_mode is not None:
+            fields["resale_price_mode"] = args.resale_price_mode
+        if args.market_source is not None:
+            fields["market_source"] = _parse_market_source(args.market_source)
 
         effective_target = fields.get("target_price", rule.target_price)
         effective_max = fields.get("max_price", rule.max_price)
         _validate_price_order(effective_target, effective_max)
+
+        effective_mode = fields.get("resale_price_mode", rule.resale_price_mode)
+        effective_source = fields.get("market_source", rule.market_source)
+        if effective_mode == "market" and effective_source is None:
+            raise ValueError("resale_price_mode=market requires --market-source")
     except ValueError as exc:
         print(f"Invalid value: {exc}")
         return 1
@@ -394,7 +434,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
         print(
             "Nothing to update — pass at least one of --target-price/--max-price/"
             "--check-interval/--max-quantity/--estimated-resale-price/--platform-fee-pct/"
-            "--fixed-fee/--shipping-cost/--other-costs."
+            "--fixed-fee/--shipping-cost/--other-costs/--resale-price-mode/--market-source."
         )
         return 1
 
@@ -437,10 +477,23 @@ async def _run_test(session: Session, rule: WatchRule) -> int:
         f"confidence={result.match_result.confidence} matched={result.match_result.matched}"
     )
 
-    config = load_discord_config()
-    async with DiscordNotifier(config) as notifier:
+    market_registry = None
+    if rule.resale_price_mode == "market":
+        try:
+            market_registry = _build_market_registry()
+        except MissingEbayConfigError as exc:
+            print(f"market data unavailable: {exc}")
+
+    discord_config = load_discord_config()
+    async with DiscordNotifier(discord_config) as notifier:
         decision = await notify_events_if_allowed(
-            rule, result.observation, result.match_result, result.events, notifier
+            rule,
+            result.observation,
+            result.match_result,
+            result.events,
+            notifier,
+            market_registry,
+            _market_cache,
         )
 
     event_names = [e.event_type.value for e in result.events] or ["none"]
@@ -451,23 +504,46 @@ async def _run_test(session: Session, rule: WatchRule) -> int:
     notified = decision.allowed and bool(result.events)
     print(f"notified: {notified}")
 
+    resale_price: Decimal | None = rule.estimated_resale_price
+    if rule.resale_price_mode == "market":
+        print("Market estimate:")
+        if market_registry is None:
+            print("  source: unavailable (market source not configured)")
+            resale_price = None
+        else:
+            estimate = resolve_resale_estimate(rule, market_registry, _market_cache)
+            if estimate is None or estimate.sample_size == 0:
+                print("  no comparable market observations found")
+                resale_price = None
+            else:
+                print(f"  source: {estimate.source}")
+                print(f"  sample size: {estimate.sample_size}")
+                print(f"  estimated resale: {estimate.estimated_price} {obs.currency}")
+                print(f"  confidence: {estimate.confidence.value}")
+                resale_price = estimate.estimated_price
+        print()
+
     print("Opportunity:")
-    if rule.estimated_resale_price is None:
-        print("  not configured (no estimated_resale_price on this watch rule)")
+    if resale_price is None:
+        if rule.resale_price_mode == "market":
+            print("  not available (market data unavailable)")
+        else:
+            print("  not configured (no estimated_resale_price on this watch rule)")
     else:
         config = OpportunityConfig(
-            estimated_resale_price=rule.estimated_resale_price,
+            estimated_resale_price=resale_price,
             platform_fee_pct=rule.platform_fee_pct or Decimal("0"),
             fixed_fee=rule.fixed_fee or Decimal("0"),
             shipping_cost=rule.shipping_cost or Decimal("0"),
             other_costs=rule.other_costs or Decimal("0"),
         )
         opportunity = evaluate_opportunity(obs.price, config)
+        print(f"  purchase price: {obs.price} {obs.currency}")
         print(f"  estimated resale: {opportunity.estimated_resale_price} {obs.currency}")
-        print(f"  net profit:       {opportunity.net_profit} {obs.currency}")
-        print(f"  ROI:              {opportunity.roi_pct}%")
-        print(f"  margin:           {opportunity.net_margin_pct}%")
-        print(f"  status:           {opportunity.status.value}")
+        print(f"  net profit: {opportunity.net_profit} {obs.currency}")
+        print(f"  ROI: {opportunity.roi_pct}%")
+        print(f"  margin: {opportunity.net_margin_pct}%")
+        print(f"  status: {opportunity.status.value}")
     return 0
 
 
@@ -478,6 +554,114 @@ def cmd_test(args: argparse.Namespace) -> int:
         print(f"No watch_rule={args.id}")
         return 1
     return asyncio.run(_run_test(session, rule))
+
+
+def cmd_market(args: argparse.Namespace) -> int:
+    session = _get_session()
+    rule = crud.get_watch_rule(session, args.id)
+    if rule is None:
+        print(f"No watch_rule={args.id}")
+        return 1
+    if rule.resale_price_mode != "market":
+        print(
+            f"watch_rule={rule.id} resale_price_mode={rule.resale_price_mode!r}, not 'market'. "
+            f"Use `edit {rule.id} --resale-price-mode market --market-source <name>` first."
+        )
+        return 1
+
+    try:
+        market_registry = _build_market_registry()
+    except MissingEbayConfigError as exc:
+        print(f"market data unavailable: {exc}")
+        return 1
+
+    estimate = resolve_resale_estimate(rule, market_registry, _market_cache)
+    print(f"Market source: {rule.market_source}")
+    if estimate is None:
+        print("Matched observations: unavailable (fetch failed — see logs)")
+        return 1
+    print(f"Matched observations: {estimate.sample_size}")
+    if estimate.sample_size == 0:
+        print("No comparable observations found.")
+        return 0
+    print(f"Prices: min={estimate.min_price} max={estimate.max_price} mean={estimate.mean_price}")
+    print(f"Median: {estimate.median_price}")
+    print(f"Estimated resale: {estimate.estimated_price}")
+    print(f"Confidence: {estimate.confidence.value}")
+    print(f"Method: {estimate.method}")
+    print(f"Reason: {estimate.reason}")
+    return 0
+
+
+_PRIORITY_ORDER = [Priority.IGNORE, Priority.LOW, Priority.MEDIUM, Priority.HIGH, Priority.TOP]
+
+
+def cmd_opportunities(args: argparse.Namespace) -> int:
+    session = _get_session()
+    rules = crud.list_watch_rules(session, enabled=True)
+    rules_by_id = {rule.id: rule for rule in rules}
+
+    market_registry = None
+    if any(rule.resale_price_mode == "market" for rule in rules):
+        try:
+            market_registry = _build_market_registry()
+        except MissingEbayConfigError as exc:
+            print(f"market unavailable: {exc}")
+            print()
+
+    candidates = []
+    skipped_no_data = 0
+    for rule in rules:
+        candidate = build_opportunity_candidate(session, rule, market_registry, _market_cache)
+        if candidate is None:
+            skipped_no_data += 1
+            continue
+        candidates.append(candidate)
+
+    if skipped_no_data:
+        print(f"{skipped_no_data} rule(s) skipped: no monitoring data yet.")
+
+    ranked = rank_opportunities(candidates, RankingConfig(), RankingThresholds())
+
+    if args.min_priority is not None:
+        min_index = _PRIORITY_ORDER.index(Priority(args.min_priority.lower()))
+        ranked = [r for r in ranked if _PRIORITY_ORDER.index(r.priority) >= min_index]
+
+    if args.top is not None:
+        ranked = ranked[: args.top]
+
+    if not ranked:
+        print("No rankable opportunities.")
+        return 0
+
+    header = (
+        f"{'ID':<4} | {'Merchant':<14} | {'Product':<28} | {'Buy':>8} | "
+        f"{'Resale':>8} | {'Profit':>8} | {'ROI':>7} | {'Score':>6} | Priority"
+    )
+    print(header)
+    for r in ranked:
+        resale = str(r.estimated_resale_price) if r.estimated_resale_price is not None else "-"
+        profit = str(r.net_profit) if r.net_profit is not None else "-"
+        roi = f"{r.roi_pct}%" if r.roi_pct is not None else "-"
+        score = str(r.score) if not r.excluded else "-"
+        priority = "ignore" if r.excluded else r.priority.value
+        print(
+            f"{r.watch_rule_id:<4} | {r.merchant:<14} | {r.product_name:<28} | "
+            f"{str(r.purchase_price):>8} | {resale:>8} | {profit:>8} | {roi:>7} | "
+            f"{score:>6} | {priority}"
+        )
+        if r.excluded and r.exclusion_reason:
+            reason = r.exclusion_reason
+            watch_rule = rules_by_id.get(r.watch_rule_id)
+            if (
+                reason == "no resale estimate available"
+                and watch_rule is not None
+                and watch_rule.resale_price_mode == "market"
+                and market_registry is None
+            ):
+                reason = "market unavailable"
+            print(f"     ({reason})")
+    return 0
 
 
 def _worker_status() -> str:
@@ -550,6 +734,10 @@ def build_parser() -> argparse.ArgumentParser:
     edit_parser.add_argument("--fixed-fee", dest="fixed_fee")
     edit_parser.add_argument("--shipping-cost", dest="shipping_cost")
     edit_parser.add_argument("--other-costs", dest="other_costs")
+    edit_parser.add_argument(
+        "--resale-price-mode", dest="resale_price_mode", choices=["manual", "market"]
+    )
+    edit_parser.add_argument("--market-source", dest="market_source")
     edit_parser.set_defaults(func=cmd_edit)
 
     list_parser = subparsers.add_parser("list", help="List watch rules.")
@@ -562,10 +750,24 @@ def build_parser() -> argparse.ArgumentParser:
         ("disable", cmd_disable, "Disable a watch rule."),
         ("delete", cmd_delete, "Delete a watch rule."),
         ("test", cmd_test, "Run one check immediately."),
+        ("market", cmd_market, "Show market data diagnostics for a watch rule."),
     ):
         sub = subparsers.add_parser(name, help=help_text)
         sub.add_argument("id", type=int)
         sub.set_defaults(func=func)
+
+    opportunities_parser = subparsers.add_parser(
+        "opportunities", help="Rank active watch rules by opportunity score."
+    )
+    opportunities_parser.add_argument("--top", type=int, default=None)
+    opportunities_parser.add_argument(
+        "--min-priority",
+        dest="min_priority",
+        choices=["ignore", "low", "medium", "high", "top"],
+        default=None,
+        type=str.lower,
+    )
+    opportunities_parser.set_defaults(func=cmd_opportunities)
 
     status_parser = subparsers.add_parser("status", help="Show overall system status.")
     status_parser.set_defaults(func=cmd_status)
