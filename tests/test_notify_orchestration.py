@@ -118,6 +118,44 @@ def test_allowed_but_no_events_sends_no_notification() -> None:
     assert notifier.sent_embeds == []
 
 
+def test_opportunity_configured_but_no_events_still_sends_no_notification() -> None:
+    """Phase 15 regression: an opportunity score never triggers a
+    notification on its own — the existing policy (allowed decision + at
+    least one event) is unchanged."""
+    notifier = FakeNotifier()
+    rule = _rule(
+        estimated_resale_price=Decimal("110"),
+        platform_fee_pct=Decimal("9"),
+        shipping_cost=Decimal("6.50"),
+    )
+
+    decision = asyncio.run(notify_events_if_allowed(rule, _observation(), _match(), (), notifier))
+
+    assert decision.decision_code == DecisionCode.ALLOW
+    assert notifier.sent_embeds == []
+
+
+def test_opportunity_enriches_embed_when_event_and_configured() -> None:
+    notifier = FakeNotifier()
+    rule = _rule(
+        estimated_resale_price=Decimal("110"),
+        platform_fee_pct=Decimal("9"),
+        shipping_cost=Decimal("6.50"),
+    )
+
+    asyncio.run(
+        notify_events_if_allowed(
+            rule, _observation(price=Decimal("74.90")), _match(), (_event(),), notifier
+        )
+    )
+
+    assert len(notifier.sent_embeds) == 1
+    embed = notifier.sent_embeds[0]
+    field_names = {field.name for field in embed.fields}
+    assert "Opportunity" in field_names
+    assert "ROI" in field_names
+
+
 def test_multiple_events_send_one_embed_each() -> None:
     notifier = FakeNotifier()
     events = (_event(), _event())

@@ -319,11 +319,127 @@ def test_test_command_runs_check_and_reports(
     assert len(crud.list_observation_records_for_listing(session, listing.id)) == 1
 
 
+def test_test_command_displays_opportunity_when_configured(
+    session: Session, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _patch_session(monkeypatch, session)
+
+    product = crud.create_product(session, "Duopack Evoli", ean="1234567890123")
+    merchant = crud.create_merchant(session, "FakeStore")
+    listing = crud.create_listing(
+        session,
+        product_id=product.id,
+        merchant_id=merchant.id,
+        url="https://a.example/p/1",
+        external_id="fake-1",
+    )
+    rule = crud.create_watch_rule(
+        session, product_id=product.id, listing_id=listing.id, check_interval=1, max_quantity=1
+    )
+    crud.update_watch_rule(
+        session,
+        rule.id,
+        estimated_resale_price=Decimal("110"),
+        platform_fee_pct=Decimal("9"),
+        shipping_cost=Decimal("6.50"),
+    )
+
+    def fake_registry() -> ConnectorRegistry:
+        registry = ConnectorRegistry()
+        registry.register(
+            "FakeStore",
+            FakeStoreConnector(
+                products={
+                    "fake-1": {
+                        "name": "Duopack Evoli",
+                        "price": 74.90,
+                        "available": True,
+                        "seller": "FakeStore",
+                        "url": "https://a.example/p/1",
+                        "ean": "1234567890123",
+                    }
+                }
+            ),
+        )
+        return registry
+
+    monkeypatch.setattr(watch, "_build_registry", fake_registry)
+    monkeypatch.setattr(watch, "load_discord_config", lambda: DiscordConfig("x", 1, 1))
+    monkeypatch.setattr(watch, "DiscordNotifier", _FakeAsyncNotifier)
+
+    rc = watch.cmd_test(argparse.Namespace(id=rule.id))
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "Opportunity:" in output
+    assert "net profit:       18.70 EUR" in output
+    assert "ROI:              24.97%" in output
+    assert "status:           buy_candidate" in output
+
+
+def test_test_command_reports_opportunity_not_configured(
+    session: Session, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _patch_session(monkeypatch, session)
+
+    product = crud.create_product(session, "Duopack Evoli")
+    merchant = crud.create_merchant(session, "FakeStore")
+    listing = crud.create_listing(
+        session,
+        product_id=product.id,
+        merchant_id=merchant.id,
+        url="https://a.example/p/1",
+        external_id="fake-1",
+    )
+    rule = crud.create_watch_rule(
+        session, product_id=product.id, listing_id=listing.id, check_interval=1, max_quantity=1
+    )
+
+    def fake_registry() -> ConnectorRegistry:
+        registry = ConnectorRegistry()
+        registry.register(
+            "FakeStore",
+            FakeStoreConnector(
+                products={
+                    "fake-1": {
+                        "name": "Duopack Evoli",
+                        "price": 13.99,
+                        "available": True,
+                        "seller": "FakeStore",
+                        "url": "https://a.example/p/1",
+                    }
+                }
+            ),
+        )
+        return registry
+
+    monkeypatch.setattr(watch, "_build_registry", fake_registry)
+    monkeypatch.setattr(watch, "load_discord_config", lambda: DiscordConfig("x", 1, 1))
+    monkeypatch.setattr(watch, "DiscordNotifier", _FakeAsyncNotifier)
+
+    rc = watch.cmd_test(argparse.Namespace(id=rule.id))
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "Opportunity:" in output
+    assert "not configured" in output
+
+
 # --- edit -------------------------------------------------------------
 
 
 def _edit_args(id: int, **overrides: object) -> argparse.Namespace:
-    defaults = dict(target_price=None, max_price=None, check_interval=None, max_quantity=None)
+    defaults = dict(
+        target_price=None,
+        max_price=None,
+        check_interval=None,
+        max_quantity=None,
+        estimated_resale_price=None,
+        platform_fee_pct=None,
+        fixed_fee=None,
+        shipping_cost=None,
+        other_costs=None,
+    )
     defaults.update(overrides)
     return argparse.Namespace(id=id, **defaults)
 
@@ -391,6 +507,76 @@ def test_edit_rejects_check_interval_below_minimum(
 def test_edit_missing_rule_returns_error(session: Session, monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_session(monkeypatch, session)
     assert watch.cmd_edit(_edit_args(999, target_price="10")) == 1
+
+
+# --- edit: opportunity fields (Phase 15) --------------------------------
+
+
+def test_edit_updates_opportunity_fields(session: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_session(monkeypatch, session)
+    rule_id = _seed_rule(session)
+
+    rc = watch.cmd_edit(
+        _edit_args(
+            rule_id,
+            estimated_resale_price="110",
+            platform_fee_pct="9",
+            shipping_cost="6.50",
+        )
+    )
+
+    assert rc == 0
+    rule = crud.get_watch_rule(session, rule_id)
+    assert rule.estimated_resale_price == Decimal("110")
+    assert rule.platform_fee_pct == Decimal("9")
+    assert rule.shipping_cost == Decimal("6.50")
+    assert rule.fixed_fee is None
+    assert rule.other_costs is None
+
+
+def test_edit_rejects_negative_estimated_resale_price(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_session(monkeypatch, session)
+    rule_id = _seed_rule(session)
+
+    rc = watch.cmd_edit(_edit_args(rule_id, estimated_resale_price="-10"))
+
+    assert rc == 1
+    assert crud.get_watch_rule(session, rule_id).estimated_resale_price is None
+
+
+def test_edit_rejects_platform_fee_pct_at_100(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_session(monkeypatch, session)
+    rule_id = _seed_rule(session)
+
+    rc = watch.cmd_edit(_edit_args(rule_id, platform_fee_pct="100"))
+
+    assert rc == 1
+    assert crud.get_watch_rule(session, rule_id).platform_fee_pct is None
+
+
+def test_edit_rejects_negative_shipping_cost(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_session(monkeypatch, session)
+    rule_id = _seed_rule(session)
+
+    rc = watch.cmd_edit(_edit_args(rule_id, shipping_cost="-1"))
+
+    assert rc == 1
+
+
+def test_edit_allows_zero_shipping_cost(session: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_session(monkeypatch, session)
+    rule_id = _seed_rule(session)
+
+    rc = watch.cmd_edit(_edit_args(rule_id, shipping_cost="0"))
+
+    assert rc == 0
+    assert crud.get_watch_rule(session, rule_id).shipping_cost == Decimal("0")
 
 
 def test_edit_with_no_fields_returns_error(

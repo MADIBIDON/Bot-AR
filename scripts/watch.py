@@ -54,6 +54,7 @@ from database import crud
 from database.models import WatchRule
 from database.session import create_all, get_engine, get_session_factory
 from engine.monitoring import run_check_and_store
+from engine.opportunity import OpportunityConfig, evaluate_opportunity
 from engine.worker import MIN_CHECK_INTERVAL_SECONDS
 from notifications.discord.client import DiscordNotifier
 from notifications.discord.config import load_discord_config
@@ -120,6 +121,23 @@ def _parse_check_interval(raw: str) -> int:
 def _validate_price_order(target_price: Decimal | None, max_price: Decimal | None) -> None:
     if target_price is not None and max_price is not None and max_price < target_price:
         raise ValueError(f"max_price ({max_price}) must be >= target_price ({target_price})")
+
+
+def _parse_non_negative_decimal(label: str, raw: str) -> Decimal:
+    try:
+        value = Decimal(raw)
+    except InvalidOperation:
+        raise ValueError(f"{label}: {raw!r} is not a valid number") from None
+    if value < 0:
+        raise ValueError(f"{label} must not be negative, got {value}")
+    return value
+
+
+def _parse_fee_pct(raw: str) -> Decimal:
+    value = _parse_non_negative_decimal("platform_fee_pct", raw)
+    if value >= 100:
+        raise ValueError(f"platform_fee_pct must be less than 100, got {value}")
+    return value
 
 
 @dataclass
@@ -350,6 +368,20 @@ def cmd_edit(args: argparse.Namespace) -> int:
             fields["check_interval"] = _parse_check_interval(args.check_interval)
         if args.max_quantity is not None:
             fields["max_quantity"] = _parse_positive_int("max_quantity", args.max_quantity)
+        if args.estimated_resale_price is not None:
+            fields["estimated_resale_price"] = _parse_positive_decimal(
+                "estimated_resale_price", args.estimated_resale_price
+            )
+        if args.platform_fee_pct is not None:
+            fields["platform_fee_pct"] = _parse_fee_pct(args.platform_fee_pct)
+        if args.fixed_fee is not None:
+            fields["fixed_fee"] = _parse_non_negative_decimal("fixed_fee", args.fixed_fee)
+        if args.shipping_cost is not None:
+            fields["shipping_cost"] = _parse_non_negative_decimal(
+                "shipping_cost", args.shipping_cost
+            )
+        if args.other_costs is not None:
+            fields["other_costs"] = _parse_non_negative_decimal("other_costs", args.other_costs)
 
         effective_target = fields.get("target_price", rule.target_price)
         effective_max = fields.get("max_price", rule.max_price)
@@ -360,8 +392,9 @@ def cmd_edit(args: argparse.Namespace) -> int:
 
     if not fields:
         print(
-            "Nothing to update — pass at least one of "
-            "--target-price/--max-price/--check-interval/--max-quantity."
+            "Nothing to update — pass at least one of --target-price/--max-price/"
+            "--check-interval/--max-quantity/--estimated-resale-price/--platform-fee-pct/"
+            "--fixed-fee/--shipping-cost/--other-costs."
         )
         return 1
 
@@ -417,6 +450,24 @@ async def _run_test(session: Session, rule: WatchRule) -> int:
     )
     notified = decision.allowed and bool(result.events)
     print(f"notified: {notified}")
+
+    print("Opportunity:")
+    if rule.estimated_resale_price is None:
+        print("  not configured (no estimated_resale_price on this watch rule)")
+    else:
+        config = OpportunityConfig(
+            estimated_resale_price=rule.estimated_resale_price,
+            platform_fee_pct=rule.platform_fee_pct or Decimal("0"),
+            fixed_fee=rule.fixed_fee or Decimal("0"),
+            shipping_cost=rule.shipping_cost or Decimal("0"),
+            other_costs=rule.other_costs or Decimal("0"),
+        )
+        opportunity = evaluate_opportunity(obs.price, config)
+        print(f"  estimated resale: {opportunity.estimated_resale_price} {obs.currency}")
+        print(f"  net profit:       {opportunity.net_profit} {obs.currency}")
+        print(f"  ROI:              {opportunity.roi_pct}%")
+        print(f"  margin:           {opportunity.net_margin_pct}%")
+        print(f"  status:           {opportunity.status.value}")
     return 0
 
 
@@ -494,6 +545,11 @@ def build_parser() -> argparse.ArgumentParser:
     edit_parser.add_argument("--max-price", dest="max_price")
     edit_parser.add_argument("--check-interval", dest="check_interval")
     edit_parser.add_argument("--max-quantity", dest="max_quantity")
+    edit_parser.add_argument("--estimated-resale-price", dest="estimated_resale_price")
+    edit_parser.add_argument("--platform-fee-pct", dest="platform_fee_pct")
+    edit_parser.add_argument("--fixed-fee", dest="fixed_fee")
+    edit_parser.add_argument("--shipping-cost", dest="shipping_cost")
+    edit_parser.add_argument("--other-costs", dest="other_costs")
     edit_parser.set_defaults(func=cmd_edit)
 
     list_parser = subparsers.add_parser("list", help="List watch rules.")

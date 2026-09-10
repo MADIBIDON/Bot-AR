@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from engine.change_detection import EventType, MonitoringEvent
+from engine.opportunity import OpportunityConfig, evaluate_opportunity
 from notifications.discord.formatter import format_event_embed
 from products.matcher import MatchResult
 from products.observation import ProductObservation
@@ -96,3 +97,31 @@ def test_embed_has_timestamp() -> None:
     event = _event(EventType.PRICE_DROP)
     embed = format_event_embed(event, _observation(), _match())
     assert embed.timestamp == event.occurred_at
+
+
+def test_embed_without_opportunity_has_no_opportunity_fields() -> None:
+    embed = format_event_embed(_event(EventType.PRICE_DROP), _observation(), _match())
+    assert _field(embed, "Opportunity") is None
+    assert _field(embed, "ROI") is None
+
+
+def test_embed_with_opportunity_adds_metrics_fields() -> None:
+    config = OpportunityConfig(
+        estimated_resale_price=Decimal("110"),
+        platform_fee_pct=Decimal("9"),
+        shipping_cost=Decimal("6.50"),
+    )
+    opportunity = evaluate_opportunity(Decimal("74.90"), config)
+
+    embed = format_event_embed(
+        _event(EventType.PRICE_DROP),
+        _observation(price=Decimal("74.90")),
+        _match(),
+        opportunity=opportunity,
+    )
+
+    assert _field(embed, "Estimated resale") == "110.00 EUR"
+    assert _field(embed, "Net profit") == "18.70 EUR"
+    assert _field(embed, "ROI") == "24.97%"
+    assert _field(embed, "Margin") == "17.00%"
+    assert _field(embed, "Opportunity") == "buy_candidate"

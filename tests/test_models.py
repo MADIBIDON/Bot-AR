@@ -280,3 +280,94 @@ def test_watch_rule_priority_must_be_within_bounds(session: Session) -> None:
     session.add(WatchRule(product_id=product.id, check_interval=300, max_quantity=1, priority=11))
     with pytest.raises(IntegrityError):
         session.commit()
+
+
+def test_watch_rule_estimated_resale_price_must_be_positive(session: Session) -> None:
+    product = Product(name="Duopack Evoli 30 ans")
+    session.add(product)
+    session.commit()
+
+    session.add(
+        WatchRule(
+            product_id=product.id,
+            check_interval=300,
+            max_quantity=1,
+            estimated_resale_price=0,
+        )
+    )
+    with pytest.raises(IntegrityError):
+        session.commit()
+
+
+def test_watch_rule_platform_fee_pct_must_be_below_100(session: Session) -> None:
+    product = Product(name="Duopack Evoli 30 ans")
+    session.add(product)
+    session.commit()
+
+    session.add(
+        WatchRule(product_id=product.id, check_interval=300, max_quantity=1, platform_fee_pct=100)
+    )
+    with pytest.raises(IntegrityError):
+        session.commit()
+
+
+def test_watch_rule_platform_fee_pct_must_not_be_negative(session: Session) -> None:
+    product = Product(name="Duopack Evoli 30 ans")
+    session.add(product)
+    session.commit()
+
+    session.add(
+        WatchRule(product_id=product.id, check_interval=300, max_quantity=1, platform_fee_pct=-1)
+    )
+    with pytest.raises(IntegrityError):
+        session.commit()
+
+
+def test_watch_rule_fixed_fee_must_not_be_negative(session: Session) -> None:
+    product = Product(name="Duopack Evoli 30 ans")
+    session.add(product)
+    session.commit()
+
+    session.add(WatchRule(product_id=product.id, check_interval=300, max_quantity=1, fixed_fee=-1))
+    with pytest.raises(IntegrityError):
+        session.commit()
+
+
+def test_watch_rule_shipping_cost_zero_is_allowed(session: Session) -> None:
+    product = Product(name="Duopack Evoli 30 ans")
+    session.add(product)
+    session.commit()
+
+    rule = WatchRule(product_id=product.id, check_interval=300, max_quantity=1, shipping_cost=0)
+    session.add(rule)
+    session.commit()  # must not raise: zero shipping is a legitimate cost
+
+    assert rule.shipping_cost == 0
+
+
+def test_watch_rule_other_costs_must_not_be_negative(session: Session) -> None:
+    product = Product(name="Duopack Evoli 30 ans")
+    session.add(product)
+    session.commit()
+
+    session.add(
+        WatchRule(product_id=product.id, check_interval=300, max_quantity=1, other_costs=-1)
+    )
+    with pytest.raises(IntegrityError):
+        session.commit()
+
+
+def test_watch_rule_opportunity_fields_default_to_none(session: Session) -> None:
+    product = Product(name="Duopack Evoli 30 ans")
+    session.add(product)
+    session.commit()
+
+    rule = WatchRule(product_id=product.id, check_interval=300, max_quantity=1)
+    session.add(rule)
+    session.commit()
+
+    assert rule.estimated_resale_price is None
+    assert rule.platform_fee_pct is None
+    assert rule.fixed_fee is None
+    assert rule.shipping_cost is None
+    assert rule.other_costs is None

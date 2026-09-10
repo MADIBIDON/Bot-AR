@@ -147,6 +147,25 @@ class WatchRule(Base):
         CheckConstraint("check_interval > 0", name="ck_watch_rule_check_interval_positive"),
         CheckConstraint("max_quantity > 0", name="ck_watch_rule_max_quantity_positive"),
         CheckConstraint("priority >= 0 AND priority <= 10", name="ck_watch_rule_priority_range"),
+        CheckConstraint(
+            "estimated_resale_price IS NULL OR estimated_resale_price > 0",
+            name="ck_watch_rule_estimated_resale_price_positive",
+        ),
+        CheckConstraint(
+            "platform_fee_pct IS NULL OR (platform_fee_pct >= 0 AND platform_fee_pct < 100)",
+            name="ck_watch_rule_platform_fee_pct_range",
+        ),
+        CheckConstraint(
+            "fixed_fee IS NULL OR fixed_fee >= 0", name="ck_watch_rule_fixed_fee_non_negative"
+        ),
+        CheckConstraint(
+            "shipping_cost IS NULL OR shipping_cost >= 0",
+            name="ck_watch_rule_shipping_cost_non_negative",
+        ),
+        CheckConstraint(
+            "other_costs IS NULL OR other_costs >= 0",
+            name="ck_watch_rule_other_costs_non_negative",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -155,6 +174,15 @@ class WatchRule(Base):
 
     target_price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), default=None)
     max_price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), default=None)
+
+    # Opportunity Engine config (Phase 15) — manually supplied, no live
+    # marketplace lookup exists yet. All optional: no resale estimate
+    # means engine.opportunity.evaluate_opportunity() has nothing to do.
+    estimated_resale_price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), default=None)
+    platform_fee_pct: Mapped[Decimal | None] = mapped_column(Numeric(5, 2), default=None)
+    fixed_fee: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), default=None)
+    shipping_cost: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), default=None)
+    other_costs: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), default=None)
 
     enabled: Mapped[bool] = mapped_column(default=True, nullable=False)
     check_interval: Mapped[int] = mapped_column(nullable=False)
