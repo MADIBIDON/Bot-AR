@@ -8,6 +8,7 @@ engine/ never imports this.
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import TYPE_CHECKING
 
 import discord
@@ -20,6 +21,7 @@ if TYPE_CHECKING:
     from market_data.estimator import ResaleEstimate
     from products.matcher import MatchResult
     from products.observation import ProductObservation
+    from purchase.models import PurchaseIntent
 
 _EVENT_TITLES: dict[EventType, str] = {
     EventType.STOCK_AVAILABLE: "📦 Back in Stock",
@@ -93,4 +95,50 @@ def format_event_embed(
         embed.add_field(
             name="Market confidence", value=resale_estimate.confidence.value, inline=True
         )
+    return embed
+
+
+_PURCHASE_TITLE_COLORS: dict[str, discord.Color] = {
+    "PURCHASE STARTED": discord.Color.blue(),
+    "PURCHASE SUCCESS": discord.Color.green(),
+    "PURCHASE FAILED": discord.Color.red(),
+    "HUMAN ACTION REQUIRED": discord.Color.orange(),
+    "AUTOMATED CHECKOUT UNSUPPORTED": discord.Color.orange(),
+}
+
+
+def format_purchase_embed(
+    title: str,
+    intent: PurchaseIntent,
+    *,
+    reason: str,
+    final_price: Decimal | None = None,
+    shipping_cost: Decimal | None = None,
+    total_cost: Decimal | None = None,
+    order_reference: str | None = None,
+) -> discord.Embed:
+    """Purchase-lifecycle embed — distinct from format_event_embed's "a
+    price/stock event happened" alert. Never includes payment data: only
+    product/merchant/price/quantity/order-reference fields ever appear
+    here, matching purchase/base.py's guarantee end to end."""
+    embed = discord.Embed(
+        title=title,
+        url=intent.url,
+        color=_PURCHASE_TITLE_COLORS.get(title, discord.Color.blurple()),
+        timestamp=intent.created_at,
+    )
+    embed.add_field(name="Product", value=intent.product_name, inline=False)
+    embed.add_field(name="Merchant", value=intent.merchant, inline=True)
+    embed.add_field(name="Observed price", value=f"{intent.observed_price}", inline=True)
+    embed.add_field(name="Quantity", value=str(intent.quantity), inline=True)
+    embed.add_field(name="Max allowed", value=f"{intent.max_price_allowed}", inline=True)
+    if final_price is not None:
+        embed.add_field(name="Product price", value=f"{final_price}", inline=True)
+    if shipping_cost is not None:
+        embed.add_field(name="Shipping", value=f"{shipping_cost}", inline=True)
+    if total_cost is not None:
+        embed.add_field(name="Total", value=f"{total_cost}", inline=True)
+    if order_reference is not None:
+        embed.add_field(name="Order ID", value=order_reference, inline=True)
+    embed.add_field(name="Reason", value=reason, inline=False)
     return embed

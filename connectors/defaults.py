@@ -60,6 +60,17 @@ def find_merchant_for_domain(hostname: str) -> MerchantDefinition | None:
     return None
 
 
+def domains_for_merchant(name: str) -> tuple[str, ...]:
+    """Reverse of find_merchant_for_domain — used by the purchase engine
+    to check a WatchRule's merchant against PURCHASE_ALLOWED_MERCHANTS
+    (which lists domains, not display names). Empty for an unknown
+    merchant name — never guesses."""
+    for merchant in MERCHANTS:
+        if merchant.name == name:
+            return merchant.domains
+    return ()
+
+
 def supported_domains_summary() -> str:
     return "\n".join(f"  {merchant.name}: {', '.join(merchant.domains)}" for merchant in MERCHANTS)
 

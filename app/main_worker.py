@@ -39,6 +39,8 @@ from market_data.ebay import MissingEbayConfigError
 from market_data.registry import MarketDataRegistry
 from notifications.discord.client import DiscordNotifier
 from notifications.discord.config import load_discord_config
+from purchase.config import load_purchase_policy
+from purchase.defaults import build_default_purchase_registry
 
 PID_FILE = Path("data") / "worker.pid"
 LOG_FILE = Path("logs") / "worker.log"
@@ -93,6 +95,15 @@ async def main() -> None:
     registry = build_default_registry()
     market_registry = _build_market_registry()
     market_cache = TTLCache()
+    purchase_registry = build_default_purchase_registry()
+    purchase_policy = load_purchase_policy()
+    if purchase_policy.enabled:
+        logger.info(
+            "automated purchasing ENABLED — allowed merchants: %s",
+            ", ".join(sorted(purchase_policy.allowed_merchant_domains)) or "(none configured)",
+        )
+    else:
+        logger.info("automated purchasing disabled (PURCHASES_ENABLED != true)")
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -109,6 +120,8 @@ async def main() -> None:
                 stop_event=stop_event,
                 market_registry=market_registry,
                 market_cache=market_cache,
+                purchase_registry=purchase_registry,
+                purchase_policy=purchase_policy,
             )
     finally:
         session.close()

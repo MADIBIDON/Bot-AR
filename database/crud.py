@@ -9,11 +9,19 @@ from datetime import datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from database.models import EventRecord, Listing, Merchant, ObservationRecord, Product, WatchRule
+from database.models import (
+    EventRecord,
+    Listing,
+    Merchant,
+    ObservationRecord,
+    Product,
+    PurchaseAttempt,
+    WatchRule,
+)
 
 if TYPE_CHECKING:
     from products.observation import ProductObservation
@@ -186,6 +194,11 @@ def get_watch_rule(session: Session, watch_rule_id: int) -> WatchRule | None:
     return session.get(WatchRule, watch_rule_id)
 
 
+def get_watch_rule_by_listing_id(session: Session, listing_id: int) -> WatchRule | None:
+    stmt = select(WatchRule).where(WatchRule.listing_id == listing_id)
+    return session.scalars(stmt).first()
+
+
 def list_watch_rules(
     session: Session,
     *,
@@ -323,3 +336,91 @@ def get_most_recent_observation(session: Session) -> ObservationRecord | None:
 def get_most_recent_event(session: Session) -> EventRecord | None:
     stmt = select(EventRecord).order_by(EventRecord.occurred_at.desc()).limit(1)
     return session.scalars(stmt).first()
+
+
+_ACTIVE_PURCHASE_STATUS_VALUES = ("created", "validating", "checkout_started")
+
+
+def get_active_purchase_attempt_for_listing(
+    session: Session, listing_id: int
+) -> PurchaseAttempt | None:
+    """The idempotency check: is there already an in-flight attempt for
+    this listing? See database/models.py::PurchaseAttempt for why calling
+    this immediately before create_purchase_attempt(), with no `await` in
+    between, is a sufficient lock in this project's single-worker-process
+    architecture."""
+    stmt = select(PurchaseAttempt).where(
+        PurchaseAttempt.listing_id == listing_id,
+        PurchaseAttempt.status.in_(_ACTIVE_PURCHASE_STATUS_VALUES),
+    )
+    return session.scalars(stmt).first()
+
+
+def get_most_recent_purchase_attempt_for_listing(
+    session: Session, listing_id: int
+) -> PurchaseAttempt | None:
+    stmt = (
+        select(PurchaseAttempt)
+        .where(PurchaseAttempt.listing_id == listing_id)
+        .order_by(PurchaseAttempt.created_at.desc())
+        .limit(1)
+    )
+    return session.scalars(stmt).first()
+
+
+def create_purchase_attempt(
+    session: Session,
+    *,
+    watch_rule_id: int,
+    listing_id: int,
+    status: str,
+    observed_price: Decimal,
+    max_price_allowed: Decimal,
+    quantity: int,
+) -> PurchaseAttempt:
+    attempt = PurchaseAttempt(
+        watch_rule_id=watch_rule_id,
+        listing_id=listing_id,
+        status=status,
+        observed_price=observed_price,
+        max_price_allowed=max_price_allowed,
+        quantity=quantity,
+    )
+    session.add(attempt)
+    session.commit()
+    session.refresh(attempt)
+    return attempt
+
+
+def update_purchase_attempt(
+    session: Session, purchase_attempt_id: int, **fields: object
+) -> PurchaseAttempt | None:
+    attempt = session.get(PurchaseAttempt, purchase_attempt_id)
+    if attempt is None:
+        return None
+    for key, value in fields.items():
+        if not hasattr(attempt, key):
+            raise AttributeError(f"PurchaseAttempt has no field {key!r}")
+        setattr(attempt, key, value)
+    session.commit()
+    session.refresh(attempt)
+    return attempt
+
+
+def list_purchase_attempts(session: Session, *, limit: int | None = None) -> list[PurchaseAttempt]:
+    stmt = select(PurchaseAttempt).order_by(PurchaseAttempt.created_at.desc())
+    if limit is not None:
+        stmt = stmt.limit(limit)
+    return list(session.scalars(stmt))
+
+
+def sum_purchased_total_since(session: Session, since: datetime) -> Decimal:
+    """Total actually spent (PURCHASED attempts' total_cost) since
+    `since` — used for the daily budget gate. Never counts a
+    non-purchased attempt (FAILED/CANCELLED/etc. never spent anything)."""
+    stmt = select(func.sum(PurchaseAttempt.total_cost)).where(
+        PurchaseAttempt.status == "purchased",
+        PurchaseAttempt.created_at >= since,
+    )
+    total = session.scalar(stmt)
+    return total if total is not None else Decimal("0")

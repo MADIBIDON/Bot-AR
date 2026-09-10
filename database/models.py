@@ -285,3 +285,69 @@ class EventRecord(Base):
             f"EventRecord(id={self.id!r}, event_type={self.event_type!r}, "
             f"watch_rule_id={self.watch_rule_id!r})"
         )
+
+
+class PurchaseAttempt(Base):
+    """One attempted automated purchase. purchase/engine.py is the only
+    writer; this table is pure history/audit, never read by the
+    monitoring fast path.
+
+    Dry runs (scripts/watch.py purchase-test) never create a row here —
+    only a real attempt (PURCHASES_ENABLED=true, past every safety gate)
+    does, so this table's rows always mean "the engine actually tried
+    something", not "someone ran a test". order_reference is a merchant
+    order id/number only — never a payment token, card detail, or session
+    cookie; see purchase/base.py for that guarantee end to end.
+
+    Idempotency (Phase 19 spec): the purchase engine only ever creates a
+    new row for a listing after checking there is no existing row for
+    that listing_id whose status is still in _ACTIVE_PURCHASE_STATUSES,
+    and does so without any `await` between that check and this insert —
+    safe because app/pidfile.py already guarantees a single worker
+    process, so nothing else can interleave on the same event loop
+    between the check and the write.
+    """
+
+    __tablename__ = "purchase_attempts"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('created', 'validating', 'checkout_started', 'purchased', "
+            "'failed', 'human_action_required', 'automated_checkout_unsupported', "
+            "'cancelled')",
+            name="ck_purchase_attempt_status_valid",
+        ),
+        CheckConstraint("quantity > 0", name="ck_purchase_attempt_quantity_positive"),
+        CheckConstraint("observed_price > 0", name="ck_purchase_attempt_observed_price_positive"),
+        CheckConstraint(
+            "max_price_allowed > 0", name="ck_purchase_attempt_max_price_allowed_positive"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    watch_rule_id: Mapped[int] = mapped_column(ForeignKey("watch_rules.id"), nullable=False)
+    listing_id: Mapped[int] = mapped_column(ForeignKey("listings.id"), nullable=False)
+
+    status: Mapped[str] = mapped_column(nullable=False)
+
+    observed_price: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
+    max_price_allowed: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
+    quantity: Mapped[int] = mapped_column(nullable=False)
+
+    final_price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), default=None)
+    shipping_cost: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), default=None)
+    total_cost: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), default=None)
+
+    order_reference: Mapped[str | None] = mapped_column(default=None)
+    failure_reason: Mapped[str | None] = mapped_column(default=None)
+
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+    watch_rule: Mapped[WatchRule] = relationship()
+    listing: Mapped[Listing] = relationship()
+
+    def __repr__(self) -> str:
+        return (
+            f"PurchaseAttempt(id={self.id!r}, listing_id={self.listing_id!r}, "
+            f"status={self.status!r})"
+        )

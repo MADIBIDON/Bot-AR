@@ -17,6 +17,9 @@ Usage:
     python scripts/watch.py test <id>
     python scripts/watch.py market <id>
     python scripts/watch.py opportunities [--top N] [--min-priority LOW|MEDIUM|HIGH|TOP]
+    python scripts/watch.py purchases [--limit N]
+    python scripts/watch.py purchase-status
+    python scripts/watch.py purchase-test <listing_id>
     python scripts/watch.py status
 
 `add --url` identifies the merchant/connector automatically from the
@@ -38,6 +41,7 @@ import argparse
 import asyncio
 import sys
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from urllib.parse import urlparse
@@ -53,6 +57,7 @@ from app.resale import resolve_resale_estimate
 from connectors.base import ConnectorError, ConnectorProduct, ProductNotFoundError
 from connectors.defaults import (
     build_default_registry,
+    domains_for_merchant,
     find_merchant_for_domain,
     supported_domains_summary,
 )
@@ -68,6 +73,8 @@ from market_data.defaults import SUPPORTED_MARKET_SOURCES, build_default_market_
 from market_data.ebay import MissingEbayConfigError
 from notifications.discord.client import DiscordNotifier
 from notifications.discord.config import load_discord_config
+from purchase.config import load_purchase_policy
+from purchase.engine import build_decision_context, build_purchase_intent, evaluate_purchase_intent
 
 PID_FILE = Path("data") / "worker.pid"
 
@@ -664,6 +671,116 @@ def cmd_opportunities(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_purchases(args: argparse.Namespace) -> int:
+    session = _get_session()
+    attempts = crud.list_purchase_attempts(session, limit=args.limit)
+    if not attempts:
+        print("No purchase attempts recorded.")
+        return 0
+
+    header = (
+        f"{'ID':<5} | {'Rule':<5} | {'Status':<28} | {'Price':>8} | {'Total':>8} | "
+        f"{'Order ref':<16} | Created"
+    )
+    print(header)
+    for a in attempts:
+        total = str(a.total_cost) if a.total_cost is not None else "-"
+        order_ref = a.order_reference or "-"
+        print(
+            f"{a.id:<5} | {a.watch_rule_id:<5} | {a.status:<28} | {str(a.observed_price):>8} | "
+            f"{total:>8} | {order_ref:<16} | {a.created_at.isoformat()}"
+        )
+        if a.failure_reason:
+            print(f"        ({a.failure_reason})")
+    return 0
+
+
+def cmd_purchase_status(args: argparse.Namespace) -> int:
+    session = _get_session()
+    policy = load_purchase_policy()
+
+    print(f"PURCHASES_ENABLED:          {policy.enabled}")
+    print(
+        "PURCHASE_MAX_ORDER_EUR:     "
+        f"{policy.max_order_eur if policy.max_order_eur is not None else 'not set'}"
+    )
+    print(
+        "PURCHASE_MAX_DAILY_EUR:     "
+        f"{policy.max_daily_eur if policy.max_daily_eur is not None else 'not set'}"
+    )
+    allowed = ", ".join(sorted(policy.allowed_merchant_domains)) or "(none)"
+    print(f"PURCHASE_ALLOWED_MERCHANTS: {allowed}")
+    print(f"PURCHASE_COOLDOWN_SECONDS:  {policy.cooldown_seconds}")
+
+    since = (datetime.now(UTC) - timedelta(days=1)).replace(tzinfo=None)
+    spent_today = crud.sum_purchased_total_since(session, since)
+    print(f"Spent in last 24h:          {spent_today}")
+
+    attempts = crud.list_purchase_attempts(session, limit=1)
+    if attempts:
+        last = attempts[0]
+        print(f"Most recent attempt:       #{last.id} status={last.status} ({last.created_at})")
+    else:
+        print("Most recent attempt:       none")
+    return 0
+
+
+def cmd_purchase_test(args: argparse.Namespace) -> int:
+    """DRY RUN only: runs the full detection -> validation -> budget
+    pipeline and prints what would happen, but never persists a
+    PurchaseAttempt and never calls a connector's revalidate()/checkout()
+    — see purchase/engine.py's module docstring for why those two steps
+    are deliberately skipped here."""
+    session = _get_session()
+    rule = crud.get_watch_rule_by_listing_id(session, args.listing_id)
+    if rule is None:
+        print(f"No watch_rule found for listing_id={args.listing_id}")
+        return 1
+
+    registry = _build_registry()
+    result = run_check_and_store(session, rule, registry)
+    if not result.success:
+        print(f"check failed: {result.error}")
+        return 1
+
+    policy = load_purchase_policy()
+    intent = build_purchase_intent(rule, result.observation, result.match_result)
+    total_cost = intent.observed_price * intent.quantity
+    has_active, since_last, spent_today = build_decision_context(session, intent)
+    merchant_domains = domains_for_merchant(intent.merchant)
+
+    decision = evaluate_purchase_intent(
+        watch_rule=rule,
+        intent=intent,
+        policy=policy,
+        merchant_domains=merchant_domains,
+        match_confidence=result.match_result.confidence,
+        available=result.observation.available,
+        total_cost=total_cost,
+        has_active_attempt=has_active,
+        seconds_since_last_attempt=since_last,
+        spent_today=spent_today,
+    )
+
+    print("DRY RUN")
+    print()
+    print(f"Product: {intent.product_name}")
+    print(f"Merchant: {intent.merchant}")
+    print(f"Observed price: {intent.observed_price}")
+    print(f"Final expected cost: {total_cost}")
+    print(f"Max allowed: {rule.max_price}")
+    print(f"Quantity: {intent.quantity}")
+    print(f"Match confidence: {result.match_result.confidence}")
+    print(f"Budget check: {'OK' if decision.proceed else 'FAILED'}")
+    print()
+    print(f"WOULD PURCHASE: {'YES' if decision.proceed else 'NO'}")
+    if not decision.proceed:
+        print(f"Reason: {decision.reason}")
+    print()
+    print("No transaction executed.")
+    return 0
+
+
 def _worker_status() -> str:
     return pidfile.describe_status(pidfile.get_status(PID_FILE))
 
@@ -758,6 +875,21 @@ def build_parser() -> argparse.ArgumentParser:
         type=str.lower,
     )
     opportunities_parser.set_defaults(func=cmd_opportunities)
+
+    purchases_parser = subparsers.add_parser("purchases", help="List recorded purchase attempts.")
+    purchases_parser.add_argument("--limit", type=int, default=None)
+    purchases_parser.set_defaults(func=cmd_purchases)
+
+    purchase_status_parser = subparsers.add_parser(
+        "purchase-status", help="Show the automated-purchase policy and recent spend."
+    )
+    purchase_status_parser.set_defaults(func=cmd_purchase_status)
+
+    purchase_test_parser = subparsers.add_parser(
+        "purchase-test", help="Dry-run the purchase pipeline for one listing — never buys."
+    )
+    purchase_test_parser.add_argument("listing_id", type=int)
+    purchase_test_parser.set_defaults(func=cmd_purchase_test)
 
     status_parser = subparsers.add_parser("status", help="Show overall system status.")
     status_parser.set_defaults(func=cmd_status)

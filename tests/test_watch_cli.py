@@ -1149,3 +1149,165 @@ def test_opportunities_does_not_crash_without_ebay_and_mixes_manual_rules(
     output = capsys.readouterr().out
     assert "Manual Product" in output
     assert "Market Product" in output
+
+
+# --- purchases (Phase 19) -----------------------------------------------
+
+
+def _seed_purchase_rule(
+    session: Session, *, price: str = "59.90", max_price: str = "60", external_id: str = "etb-1"
+) -> tuple[int, int]:
+    product = crud.create_product(session, "ETB Chaos Ascendant FR")
+    merchant = crud.get_merchant_by_name(session, "RetailerA")
+    if merchant is None:
+        merchant = crud.create_merchant(session, "RetailerA")
+    listing = crud.create_listing(
+        session,
+        product_id=product.id,
+        merchant_id=merchant.id,
+        url=f"https://a.example/p/{external_id}",
+        external_id=external_id,
+    )
+    rule = crud.create_watch_rule(
+        session,
+        product_id=product.id,
+        listing_id=listing.id,
+        check_interval=1,
+        max_quantity=1,
+        max_price=Decimal(max_price),
+    )
+    return rule.id, listing.id
+
+
+def test_purchases_with_no_history_reports_nothing(
+    session: Session, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _patch_session(monkeypatch, session)
+
+    rc = watch.cmd_purchases(argparse.Namespace(limit=None))
+
+    assert rc == 0
+    assert "No purchase attempts recorded." in capsys.readouterr().out
+
+
+def test_purchases_lists_recorded_attempts(
+    session: Session, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _patch_session(monkeypatch, session)
+    rule_id, listing_id = _seed_purchase_rule(session)
+    crud.create_purchase_attempt(
+        session,
+        watch_rule_id=rule_id,
+        listing_id=listing_id,
+        status="failed",
+        observed_price=Decimal("59.90"),
+        max_price_allowed=Decimal("60"),
+        quantity=1,
+    )
+
+    rc = watch.cmd_purchases(argparse.Namespace(limit=None))
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "failed" in output
+
+
+def test_purchase_status_reports_policy_and_history(
+    session: Session, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _patch_session(monkeypatch, session)
+    monkeypatch.setenv("PURCHASES_ENABLED", "false")
+    monkeypatch.delenv("PURCHASE_ALLOWED_MERCHANTS", raising=False)
+
+    rc = watch.cmd_purchase_status(argparse.Namespace())
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "PURCHASES_ENABLED:          False" in output
+    assert "Most recent attempt:       none" in output
+
+
+def test_purchase_test_missing_listing_returns_error(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_session(monkeypatch, session)
+
+    rc = watch.cmd_purchase_test(argparse.Namespace(listing_id=999))
+
+    assert rc == 1
+
+
+def test_purchase_test_dry_run_would_purchase_yes(
+    session: Session, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _patch_session(monkeypatch, session)
+    _rule_id, listing_id = _seed_purchase_rule(session, price="59.90", max_price="60")
+    monkeypatch.setenv("PURCHASES_ENABLED", "true")
+    monkeypatch.setenv("PURCHASE_ALLOWED_MERCHANTS", "retailera.example")
+    monkeypatch.setattr(watch, "domains_for_merchant", lambda name: ("retailera.example",))
+
+    def fake_registry() -> ConnectorRegistry:
+        registry = ConnectorRegistry()
+        registry.register(
+            "RetailerA",
+            FakeStoreConnector(
+                products={
+                    "etb-1": {
+                        "name": "ETB Chaos Ascendant FR",
+                        "price": 59.90,
+                        "available": True,
+                        "seller": "RetailerA",
+                        "url": "https://a.example/p/etb-1",
+                    }
+                }
+            ),
+        )
+        return registry
+
+    monkeypatch.setattr(watch, "_build_registry", fake_registry)
+
+    rc = watch.cmd_purchase_test(argparse.Namespace(listing_id=listing_id))
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "DRY RUN" in output
+    assert "WOULD PURCHASE: YES" in output
+    assert "No transaction executed." in output
+    # A dry run must never create a PurchaseAttempt row.
+    assert crud.list_purchase_attempts(session) == []
+
+
+def test_purchase_test_dry_run_would_purchase_no_when_disabled(
+    session: Session, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _patch_session(monkeypatch, session)
+    _rule_id, listing_id = _seed_purchase_rule(session)
+    monkeypatch.setenv("PURCHASES_ENABLED", "false")
+
+    def fake_registry() -> ConnectorRegistry:
+        registry = ConnectorRegistry()
+        registry.register(
+            "RetailerA",
+            FakeStoreConnector(
+                products={
+                    "etb-1": {
+                        "name": "ETB Chaos Ascendant FR",
+                        "price": 59.90,
+                        "available": True,
+                        "seller": "RetailerA",
+                        "url": "https://a.example/p/etb-1",
+                    }
+                }
+            ),
+        )
+        return registry
+
+    monkeypatch.setattr(watch, "_build_registry", fake_registry)
+
+    rc = watch.cmd_purchase_test(argparse.Namespace(listing_id=listing_id))
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "WOULD PURCHASE: NO" in output
+    assert "PURCHASES_ENABLED" in output
+    assert crud.list_purchase_attempts(session) == []
