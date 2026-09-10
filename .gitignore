@@ -10,6 +10,8 @@ venv/
 *.bak
 *.db
 *.sqlite3
+logs/
+data/worker.pid
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/

@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import os
 import sys
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -47,6 +46,7 @@ from dotenv import load_dotenv
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app import pidfile
 from app.notify import notify_events_if_allowed
 from app.opportunity_snapshot import build_opportunity_candidate
 from app.resale import resolve_resale_estimate
@@ -665,17 +665,7 @@ def cmd_opportunities(args: argparse.Namespace) -> int:
 
 
 def _worker_status() -> str:
-    if not PID_FILE.exists():
-        return "not running"
-    try:
-        pid = int(PID_FILE.read_text().strip())
-    except ValueError:
-        return "unknown (invalid pid file)"
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return "not running (stale pid file)"
-    return f"running (pid={pid})"
+    return pidfile.describe_status(pidfile.get_status(PID_FILE))
 
 
 def cmd_status(args: argparse.Namespace) -> int:

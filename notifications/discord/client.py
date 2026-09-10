@@ -95,6 +95,19 @@ class DiscordNotifier:
             channel = await self._client.fetch_channel(self._config.alert_channel_id)
         return channel
 
+    async def verify_access(self) -> None:
+        """Confirms the bot is actually a member of the configured guild
+        and can resolve the configured alert channel — used by
+        app/healthcheck.py, never by the monitoring pipeline itself.
+        Raises RuntimeError (never logs the token) if either is missing."""
+        guild = self._client.get_guild(self._config.guild_id)
+        if guild is None:
+            raise RuntimeError(
+                f"Bot is not a member of guild {self._config.guild_id} "
+                "(or the guild cache is not populated yet)."
+            )
+        await self._get_channel()
+
     async def send_message(self, content: str) -> None:
         channel = await self._get_channel()
         await channel.send(content=content)
