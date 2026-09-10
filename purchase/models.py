@@ -64,15 +64,18 @@ class RevalidationResult:
     """What a PurchaseConnector.revalidate() reports right before
     checkout — deliberately richer than products.observation.
     ProductObservation (which the monitoring fast path uses): shipping
-    cost and exact available quantity are usually only knowable once an
-    item is actually in a cart, which is what revalidate() is expected to
-    do. quantity_available=None means "unknown, assume enough for the
-    requested quantity if available=True" — never invented as a number."""
+    cost, tax, and exact available quantity are usually only knowable
+    once an item is actually in a cart, which is what revalidate() is
+    expected to do. quantity_available=None means "unknown, assume
+    enough for the requested quantity if available=True"; shipping_cost/
+    tax_amount=None means "unknown" (e.g. no destination configured yet)
+    — never invented as a number."""
 
     available: bool
     price: Decimal
     shipping_cost: Decimal | None
     quantity_available: int | None
+    tax_amount: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)

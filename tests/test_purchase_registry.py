@@ -45,5 +45,19 @@ def test_default_registry_covers_every_retail_merchant() -> None:
     registry = build_default_purchase_registry()
 
     for merchant in MERCHANTS:
-        connector = registry.get(merchant.name)
-        assert isinstance(connector, UnsupportedPurchaseConnector)
+        registry.get(merchant.name)  # must not raise for any registered merchant
+
+
+def test_default_registry_wires_fuji_store_to_real_connector() -> None:
+    from purchase.merchants.fuji_store import FujiStorePurchaseConnector
+
+    registry = build_default_purchase_registry()
+
+    assert isinstance(registry.get("Fuji Store"), FujiStorePurchaseConnector)
+
+
+def test_default_registry_kairyu_and_relictcg_stay_unsupported_pending_ucp_hosting() -> None:
+    registry = build_default_purchase_registry()
+
+    assert isinstance(registry.get("Kairyu"), UnsupportedPurchaseConnector)
+    assert isinstance(registry.get("RelicTCG"), UnsupportedPurchaseConnector)

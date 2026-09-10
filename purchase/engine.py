@@ -307,7 +307,8 @@ async def attempt_purchase(
         return await _finish(session, notifier, attempt.id, intent, PurchaseStatus.FAILED, str(exc))
 
     shipping = revalidated.shipping_cost if revalidated.shipping_cost is not None else Decimal("0")
-    revalidated_total = revalidated.price * intent.quantity + shipping
+    tax = revalidated.tax_amount if revalidated.tax_amount is not None else Decimal("0")
+    revalidated_total = revalidated.price * intent.quantity + shipping + tax
     if not revalidated.available:
         return await _finish(
             session,
