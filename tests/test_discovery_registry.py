@@ -31,15 +31,18 @@ def test_default_registry_always_has_fuji_store() -> None:
     assert isinstance(registry.get("Fuji Store"), WooCommerceDiscoverySource)
 
 
-def test_default_registry_kairyu_relictcg_unregistered_without_profile_url(
+def test_default_registry_kairyu_relictcg_registered_without_any_env_var(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Phase 23: config.settings.get_ucp_agent_profile_url() falls back to
+    this project's own hosted default when the env var isn't set, so
+    discovery for Kairyu/RelicTCG works out of the box."""
     monkeypatch.delenv("PURCHASE_UCP_AGENT_PROFILE_URL", raising=False)
 
     registry = build_default_discovery_registry()
 
-    assert "Kairyu" not in registry.names()
-    assert "RelicTCG" not in registry.names()
+    assert isinstance(registry.get("Kairyu"), ShopifyUCPDiscoverySource)
+    assert isinstance(registry.get("RelicTCG"), ShopifyUCPDiscoverySource)
 
 
 def test_default_registry_kairyu_relictcg_registered_with_profile_url(

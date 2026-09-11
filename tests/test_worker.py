@@ -103,11 +103,12 @@ def test_rule_not_due_is_skipped(session: Session) -> None:
     registry.register("RetailerA", FakeStoreConnector(products={"fake-123": _fake_product()}))
 
     t0 = datetime.now(UTC)
-    run_monitoring_tick(session, registry, now=t0)  # first run: always due, creates baseline
+    # first run: always due, creates baseline
+    asyncio.run(run_monitoring_tick(session, registry, now=t0))
     assert len(crud.list_observation_records_for_listing(session, listing.id)) == 1
 
     # second tick, only 10s later: check_interval=3600 -> must NOT run again
-    pairs = run_monitoring_tick(session, registry, now=t0 + timedelta(seconds=10))
+    pairs = asyncio.run(run_monitoring_tick(session, registry, now=t0 + timedelta(seconds=10)))
     assert pairs == []
     assert len(crud.list_observation_records_for_listing(session, listing.id)) == 1
 
@@ -117,7 +118,7 @@ def test_rule_due_is_checked(session: Session) -> None:
     registry = ConnectorRegistry()
     registry.register("RetailerA", FakeStoreConnector(products={"fake-123": _fake_product()}))
 
-    pairs = run_monitoring_tick(session, registry)
+    pairs = asyncio.run(run_monitoring_tick(session, registry))
 
     assert len(pairs) == 1
     assert pairs[0][0].id == rule.id
@@ -138,7 +139,7 @@ def test_one_failing_rule_does_not_block_the_other(session: Session) -> None:
         FakeStoreConnector(products={"fake-ok": _fake_product(url="https://a.example/p/fake-ok")}),
     )
 
-    pairs = run_monitoring_tick(session, registry)
+    pairs = asyncio.run(run_monitoring_tick(session, registry))
 
     results_by_rule = {rule.id: result for rule, result in pairs}
     assert results_by_rule[rule_ok.id].success is True
@@ -170,7 +171,7 @@ def test_one_merchant_failing_does_not_block_the_other_two(session: Session) -> 
         "MerchantC", FakeStoreConnector(products={"c-1": _fake_product(url="https://c.example/1")})
     )
 
-    pairs = run_monitoring_tick(session, registry)
+    pairs = asyncio.run(run_monitoring_tick(session, registry))
     results_by_rule = {rule.id: result for rule, result in pairs}
 
     assert results_by_rule[rule_a.id].success is True
@@ -333,13 +334,15 @@ def test_backoff_skips_rule_after_retryable_failure(session: Session) -> None:
     backoff = BackoffTracker(base_seconds=100, max_seconds=1000)
     t0 = datetime.now(UTC)
 
-    first = run_monitoring_tick(session, registry, now=t0, backoff=backoff)
+    first = asyncio.run(run_monitoring_tick(session, registry, now=t0, backoff=backoff))
     assert len(first) == 1
     assert first[0][1].success is False
 
     # Immediately due again by check_interval (1s and no observation was
     # ever persisted, since the check failed) but backed off for ~100s.
-    second = run_monitoring_tick(session, registry, now=t0 + timedelta(seconds=5), backoff=backoff)
+    second = asyncio.run(
+        run_monitoring_tick(session, registry, now=t0 + timedelta(seconds=5), backoff=backoff)
+    )
     assert second == []
 
 
@@ -353,13 +356,13 @@ def test_backoff_resets_after_success(session: Session) -> None:
     backoff = BackoffTracker(base_seconds=100, max_seconds=1000)
     t0 = datetime.now(UTC)
 
-    run_monitoring_tick(session, registry, now=t0, backoff=backoff)
+    asyncio.run(run_monitoring_tick(session, registry, now=t0, backoff=backoff))
     assert backoff.is_blocked(rule.id, t0 + timedelta(seconds=1)) is True
 
     # Swap in a working connector and let the backoff window pass.
     registry.register("RetailerA", FakeStoreConnector(products={"fake-123": _fake_product()}))
     later = t0 + timedelta(seconds=150)
-    results = run_monitoring_tick(session, registry, now=later, backoff=backoff)
+    results = asyncio.run(run_monitoring_tick(session, registry, now=later, backoff=backoff))
 
     assert len(results) == 1
     assert results[0][1].success is True

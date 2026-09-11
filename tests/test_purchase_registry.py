@@ -56,15 +56,20 @@ def test_default_registry_wires_fuji_store_to_real_connector() -> None:
     assert isinstance(registry.get("Fuji Store"), FujiStorePurchaseConnector)
 
 
-def test_default_registry_kairyu_and_relictcg_unsupported_without_ucp_profile_url(
+def test_default_registry_wires_kairyu_and_relictcg_to_ucp_without_any_env_var(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Phase 23: config.settings.get_ucp_agent_profile_url() falls back to
+    this project's own hosted default when the env var isn't set, so UCP
+    works out of the box — no .env edit required."""
+    from purchase.merchants.shopify_ucp import ShopifyUCPPurchaseConnector
+
     monkeypatch.delenv("PURCHASE_UCP_AGENT_PROFILE_URL", raising=False)
 
     registry = build_default_purchase_registry()
 
-    assert isinstance(registry.get("Kairyu"), UnsupportedPurchaseConnector)
-    assert isinstance(registry.get("RelicTCG"), UnsupportedPurchaseConnector)
+    assert isinstance(registry.get("Kairyu"), ShopifyUCPPurchaseConnector)
+    assert isinstance(registry.get("RelicTCG"), ShopifyUCPPurchaseConnector)
 
 
 def test_default_registry_wires_kairyu_and_relictcg_to_ucp_when_profile_url_set(

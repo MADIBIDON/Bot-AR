@@ -2,10 +2,13 @@
 
 Kairyu/RelicTCG: Shopify UCP `search_catalog`, the same capability
 already confirmed live and used by purchase/merchants/shopify_ucp.py —
-one discovery implementation for both, no per-merchant scraping. Both
-require PURCHASE_UCP_AGENT_PROFILE_URL; without it they are simply not
-registered, and app/discovery.py reports DISCOVERY_UNAVAILABLE for them
-without touching the other merchants.
+one discovery implementation for both, no per-merchant scraping. Both use
+config.settings.get_ucp_agent_profile_url() (Phase 23), which defaults to
+this project's own public, always-on UCP profile — no env var needs to be
+set for these to work; PURCHASE_UCP_AGENT_PROFILE_URL still overrides it
+when set. If that ever resolves to an unreachable URL, both are simply
+not registered, and app/discovery.py reports DISCOVERY_UNAVAILABLE for
+them without touching the other merchants.
 
 Fuji Store: WooCommerce's public Store API search (`?search=`), no
 configuration needed.
@@ -13,8 +16,7 @@ configuration needed.
 
 from __future__ import annotations
 
-import os
-
+from config.settings import get_ucp_agent_profile_url
 from connectors.defaults import MERCHANTS
 from discovery.registry import DiscoveryRegistry
 from discovery.shopify_ucp import ShopifyUCPDiscoverySource
@@ -31,7 +33,7 @@ _WOOCOMMERCE_SHOP_DOMAINS = {
 
 def build_default_discovery_registry() -> DiscoveryRegistry:
     registry = DiscoveryRegistry()
-    agent_profile_url = os.environ.get("PURCHASE_UCP_AGENT_PROFILE_URL", "").strip()
+    agent_profile_url = get_ucp_agent_profile_url()
 
     for merchant in MERCHANTS:
         if merchant.name in _UCP_SHOP_DOMAINS and agent_profile_url:

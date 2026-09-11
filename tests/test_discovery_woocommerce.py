@@ -1,6 +1,7 @@
-"""No real network: httpx.get is monkeypatched, response shape matches
-the real WooCommerce Store API search response captured live against
-fuji-store.fr during Phase 22 recon.
+"""No real network: the discovery source's persistent client's .get() is
+monkeypatched (Phase 23 connection pooling — see discovery/woocommerce.py),
+response shape matches the real WooCommerce Store API search response
+captured live against fuji-store.fr during Phase 22 recon.
 """
 
 from __future__ import annotations
@@ -27,13 +28,18 @@ def _item(**overrides: object) -> dict:
     return defaults
 
 
+def _source() -> WooCommerceDiscoverySource:
+    return WooCommerceDiscoverySource(shop_domain="fuji-store.fr", merchant_name="Fuji Store")
+
+
 def test_search_returns_connector_products(monkeypatch: pytest.MonkeyPatch) -> None:
+    source = _source()
+
     def fake_get(url: str, **kwargs: object) -> httpx.Response:
         return httpx.Response(200, json=[_item()], request=httpx.Request("GET", url))
 
-    monkeypatch.setattr(httpx, "get", fake_get)
+    monkeypatch.setattr(source._client, "get", fake_get)
 
-    source = WooCommerceDiscoverySource(shop_domain="fuji-store.fr", merchant_name="Fuji Store")
     results = source.search("Alakazam")
 
     assert len(results) == 1
@@ -44,74 +50,75 @@ def test_search_returns_connector_products(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 def test_out_of_stock_item_reported_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    source = _source()
+
     def fake_get(url: str, **kwargs: object) -> httpx.Response:
         return httpx.Response(
             200, json=[_item(is_in_stock=False)], request=httpx.Request("GET", url)
         )
 
-    monkeypatch.setattr(httpx, "get", fake_get)
+    monkeypatch.setattr(source._client, "get", fake_get)
 
-    source = WooCommerceDiscoverySource(shop_domain="fuji-store.fr", merchant_name="Fuji Store")
     results = source.search("Alakazam")
 
     assert results[0].available is False
 
 
 def test_empty_results(monkeypatch: pytest.MonkeyPatch) -> None:
+    source = _source()
+
     def fake_get(url: str, **kwargs: object) -> httpx.Response:
         return httpx.Response(200, json=[], request=httpx.Request("GET", url))
 
-    monkeypatch.setattr(httpx, "get", fake_get)
-
-    source = WooCommerceDiscoverySource(shop_domain="fuji-store.fr", merchant_name="Fuji Store")
+    monkeypatch.setattr(source._client, "get", fake_get)
 
     assert source.search("nonexistent") == []
 
 
 def test_incomplete_item_is_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
+    source = _source()
+
     def fake_get(url: str, **kwargs: object) -> httpx.Response:
         return httpx.Response(
             200, json=[{"slug": "x", "name": "X"}], request=httpx.Request("GET", url)
         )
 
-    monkeypatch.setattr(httpx, "get", fake_get)
-
-    source = WooCommerceDiscoverySource(shop_domain="fuji-store.fr", merchant_name="Fuji Store")
+    monkeypatch.setattr(source._client, "get", fake_get)
 
     assert source.search("x") == []
 
 
 def test_network_error_raises_discovery_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    source = _source()
+
     def fake_get(url: str, **kwargs: object):
         raise httpx.TimeoutException("timed out", request=httpx.Request("GET", url))
 
-    monkeypatch.setattr(httpx, "get", fake_get)
-
-    source = WooCommerceDiscoverySource(shop_domain="fuji-store.fr", merchant_name="Fuji Store")
+    monkeypatch.setattr(source._client, "get", fake_get)
 
     with pytest.raises(DiscoveryError, match="timeout"):
         source.search("Alakazam")
 
 
 def test_http_error_raises_discovery_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    source = _source()
+
     def fake_get(url: str, **kwargs: object) -> httpx.Response:
         return httpx.Response(500, request=httpx.Request("GET", url))
 
-    monkeypatch.setattr(httpx, "get", fake_get)
-
-    source = WooCommerceDiscoverySource(shop_domain="fuji-store.fr", merchant_name="Fuji Store")
+    monkeypatch.setattr(source._client, "get", fake_get)
 
     with pytest.raises(DiscoveryError, match="500"):
         source.search("Alakazam")
 
 
 def test_non_json_response_raises_discovery_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    source = _source()
+
     def fake_get(url: str, **kwargs: object) -> httpx.Response:
         return httpx.Response(200, text="<html></html>", request=httpx.Request("GET", url))
 
-    monkeypatch.setattr(httpx, "get", fake_get)
-
-    source = WooCommerceDiscoverySource(shop_domain="fuji-store.fr", merchant_name="Fuji Store")
+    monkeypatch.setattr(source._client, "get", fake_get)
 
     with pytest.raises(DiscoveryError, match="non-JSON"):
         source.search("Alakazam")

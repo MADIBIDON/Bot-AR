@@ -133,7 +133,7 @@ async def tick(
     attempt (see module docstring) — never awaited here, never able to
     delay the next WatchRule in this loop.
     """
-    pairs = run_monitoring_tick(session, registry, now=now, backoff=backoff)
+    pairs = await run_monitoring_tick(session, registry, now=now, backoff=backoff)
     results: list[MonitoringResult] = []
     for watch_rule, result in pairs:
         results.append(result)
@@ -261,3 +261,32 @@ async def run_forever(
                 await asyncio.wait_for(stop_event.wait(), timeout=poll_interval)
     finally:
         logger.info("worker stopped")
+
+
+async def drain_background_tasks(timeout: float = 10.0) -> None:
+    """Waits for every currently in-flight background task (a purchase
+    attempt fired by _fire_and_forget, or a discovery run fired by
+    _start_discovery_if_due) to finish, up to `timeout` seconds, then
+    cancels whatever is still running and waits briefly for that
+    cancellation to actually land.
+
+    Call this after run_forever() returns and before closing the Session
+    or disconnecting Discord (app/main_worker.py does both) — otherwise a
+    task that resumes after its last `await` (e.g. right after finishing
+    a network call, about to write to the Session or send a Discord
+    embed) could run against resources that are already gone.
+    """
+    pending = list(_background_tasks)
+    if not pending:
+        return
+    _done, still_pending = await asyncio.wait(pending, timeout=timeout)
+    if not still_pending:
+        return
+    logger.warning(
+        "%d background task(s) still running after %.0fs at shutdown — cancelling",
+        len(still_pending),
+        timeout,
+    )
+    for task in still_pending:
+        task.cancel()
+    await asyncio.gather(*still_pending, return_exceptions=True)

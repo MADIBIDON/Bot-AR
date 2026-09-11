@@ -133,10 +133,15 @@ def run_check(watch_rule: WatchRule, registry: ConnectorRegistry) -> MonitoringR
     )
 
 
-def run_check_and_store(
-    session: Session, watch_rule: WatchRule, registry: ConnectorRegistry
+def store_check_result(
+    session: Session, watch_rule: WatchRule, result: MonitoringResult
 ) -> MonitoringResult:
-    """Run a check, persist the observation, detect and persist events.
+    """The database-writing half of run_check_and_store, split out (Phase
+    23) so a caller can run run_check()'s network I/O for several
+    WatchRules concurrently (e.g. via asyncio.to_thread, bounded) and then
+    replay this — the only part that touches the shared SQLAlchemy Session
+    — sequentially, on the session's own thread. See engine/worker.py's
+    run_monitoring_tick for that concurrent caller.
 
     Order matters: the previous observation is fetched *before* the new one
     is persisted, otherwise "previous" would be the record we just wrote.
@@ -144,7 +149,6 @@ def run_check_and_store(
     misidentified product is still recorded for audit, but never produces
     a STOCK_AVAILABLE/PRICE_DROP/... event.
     """
-    result = run_check(watch_rule, registry)
     if not (result.success and result.observation is not None):
         return result
 
@@ -175,6 +179,15 @@ def run_check_and_store(
         events = tuple(persisted)
 
     return replace(result, events=events)
+
+
+def run_check_and_store(
+    session: Session, watch_rule: WatchRule, registry: ConnectorRegistry
+) -> MonitoringResult:
+    """run_check() then store_check_result() — the original, fully
+    sequential single-rule helper, still used where there's no reason to
+    split network from storage (run_all_active_watch_rules, most tests)."""
+    return store_check_result(session, watch_rule, run_check(watch_rule, registry))
 
 
 def run_all_active_watch_rules(

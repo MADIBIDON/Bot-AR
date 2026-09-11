@@ -15,6 +15,7 @@ is unchanged.
 
 from __future__ import annotations
 
+import asyncio
 from decimal import Decimal
 from typing import TYPE_CHECKING, Protocol
 
@@ -82,9 +83,21 @@ async def notify_events_if_allowed(
     """
     decision = evaluate(watch_rule, observation, match_result)
     if decision.allowed:
-        opportunity, resale_estimate = _opportunity_for(
-            watch_rule, observation.price, market_registry, cache
-        )
+        if watch_rule.resale_price_mode == "market":
+            # Phase 23: the only path here with a real network call
+            # (eBay, via market_registry) — offloaded to a thread so a
+            # slow/misbehaving market source can't block the event loop
+            # other concurrently-checked WatchRules' own alerts share.
+            # "manual" mode (the only mode any real WatchRule uses today)
+            # is pure in-memory arithmetic and stays directly awaited —
+            # no thread-hop overhead for the common case.
+            opportunity, resale_estimate = await asyncio.to_thread(
+                _opportunity_for, watch_rule, observation.price, market_registry, cache
+            )
+        else:
+            opportunity, resale_estimate = _opportunity_for(
+                watch_rule, observation.price, market_registry, cache
+            )
         for event in events:
             embed = format_event_embed(
                 event,

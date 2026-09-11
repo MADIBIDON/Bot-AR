@@ -58,8 +58,17 @@ class SchemaOrgProductConnector(BaseConnector):
         user_agent: str = DEFAULT_USER_AGENT,
     ) -> None:
         self._merchant_name = merchant_name
-        self._timeout = timeout
-        self._user_agent = user_agent
+        # Phase 23: one persistent client per connector instance (built
+        # once in connectors/defaults.py and reused for the worker's whole
+        # lifetime) instead of httpx.get()'s module-level convenience call,
+        # which opens and tears down a fresh TCP+TLS connection every
+        # single check. httpx.Client is safe to share across threads —
+        # each request just checks out a connection from its pool — so
+        # this also works with engine/worker.py's concurrent, threaded
+        # checks of the same merchant.
+        self._client = httpx.Client(
+            timeout=timeout, headers={"User-Agent": user_agent}, follow_redirects=True
+        )
 
     @abstractmethod
     def _build_url(self, path_id: str) -> str:
@@ -87,12 +96,7 @@ class SchemaOrgProductConnector(BaseConnector):
 
     def _fetch(self, url: str) -> str:
         try:
-            response = httpx.get(
-                url,
-                timeout=self._timeout,
-                headers={"User-Agent": self._user_agent},
-                follow_redirects=True,
-            )
+            response = self._client.get(url)
         except httpx.TimeoutException as exc:
             raise ConnectorError(f"timeout fetching {url}") from exc
         except httpx.RequestError as exc:

@@ -83,7 +83,7 @@ def test_http_404_raises_product_not_found(monkeypatch: pytest.MonkeyPatch) -> N
     def fake_get(url: str, **kwargs: object) -> httpx.Response:
         return httpx.Response(404, request=httpx.Request("GET", url))
 
-    monkeypatch.setattr(httpx, "get", fake_get)
+    monkeypatch.setattr(connector._client, "get", fake_get)
 
     with pytest.raises(ProductNotFoundError):
         connector.get_product("does-not-exist")
@@ -95,7 +95,7 @@ def test_http_429_raises_connector_error(monkeypatch: pytest.MonkeyPatch) -> Non
     def fake_get(url: str, **kwargs: object) -> httpx.Response:
         return httpx.Response(429, request=httpx.Request("GET", url))
 
-    monkeypatch.setattr(httpx, "get", fake_get)
+    monkeypatch.setattr(connector._client, "get", fake_get)
 
     with pytest.raises(ConnectorError, match="429"):
         connector.get_product("some-slug")
@@ -107,7 +107,7 @@ def test_timeout_raises_connector_error(monkeypatch: pytest.MonkeyPatch) -> None
     def fake_get(url: str, **kwargs: object):
         raise httpx.TimeoutException("timed out", request=httpx.Request("GET", url))
 
-    monkeypatch.setattr(httpx, "get", fake_get)
+    monkeypatch.setattr(connector._client, "get", fake_get)
 
     with pytest.raises(ConnectorError, match="timeout"):
         connector.get_product("some-slug")

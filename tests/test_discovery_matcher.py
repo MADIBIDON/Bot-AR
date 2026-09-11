@@ -4,7 +4,7 @@ from decimal import Decimal
 
 from connectors.base import ConnectorProduct
 from database.models import Product
-from discovery.matcher import classify_candidate
+from discovery.matcher import AUTO_LINK_CONFIDENCE_THRESHOLD, classify_candidate
 
 
 def _product(**overrides: object) -> Product:
@@ -57,7 +57,7 @@ def test_mpn_exact_match_auto_links() -> None:
     match = classify_candidate(product, candidate)
 
     assert match.verdict == "auto_link"
-    assert match.confidence == 90
+    assert match.confidence == 95
 
 
 def test_mpn_mismatch_is_no_match() -> None:
@@ -76,7 +76,7 @@ def test_exact_normalized_name_with_no_identifiers_auto_links() -> None:
     match = classify_candidate(product, candidate)
 
     assert match.verdict == "auto_link"
-    assert match.confidence == 75
+    assert match.confidence == 95
 
 
 def test_similar_but_not_exact_name_is_candidate_only() -> None:
@@ -114,3 +114,119 @@ def test_unrelated_product_is_no_match() -> None:
     match = classify_candidate(product, candidate)
 
     assert match.verdict == "no_match"
+
+
+# --- Phase 23: structured matching (real Product #5 case) -----------------
+
+
+def test_tripack_vs_tri_pack_synonym_with_same_set_auto_links() -> None:
+    """The real case that motivated Phase 23: same product, two merchants,
+    two different but equivalent spellings of "Tripack", no shared
+    identifier — must clear the auto-link bar on structure + name alone."""
+    product = _product(name="[SCELLE] Tripack ME04 - Chaos Ascendant [FR]")
+    candidate = _candidate(
+        name="Tri-Pack Pokémon - Méga-Évolution - Chaos Ascendant [ME04] - FR",
+        seller="RelicTCG",
+    )
+
+    match = classify_candidate(product, candidate)
+
+    assert match.verdict == "auto_link"
+    assert match.confidence >= AUTO_LINK_CONFIDENCE_THRESHOLD
+
+
+def test_etb_vs_elite_trainer_box_synonym_with_same_set_auto_links() -> None:
+    product = _product(name="[SCELLE] Elite Trainer Box ME04 - Chaos Ascendant [FR]")
+    candidate = _candidate(
+        name="Coffret Pokémon Dresseur d'Elite - Méga-Évolution - Chaos Ascendant [ME04] - FR",
+        seller="RelicTCG",
+    )
+
+    match = classify_candidate(product, candidate)
+
+    assert match.verdict == "auto_link"
+    assert match.confidence >= AUTO_LINK_CONFIDENCE_THRESHOLD
+
+
+def test_same_set_type_language_but_no_shared_words_is_weak_candidate() -> None:
+    """Structure matches but there's barely any shared descriptive word —
+    stays a (low-confidence) candidate, never an auto-link, since
+    structure alone (set/type/language) isn't proof of the same set name."""
+    product = _product(name="Tripack ME04 Chaos Ascendant FR")
+    candidate = _candidate(name="Tripack ME04 Something Else Entirely FR")
+
+    match = classify_candidate(product, candidate)
+
+    assert match.verdict == "candidate"
+    assert match.confidence < AUTO_LINK_CONFIDENCE_THRESHOLD
+
+
+def test_wrong_set_code_is_hard_rejected() -> None:
+    product = _product(name="Tripack ME04 Chaos Ascendant FR")
+    candidate = _candidate(name="Tripack ME05 Chaos Ascendant FR")
+
+    match = classify_candidate(product, candidate)
+
+    assert match.verdict == "no_match"
+    assert match.confidence == 0
+
+
+def test_wrong_language_is_hard_rejected() -> None:
+    product = _product(name="Tripack ME04 Chaos Ascendant FR")
+    candidate = _candidate(name="Tripack ME04 Chaos Ascendant JP")
+
+    match = classify_candidate(product, candidate)
+
+    assert match.verdict == "no_match"
+    assert match.confidence == 0
+
+
+def test_wrong_product_type_is_hard_rejected() -> None:
+    product = _product(name="Tripack ME04 Chaos Ascendant FR")
+    candidate = _candidate(name="ETB ME04 Chaos Ascendant FR")
+
+    match = classify_candidate(product, candidate)
+
+    assert match.verdict == "no_match"
+    assert match.confidence == 0
+
+
+def test_ean_mismatch_hard_rejected_even_with_matching_structure() -> None:
+    product = _product(name="Tripack ME04 Chaos Ascendant FR", ean="1111111111111")
+    candidate = _candidate(name="Tri-Pack Chaos Ascendant ME04 FR", ean="2222222222222")
+
+    match = classify_candidate(product, candidate)
+
+    assert match.verdict == "no_match"
+
+
+def test_mpn_mismatch_hard_rejected_even_with_matching_structure() -> None:
+    product = _product(name="Tripack ME04 Chaos Ascendant FR", mpn="AAA-04")
+    candidate = _candidate(name="Tri-Pack Chaos Ascendant ME04 FR", mpn="BBB-04")
+
+    match = classify_candidate(product, candidate)
+
+    assert match.verdict == "no_match"
+
+
+def test_single_card_vs_sealed_product_is_hard_rejected() -> None:
+    """ "carte unitaire ≠ produit scellé" — a numbered single card must
+    never be confused with a sealed tripack/etb/display/... of the same
+    set, even if both mention the same set code."""
+    product = _product(name="[SCELLE] Tripack ME04 - Chaos Ascendant [FR]")
+    candidate = _candidate(name="035/086 Some Card ME04 FR")
+
+    match = classify_candidate(product, candidate)
+
+    assert match.verdict == "no_match"
+
+
+def test_missing_set_code_on_one_side_is_not_a_conflict() -> None:
+    """Absence of a signal is never treated as a conflict — only a
+    detected disagreement is."""
+    product = _product(name="Tripack Chaos Ascendant FR")  # no set code at all
+    candidate = _candidate(name="Tripack ME04 Chaos Ascendant FR")
+
+    match = classify_candidate(product, candidate)
+
+    assert match.verdict != "no_match"

@@ -29,17 +29,18 @@ class WooCommerceDiscoverySource(RetailDiscoverySource):
     ) -> None:
         self._base_url = f"https://{shop_domain}/{_STORE_API}"
         self._merchant_name = merchant_name
-        self._timeout = timeout
+        # Phase 23: persistent client (same reasoning as
+        # connectors/schema_org.py) — this source is built once and reused
+        # for every discovery run of this merchant for the worker's whole
+        # lifetime, so repeat runs skip the TCP+TLS handshake.
+        self._client = httpx.Client(timeout=timeout, headers={"User-Agent": DEFAULT_USER_AGENT})
 
     def search(
         self, query: str, *, ean: str | None = None, mpn: str | None = None, limit: int = 10
     ) -> list[ConnectorProduct]:
         try:
-            response = httpx.get(
-                self._base_url,
-                params={"search": query, "per_page": str(limit)},
-                headers={"User-Agent": DEFAULT_USER_AGENT},
-                timeout=self._timeout,
+            response = self._client.get(
+                self._base_url, params={"search": query, "per_page": str(limit)}
             )
         except httpx.TimeoutException as exc:
             raise DiscoveryError(f"{self._merchant_name}: timeout searching catalog") from exc

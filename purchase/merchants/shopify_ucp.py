@@ -43,6 +43,7 @@ import os
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
+from config.settings import get_ucp_agent_profile_url
 from purchase.base import (
     AutomatedCheckoutUnsupportedError,
     CheckoutResult,
@@ -90,9 +91,7 @@ class ShopifyUCPPurchaseConnector(PurchaseConnector):
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
         self._shop_domain = shop_domain
-        self._agent_profile_url = agent_profile_url or os.environ.get(
-            "PURCHASE_UCP_AGENT_PROFILE_URL", ""
-        )
+        self._agent_profile_url = agent_profile_url or get_ucp_agent_profile_url()
         self._timeout = timeout
         self._mcp_endpoint: str | None = None
 

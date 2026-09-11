@@ -30,7 +30,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from app import pidfile
-from app.worker import DEFAULT_POLL_INTERVAL_SECONDS, run_forever
+from app.worker import DEFAULT_POLL_INTERVAL_SECONDS, drain_background_tasks, run_forever
 from connectors.defaults import build_default_registry
 from database.session import create_all, get_engine, get_session_factory
 from discovery.defaults import build_default_discovery_registry
@@ -126,6 +126,12 @@ async def main() -> None:
                 purchase_policy=purchase_policy,
                 discovery_registry=discovery_registry,
             )
+            # Still inside the Discord connection and before the Session
+            # closes below: a background discovery/purchase task started
+            # by the last tick may still be running and could try to use
+            # either right after its next `await` resumes.
+            logger.info("waiting for in-flight background tasks to finish...")
+            await drain_background_tasks()
     finally:
         session.close()
         pidfile.release(PID_FILE)

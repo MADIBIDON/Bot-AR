@@ -280,9 +280,14 @@ def test_tool_not_found_error_is_reported_not_swallowed(monkeypatch: pytest.Monk
 
 
 def test_missing_agent_profile_url_raises_clearly(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Phase 23: get_ucp_agent_profile_url() always resolves to this
+    project's own hosted default now (no env var required), so the only
+    way left to hit a genuinely empty URL is if that resolution itself
+    ever returned "" — kept as a defense-in-depth guard against exactly
+    that, verified here by forcing it directly rather than via env."""
     from purchase.base import PurchaseError
 
-    monkeypatch.delenv("PURCHASE_UCP_AGENT_PROFILE_URL", raising=False)
+    monkeypatch.setattr("purchase.merchants.shopify_ucp.get_ucp_agent_profile_url", lambda: "")
     connector = ShopifyUCPPurchaseConnector(shop_domain="kairyu.fr", agent_profile_url=None)
 
     with pytest.raises(PurchaseError, match="PURCHASE_UCP_AGENT_PROFILE_URL"):

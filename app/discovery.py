@@ -25,12 +25,23 @@ threaded, so those synchronous stretches between awaits are never
 touched concurrently, only interleaved with other coroutines' own
 synchronous stretches, which is safe for a plain (non-async) SQLAlchemy
 Session even though it is not thread-safe.
+
+Phase 23: a product's merchants are independent of each other (Kairyu
+being slow says nothing about RelicTCG or Fuji Store), so their searches
+now run concurrently too, bounded by MAX_CONCURRENT_DISCOVERY_MERCHANTS
+— collected first (network only, no Session touched), then replayed
+through _link_or_report sequentially on the calling session, same
+"concurrent network, sequential Session" split as engine/worker.py's
+monitoring tick. One merchant's timeout/error is caught inside
+_search_one_merchant and turned into a normal (non-"ok") outcome, never
+raised into the gather(), so it can never take down or delay the others.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -42,12 +53,36 @@ from discovery.matcher import classify_candidate
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
 
+    from connectors.base import ConnectorProduct
     from database.models import Product
+    from discovery.base import RetailDiscoverySource
     from discovery.registry import DiscoveryRegistry
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_DISCOVERY_CHECK_INTERVAL_SECONDS = 300
+# Phase 23: renamed from DEFAULT_DISCOVERY_CHECK_INTERVAL_SECONDS, which
+# this value never actually was — it's the check_interval given to a
+# newly auto-linked WatchRule (i.e. how often the *monitoring* fast path
+# re-checks it), confusingly named after the unrelated, much slower
+# per-Product discovery_interval (Product.discovery_interval, still 1800s
+# by default — see database/models.py). Lowered 300 -> 60 (Priority 8):
+# a bot whose whole point is fast drop detection shouldn't default new
+# listings to a 5-minute blind spot.
+DEFAULT_AUTO_LINKED_CHECK_INTERVAL_SECONDS = 60
+
+DEFAULT_MAX_CONCURRENT_DISCOVERY_MERCHANTS = 3
+
+
+def max_concurrent_discovery_merchants() -> int:
+    """MAX_CONCURRENT_DISCOVERY_MERCHANTS env override, else the default."""
+    raw = os.environ.get("MAX_CONCURRENT_DISCOVERY_MERCHANTS", "").strip()
+    if not raw:
+        return DEFAULT_MAX_CONCURRENT_DISCOVERY_MERCHANTS
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_MAX_CONCURRENT_DISCOVERY_MERCHANTS
+    return value if value > 0 else DEFAULT_MAX_CONCURRENT_DISCOVERY_MERCHANTS
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,41 +112,72 @@ class DiscoveryRunResult:
     merchants: list[MerchantDiscoveryOutcome]
 
 
-async def run_discovery_for_product(
-    session: Session,
-    product: Product,
-    discovery_registry: DiscoveryRegistry,
-    *,
-    check_interval: int = DEFAULT_DISCOVERY_CHECK_INTERVAL_SECONDS,
-    now: datetime | None = None,
-) -> DiscoveryRunResult:
-    now = now or datetime.now(UTC)
-    outcomes: list[MerchantDiscoveryOutcome] = []
+@dataclass(frozen=True, slots=True)
+class _RawMerchantResult:
+    merchant_name: str
+    status: str  # "ok" | "unavailable" | "error"
+    detail: str | None
+    candidates: tuple[ConnectorProduct, ...] = ()
 
-    for merchant_name in discovery_registry.names():
-        source = discovery_registry.get(merchant_name)
+
+async def _search_one_merchant(
+    merchant_name: str,
+    source: RetailDiscoverySource,
+    product: Product,
+    semaphore: asyncio.Semaphore,
+) -> _RawMerchantResult:
+    """Runs entirely off the Session — network only. Every failure mode
+    is caught and turned into a normal result rather than raised, so
+    asyncio.gather() never has to abort the other merchants over one bad
+    one (a timeout, a 429, a bug in a source's search())."""
+    async with semaphore:
         try:
             candidates = await asyncio.to_thread(
                 source.search, product.name, ean=product.ean, mpn=product.mpn
             )
         except DiscoveryUnavailableError as exc:
             logger.info("discovery merchant=%s unavailable: %s", merchant_name, exc)
-            outcomes.append(MerchantDiscoveryOutcome(merchant_name, "unavailable", str(exc)))
-            continue
+            return _RawMerchantResult(merchant_name, "unavailable", str(exc))
         except DiscoveryError as exc:
             logger.warning("discovery merchant=%s failed: %s", merchant_name, exc)
-            outcomes.append(MerchantDiscoveryOutcome(merchant_name, "error", str(exc)))
-            continue
+            return _RawMerchantResult(merchant_name, "error", str(exc))
         except Exception as exc:  # noqa: BLE001 - one merchant's bug must never stop the others
             logger.exception("discovery merchant=%s crashed", merchant_name)
-            outcomes.append(MerchantDiscoveryOutcome(merchant_name, "error", str(exc)))
-            continue
+            return _RawMerchantResult(merchant_name, "error", str(exc))
+        return _RawMerchantResult(merchant_name, "ok", None, tuple(candidates))
 
+
+async def run_discovery_for_product(
+    session: Session,
+    product: Product,
+    discovery_registry: DiscoveryRegistry,
+    *,
+    check_interval: int = DEFAULT_AUTO_LINKED_CHECK_INTERVAL_SECONDS,
+    now: datetime | None = None,
+    max_concurrent: int | None = None,
+) -> DiscoveryRunResult:
+    now = now or datetime.now(UTC)
+    max_concurrent = max_concurrent or max_concurrent_discovery_merchants()
+    semaphore = asyncio.Semaphore(max_concurrent)
+
+    merchant_names = discovery_registry.names()
+    raw_results = await asyncio.gather(
+        *(
+            _search_one_merchant(name, discovery_registry.get(name), product, semaphore)
+            for name in merchant_names
+        )
+    )
+
+    outcomes: list[MerchantDiscoveryOutcome] = []
+    for raw in raw_results:
+        if raw.status != "ok":
+            outcomes.append(MerchantDiscoveryOutcome(raw.merchant_name, raw.status, raw.detail))
+            continue
         candidate_results = [
-            _link_or_report(session, product, merchant_name, candidate, check_interval)
-            for candidate in candidates
+            _link_or_report(session, product, raw.merchant_name, candidate, check_interval)
+            for candidate in raw.candidates
         ]
-        outcomes.append(MerchantDiscoveryOutcome(merchant_name, "ok", None, candidate_results))
+        outcomes.append(MerchantDiscoveryOutcome(raw.merchant_name, "ok", None, candidate_results))
 
     product.last_discovery_at = now
     session.commit()

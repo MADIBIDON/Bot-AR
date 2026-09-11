@@ -29,15 +29,16 @@ Fuji Store only offers PayPal Commerce Platform gateways, and Shopify UCP
 checkout requires a buyer-approved payment instrument — neither is ever
 constructed by this project.
 
-Kairyu/RelicTCG fall back to UnsupportedPurchaseConnector if
-PURCHASE_UCP_AGENT_PROFILE_URL is not set — never crash, never guess a
-profile URL.
+Kairyu/RelicTCG fall back to UnsupportedPurchaseConnector only if
+config.settings.get_ucp_agent_profile_url() somehow resolves empty (it
+never does — it defaults to this project's own hosted profile, Phase 23,
+PURCHASE_UCP_AGENT_PROFILE_URL still overrides it) — never crash, never
+guess a profile URL.
 """
 
 from __future__ import annotations
 
-import os
-
+from config.settings import get_ucp_agent_profile_url
 from connectors.defaults import MERCHANTS
 from purchase.merchants.fuji_store import FujiStorePurchaseConnector
 from purchase.merchants.shopify_ucp import ShopifyUCPPurchaseConnector
@@ -52,7 +53,7 @@ _UCP_SHOP_DOMAINS = {
 
 def build_default_purchase_registry() -> PurchaseConnectorRegistry:
     registry = PurchaseConnectorRegistry()
-    agent_profile_url = os.environ.get("PURCHASE_UCP_AGENT_PROFILE_URL", "").strip()
+    agent_profile_url = get_ucp_agent_profile_url()
 
     for merchant in MERCHANTS:
         if merchant.name == "Fuji Store":

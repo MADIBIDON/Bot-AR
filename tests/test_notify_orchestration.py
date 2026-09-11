@@ -233,3 +233,69 @@ def test_market_mode_with_registry_enriches_embed() -> None:
     field_names = {field.name for field in notifier.sent_embeds[0].fields}
     assert "Market source" in field_names
     assert "Opportunity" in field_names
+
+
+def test_slow_market_source_does_not_block_the_event_loop() -> None:
+    """Phase 23: a slow market-data lookup (real eBay latency) is
+    offloaded to a thread so it can't starve other coroutines sharing the
+    event loop — e.g. another WatchRule's own concurrent monitoring check
+    or notification, running via asyncio.gather elsewhere in the worker.
+    Proven here the same way as the discovery/purchase timing tests: a
+    concurrently-scheduled coroutine finishes on time despite the slow
+    lookup running "at the same time"."""
+    import time
+
+    from database.models import Product
+    from market_data.base import MarketDataSource
+    from market_data.cache import TTLCache
+    from market_data.models import MarketObservation
+    from market_data.registry import MarketDataRegistry
+
+    class SlowSource(MarketDataSource):
+        def search(self, query: str, *, limit: int = 20) -> list[MarketObservation]:
+            time.sleep(0.2)
+            return [
+                MarketObservation(
+                    source="ebay",
+                    product_name="Pokemon ETB Test",
+                    price=Decimal("100"),
+                    currency="EUR",
+                    listing_url="https://ebay.example/1",
+                    external_id="1",
+                    observed_at=datetime.now(UTC),
+                )
+            ]
+
+    registry = MarketDataRegistry()
+    registry.register("ebay", SlowSource())
+    notifier = FakeNotifier()
+    rule = _rule(
+        resale_price_mode="market",
+        market_source="ebay",
+        product=Product(id=1, name="Pokemon ETB Test"),
+    )
+
+    async def other_coroutine_finished_first() -> bool:
+        marker: list[str] = []
+
+        async def other() -> None:
+            await asyncio.sleep(0.02)
+            marker.append("other")
+
+        async def slow_notify() -> None:
+            await notify_events_if_allowed(
+                rule,
+                _observation(price=Decimal("74.90")),
+                _match(),
+                (_event(),),
+                notifier,
+                registry,
+                TTLCache(),
+            )
+            marker.append("notify")
+
+        await asyncio.gather(slow_notify(), other())
+        return marker[0] == "other"
+
+    assert asyncio.run(other_coroutine_finished_first()) is True
+    assert len(notifier.sent_embeds) == 1

@@ -66,7 +66,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app import pidfile
-from app.discovery import DEFAULT_DISCOVERY_CHECK_INTERVAL_SECONDS, run_discovery_for_product
+from app.discovery import DEFAULT_AUTO_LINKED_CHECK_INTERVAL_SECONDS, run_discovery_for_product
 from app.notify import notify_events_if_allowed
 from app.opportunity_snapshot import build_opportunity_candidate
 from app.resale import resolve_resale_estimate
@@ -844,7 +844,7 @@ def cmd_add_product(args: argparse.Namespace) -> int:
         )
         max_quantity = _parse_positive_int("max-quantity", args.max_quantity or "1")
         monitoring_interval = _parse_check_interval(
-            args.monitoring_interval or str(DEFAULT_DISCOVERY_CHECK_INTERVAL_SECONDS)
+            args.monitoring_interval or str(DEFAULT_AUTO_LINKED_CHECK_INTERVAL_SECONDS)
         )
     except ValueError as exc:
         print(f"Invalid value: {exc}")
@@ -1115,7 +1115,11 @@ def build_parser() -> argparse.ArgumentParser:
     add_product_parser.add_argument(
         "--monitoring-interval",
         dest="monitoring_interval",
-        help="check_interval (seconds) for each auto-discovered WatchRule",
+        help=(
+            "check_interval in seconds for each auto-discovered WatchRule "
+            f"(default {DEFAULT_AUTO_LINKED_CHECK_INTERVAL_SECONDS}, minimum "
+            f"{MIN_CHECK_INTERVAL_SECONDS}) — e.g. 30, 60, 300"
+        ),
     )
     add_product_parser.add_argument("--ean", help="Exact EAN/GTIN — highest-priority identifier")
     add_product_parser.add_argument("--gtin", help="GTIN, if different from --ean")
