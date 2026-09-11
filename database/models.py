@@ -58,6 +58,17 @@ class Product(Base):
     priority: Mapped[int] = mapped_column(default=0, nullable=False)
     status: Mapped[str] = mapped_column(default="active", nullable=False)
 
+    # Phase 22 — universal product monitoring. target_price/max_price/
+    # max_quantity above were unused until now (every real rule set its
+    # own value on WatchRule instead); they are now the single
+    # user-facing ceiling a `product watch` shares across every
+    # auto-discovered Listing/WatchRule. See engine/decision.py's
+    # effective_max_price()/effective_target_price() for the fallback
+    # rule that keeps the 3 pre-Phase-22 WatchRules (which already set
+    # their own max_price/target_price) working unchanged.
+    discovery_interval: Mapped[int] = mapped_column(default=1800, nullable=False)
+    last_discovery_at: Mapped[datetime | None] = mapped_column(default=None)
+
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 

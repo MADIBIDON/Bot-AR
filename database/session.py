@@ -81,9 +81,30 @@ def _ensure_watch_rule_opportunity_columns(engine: Engine) -> None:
         conn.commit()
 
 
+_PRODUCT_DISCOVERY_COLUMNS = {
+    "discovery_interval": "INTEGER NOT NULL DEFAULT 1800",
+    "last_discovery_at": "DATETIME",
+}
+
+
+def _ensure_product_discovery_columns(engine: Engine) -> None:
+    """Idempotent patch for a SQLite database created before Phase 22
+    added these columns to Product — same pattern/reasoning as
+    _ensure_watch_rule_opportunity_columns() above."""
+    if not str(engine.url).startswith("sqlite"):
+        return
+    with engine.connect() as conn:
+        existing = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(products)")}
+        for column, sql_type in _PRODUCT_DISCOVERY_COLUMNS.items():
+            if column not in existing:
+                conn.exec_driver_sql(f"ALTER TABLE products ADD COLUMN {column} {sql_type}")
+        conn.commit()
+
+
 def create_all(engine: Engine) -> None:
     Base.metadata.create_all(engine)
     _ensure_watch_rule_opportunity_columns(engine)
+    _ensure_product_discovery_columns(engine)
 
 
 def get_session_factory(engine: Engine) -> sessionmaker[Session]:

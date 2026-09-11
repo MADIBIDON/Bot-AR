@@ -45,7 +45,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING
 
 from database import crud
-from engine.decision import MIN_FINANCIAL_MATCH_CONFIDENCE
+from engine.decision import MIN_FINANCIAL_MATCH_CONFIDENCE, effective_max_price
 from notifications.discord.formatter import format_purchase_embed
 from purchase.base import AutomatedCheckoutUnsupportedError, HumanActionRequiredError
 from purchase.config import is_merchant_allowed
@@ -73,9 +73,11 @@ def build_purchase_intent(
     now: datetime | None = None,
 ) -> PurchaseIntent:
     """Builds the candidate from state the monitoring fast path already
-    fetched — no network call here. max_price_allowed is the WatchRule's
-    own max_price: a rule with no max_price configured never becomes a
-    purchase candidate at all (see evaluate_purchase_intent)."""
+    fetched — no network call here. max_price_allowed is the effective
+    max_price (the rule's own, or its product's shared ceiling — see
+    engine.decision.effective_max_price): a rule with neither configured
+    never becomes a purchase candidate at all (see
+    evaluate_purchase_intent)."""
     return PurchaseIntent(
         watch_rule_id=watch_rule.id,
         product_id=watch_rule.product_id,
@@ -84,7 +86,7 @@ def build_purchase_intent(
         product_name=watch_rule.product.name,
         url=observation.url,
         observed_price=observation.price,
-        max_price_allowed=watch_rule.max_price or Decimal("0"),
+        max_price_allowed=effective_max_price(watch_rule) or Decimal("0"),
         quantity=watch_rule.max_quantity,
         match_confidence=match_result.confidence,
         created_at=now or datetime.now(UTC),
@@ -131,13 +133,12 @@ def evaluate_purchase_intent(
     if not available:
         return _reject("Product is out of stock.")
 
-    if watch_rule.max_price is None:
+    max_price = effective_max_price(watch_rule)
+    if max_price is None:
         return _reject(f"Watch rule {watch_rule.id} has no max_price configured.")
 
-    if total_cost > watch_rule.max_price:
-        return _reject(
-            f"Total cost {total_cost} exceeds this watch rule's max_price {watch_rule.max_price}."
-        )
+    if total_cost > max_price:
+        return _reject(f"Total cost {total_cost} exceeds this watch rule's max_price {max_price}.")
 
     if intent.quantity > watch_rule.max_quantity:
         return _reject(
@@ -235,6 +236,7 @@ async def attempt_purchase(
     now = now or datetime.now(UTC)
     intent = build_purchase_intent(watch_rule, observation, match_result, now=now)
     total_cost = intent.observed_price * intent.quantity
+    max_price = effective_max_price(watch_rule)
     has_active, since_last, spent_today = build_decision_context(session, intent, now=now)
 
     decision = evaluate_purchase_intent(
@@ -270,7 +272,7 @@ async def attempt_purchase(
         listing_id=watch_rule.listing_id,
         status=PurchaseStatus.CREATED.value,
         observed_price=intent.observed_price,
-        max_price_allowed=watch_rule.max_price,
+        max_price_allowed=effective_max_price(watch_rule),
         quantity=intent.quantity,
     )
 
@@ -332,7 +334,7 @@ async def attempt_purchase(
             f"Only {revalidated.quantity_available} unit(s) available at checkout, "
             f"needed {intent.quantity}.",
         )
-    if watch_rule.max_price is not None and revalidated_total > watch_rule.max_price:
+    if max_price is not None and revalidated_total > max_price:
         return await _finish(
             session,
             notifier,
@@ -340,7 +342,7 @@ async def attempt_purchase(
             intent,
             PurchaseStatus.CANCELLED,
             f"Revalidated total cost {revalidated_total} exceeds max_price "
-            f"{watch_rule.max_price} (price or shipping changed before checkout).",
+            f"{max_price} (price or shipping changed before checkout).",
         )
     if policy.max_order_eur is not None and revalidated_total > policy.max_order_eur:
         return await _finish(

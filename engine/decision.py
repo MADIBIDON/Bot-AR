@@ -43,6 +43,27 @@ if TYPE_CHECKING:
 MIN_FINANCIAL_MATCH_CONFIDENCE = 80
 
 
+def effective_max_price(watch_rule: WatchRule):
+    """Phase 22: a WatchRule created by product-watch discovery has no
+    max_price of its own — every Listing/WatchRule under one product
+    watch shares the product's single ceiling instead, so a later change
+    to it is picked up everywhere at once. A rule with its own explicit
+    max_price (the pre-Phase-22 WatchRules, or any rule created directly)
+    always wins — never overridden by the product's value. `product` is
+    only dereferenced when actually needed, so a bare, unpersisted
+    WatchRule with no `product` set (as many unit tests construct) never
+    crashes as long as it also sets its own max_price/target_price."""
+    if watch_rule.max_price is not None:
+        return watch_rule.max_price
+    return watch_rule.product.max_price if watch_rule.product is not None else None
+
+
+def effective_target_price(watch_rule: WatchRule):
+    if watch_rule.target_price is not None:
+        return watch_rule.target_price
+    return watch_rule.product.target_price if watch_rule.product is not None else None
+
+
 class DecisionCode(StrEnum):
     ALLOW = "allow"
     RULE_DISABLED = "rule_disabled"
@@ -89,26 +110,28 @@ def evaluate(
             details={"confidence": match_result.confidence, "method": match_result.method},
         )
 
-    if watch_rule.max_price is not None and observation.price > watch_rule.max_price:
+    max_price = effective_max_price(watch_rule)
+    if max_price is not None and observation.price > max_price:
         return _reject(
             watch_rule.id,
             DecisionCode.PRICE_ABOVE_MAX,
             (
                 f"Observed price {observation.price} {observation.currency} exceeds "
-                f"configured max price {watch_rule.max_price} {observation.currency}."
+                f"configured max price {max_price} {observation.currency}."
             ),
-            details={"price": observation.price, "max_price": watch_rule.max_price},
+            details={"price": observation.price, "max_price": max_price},
         )
 
-    if watch_rule.target_price is not None and observation.price > watch_rule.target_price:
+    target_price = effective_target_price(watch_rule)
+    if target_price is not None and observation.price > target_price:
         return _reject(
             watch_rule.id,
             DecisionCode.TARGET_NOT_REACHED,
             (
                 f"Observed price {observation.price} {observation.currency} is above "
-                f"target price {watch_rule.target_price} {observation.currency}."
+                f"target price {target_price} {observation.currency}."
             ),
-            details={"price": observation.price, "target_price": watch_rule.target_price},
+            details={"price": observation.price, "target_price": target_price},
         )
 
     if not observation.available:

@@ -88,6 +88,10 @@ def get_product(session: Session, product_id: int) -> Product | None:
     return session.get(Product, product_id)
 
 
+def get_product_by_ean(session: Session, ean: str) -> Product | None:
+    return session.scalars(select(Product).where(Product.ean == ean)).first()
+
+
 def list_products(session: Session, *, status: str | None = None) -> list[Product]:
     stmt = select(Product)
     if status is not None:

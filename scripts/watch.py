@@ -21,6 +21,21 @@ Usage:
     python scripts/watch.py purchase-status
     python scripts/watch.py purchase-test <listing_id>
     python scripts/watch.py status
+    python scripts/watch.py add-product --name "..." --max-price 60
+                                         [--target-price X] [--max-quantity N]
+                                         [--monitoring-interval S]
+                                         [--ean ...] [--gtin ...] [--mpn ...]
+    python scripts/watch.py products
+    python scripts/watch.py product <id>
+    python scripts/watch.py discover <id>
+    python scripts/watch.py enable-product <id>
+    python scripts/watch.py disable-product <id>
+
+`add-product` is the primary, product-first workflow (Phase 22): one
+product + one max_total_price, searched and monitored across every
+supported merchant automatically — see app/discovery.py. The
+merchant-by-merchant `add` command above still exists for a single known
+listing on a single merchant.
 
 `add --url` identifies the merchant/connector automatically from the
 URL's hostname (see connectors/defaults.py for the supported list) and
@@ -51,6 +66,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app import pidfile
+from app.discovery import DEFAULT_DISCOVERY_CHECK_INTERVAL_SECONDS, run_discovery_for_product
 from app.notify import notify_events_if_allowed
 from app.opportunity_snapshot import build_opportunity_candidate
 from app.resale import resolve_resale_estimate
@@ -64,6 +80,7 @@ from connectors.defaults import (
 from database import crud
 from database.models import WatchRule
 from database.session import create_all, get_engine, get_session_factory
+from discovery.defaults import build_default_discovery_registry
 from engine.monitoring import run_check_and_store
 from engine.opportunity import OpportunityConfig, evaluate_opportunity
 from engine.ranking import Priority, RankingConfig, RankingThresholds, rank_opportunities
@@ -91,6 +108,12 @@ def _build_market_registry():
     """Thin alias kept for tests to monkeypatch, same reasoning as
     _build_registry(). Callers must handle MissingEbayConfigError."""
     return build_default_market_registry()
+
+
+def _build_discovery_registry():
+    """Thin alias kept for tests to monkeypatch, same reasoning as
+    _build_registry()."""
+    return build_default_discovery_registry()
 
 
 def _get_session() -> Session:
@@ -781,6 +804,193 @@ def cmd_purchase_test(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_discovery_result(result) -> None:
+    for outcome in result.merchants:
+        if outcome.status == "unavailable":
+            print(f"{outcome.merchant}: DISCOVERY_UNAVAILABLE ({outcome.detail})")
+            continue
+        if outcome.status == "error":
+            print(f"{outcome.merchant}: error ({outcome.detail})")
+            continue
+        if not outcome.candidates:
+            print(f"{outcome.merchant}: no listing found")
+            continue
+        for c in outcome.candidates:
+            if c.verdict == "auto_link":
+                state = "already monitored" if c.already_monitored else "LINKED"
+                print(
+                    f"{outcome.merchant}: {c.candidate_name!r} -> {c.verdict.upper()} "
+                    f"({state}, confidence={c.confidence}) {c.candidate_url}"
+                )
+            else:
+                print(
+                    f"{outcome.merchant}: {c.candidate_name!r} -> {c.verdict.upper()} "
+                    f"(confidence={c.confidence}) — {c.reason}"
+                )
+
+
+def cmd_add_product(args: argparse.Namespace) -> int:
+    """Create/reuse a Product-level watch (Phase 22): one product, one
+    shared max_total_price, discovered and monitored across every
+    supported merchant automatically — no manual per-merchant WatchRule."""
+    session = _get_session()
+
+    try:
+        max_price = _parse_positive_decimal("max-price", args.max_price)
+        target_price = (
+            _parse_positive_decimal("target-price", args.target_price)
+            if args.target_price
+            else None
+        )
+        max_quantity = _parse_positive_int("max-quantity", args.max_quantity or "1")
+        monitoring_interval = _parse_check_interval(
+            args.monitoring_interval or str(DEFAULT_DISCOVERY_CHECK_INTERVAL_SECONDS)
+        )
+    except ValueError as exc:
+        print(f"Invalid value: {exc}")
+        return 1
+
+    product = crud.get_product_by_ean(session, args.ean) if args.ean else None
+    if product is not None:
+        print(f"Reusing existing product #{product.id} (matched by EAN {args.ean}).")
+    else:
+        product = crud.create_product(
+            session,
+            args.name,
+            ean=args.ean,
+            gtin=args.gtin,
+            mpn=args.mpn,
+            max_price=max_price,
+            target_price=target_price,
+            max_quantity=max_quantity,
+        )
+        print(f"Created product #{product.id}: {product.name}")
+
+    print(f"Max total price: {product.max_price}")
+    if product.target_price:
+        print(f"Target price:    {product.target_price}")
+    print()
+    print("Running initial multi-merchant discovery...")
+    print()
+
+    registry = _build_discovery_registry()
+    result = asyncio.run(
+        run_discovery_for_product(session, product, registry, check_interval=monitoring_interval)
+    )
+    _print_discovery_result(result)
+    return 0
+
+
+def cmd_products(args: argparse.Namespace) -> int:
+    session = _get_session()
+    products = crud.list_products(session)
+    if not products:
+        print("No products watched.")
+        return 0
+
+    print(
+        f"{'ID':<4} | {'Product':<40} | {'Max':>8} | {'Listings':>8} | {'Best Price':>10} | Status"
+    )
+    for p in products:
+        rules = crud.list_watch_rules(session, product_id=p.id)
+        best_price = None
+        for r in rules:
+            records = crud.list_observation_records_for_listing(session, r.listing_id)
+            if records:
+                last_price = records[-1].price
+                if best_price is None or last_price < best_price:
+                    best_price = last_price
+        best_price_str = f"{best_price}€" if best_price is not None else "-"
+        max_str = f"{p.max_price}€" if p.max_price is not None else "-"
+        name = p.name if len(p.name) <= 40 else p.name[:37] + "..."
+        print(
+            f"{p.id:<4} | {name:<40} | {max_str:>8} | {len(rules):>8} | {best_price_str:>10} | "
+            f"{p.status.upper()}"
+        )
+    return 0
+
+
+def cmd_product(args: argparse.Namespace) -> int:
+    session = _get_session()
+    product = crud.get_product(session, args.id)
+    if product is None:
+        print(f"No product={args.id}")
+        return 1
+
+    print(f"Product: {product.name}")
+    print()
+    print("Identifiers:")
+    print(f"  EAN: {product.ean or '-'}")
+    print(f"  GTIN: {product.gtin or '-'}")
+    print(f"  MPN: {product.mpn or '-'}")
+    print()
+    print(f"Max total: {product.max_price}")
+    if product.target_price:
+        print(f"Target: {product.target_price}")
+    print(f"Max quantity: {product.max_quantity or 1}")
+    print(f"Status: {product.status}")
+    print(f"Discovery interval: {product.discovery_interval}s")
+    last_discovery = product.last_discovery_at.isoformat() if product.last_discovery_at else "never"
+    print(f"Last discovery: {last_discovery}")
+    print()
+    print("Listings:")
+    rules = crud.list_watch_rules(session, product_id=product.id)
+    if not rules:
+        print("  none yet")
+    for r in rules:
+        listing = r.listing
+        records = crud.list_observation_records_for_listing(session, listing.id)
+        last = records[-1] if records else None
+        if last is None:
+            stock = "unknown"
+        else:
+            stock = "yes" if last.available else "no"
+        print()
+        print(f"  {listing.merchant.name}")
+        print(f"    price: {last.price if last else 'unknown'}")
+        print(f"    stock: {stock}")
+        print(f"    last check: {last.observed_at.isoformat() if last else 'never'}")
+        print(f"    watch_rule={r.id} enabled={r.enabled}")
+    return 0
+
+
+def cmd_discover(args: argparse.Namespace) -> int:
+    session = _get_session()
+    product = crud.get_product(session, args.id)
+    if product is None:
+        print(f"No product={args.id}")
+        return 1
+
+    registry = _build_discovery_registry()
+    result = asyncio.run(run_discovery_for_product(session, product, registry))
+    _print_discovery_result(result)
+    return 0
+
+
+def cmd_enable_product(args: argparse.Namespace) -> int:
+    session = _get_session()
+    product = crud.update_product(session, args.id, status="active")
+    if product is None:
+        print(f"No product={args.id}")
+        return 1
+    for rule in crud.list_watch_rules(session, product_id=product.id):
+        crud.enable_watch_rule(session, rule.id)
+    print(f"product={product.id} enabled.")
+    return 0
+
+
+def cmd_disable_product(args: argparse.Namespace) -> int:
+    session = _get_session()
+    product = crud.update_product(session, args.id, status="disabled")
+    if product is None:
+        print(f"No product={args.id}")
+        return 1
+    for rule in crud.list_watch_rules(session, product_id=product.id):
+        crud.disable_watch_rule(session, rule.id)
+    print(f"product={product.id} disabled.")
+    return 0
+
+
 def _worker_status() -> str:
     return pidfile.describe_status(pidfile.get_status(PID_FILE))
 
@@ -893,6 +1103,49 @@ def build_parser() -> argparse.ArgumentParser:
 
     status_parser = subparsers.add_parser("status", help="Show overall system status.")
     status_parser.set_defaults(func=cmd_status)
+
+    add_product_parser = subparsers.add_parser(
+        "add-product",
+        help="Watch a product by name/identifiers across every supported merchant.",
+    )
+    add_product_parser.add_argument("--name", required=True, help="Product name to search for")
+    add_product_parser.add_argument("--max-price", dest="max_price", required=True)
+    add_product_parser.add_argument("--target-price", dest="target_price")
+    add_product_parser.add_argument("--max-quantity", dest="max_quantity")
+    add_product_parser.add_argument(
+        "--monitoring-interval",
+        dest="monitoring_interval",
+        help="check_interval (seconds) for each auto-discovered WatchRule",
+    )
+    add_product_parser.add_argument("--ean", help="Exact EAN/GTIN — highest-priority identifier")
+    add_product_parser.add_argument("--gtin", help="GTIN, if different from --ean")
+    add_product_parser.add_argument("--mpn", help="Manufacturer part number / SKU")
+    add_product_parser.set_defaults(func=cmd_add_product)
+
+    products_parser = subparsers.add_parser("products", help="List watched products.")
+    products_parser.set_defaults(func=cmd_products)
+
+    product_parser = subparsers.add_parser("product", help="Show one watched product in detail.")
+    product_parser.add_argument("id", type=int)
+    product_parser.set_defaults(func=cmd_product)
+
+    discover_parser = subparsers.add_parser(
+        "discover", help="Force an immediate multi-merchant discovery run for a product."
+    )
+    discover_parser.add_argument("id", type=int)
+    discover_parser.set_defaults(func=cmd_discover)
+
+    enable_product_parser = subparsers.add_parser(
+        "enable-product", help="Enable a product watch and its WatchRules."
+    )
+    enable_product_parser.add_argument("id", type=int)
+    enable_product_parser.set_defaults(func=cmd_enable_product)
+
+    disable_product_parser = subparsers.add_parser(
+        "disable-product", help="Disable a product watch and its WatchRules."
+    )
+    disable_product_parser.add_argument("id", type=int)
+    disable_product_parser.set_defaults(func=cmd_disable_product)
 
     return parser
 

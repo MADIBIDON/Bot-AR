@@ -33,6 +33,7 @@ from app import pidfile
 from app.worker import DEFAULT_POLL_INTERVAL_SECONDS, run_forever
 from connectors.defaults import build_default_registry
 from database.session import create_all, get_engine, get_session_factory
+from discovery.defaults import build_default_discovery_registry
 from market_data.cache import TTLCache
 from market_data.defaults import build_default_market_registry
 from market_data.ebay import MissingEbayConfigError
@@ -96,6 +97,7 @@ async def main() -> None:
     market_registry = _build_market_registry()
     market_cache = TTLCache()
     purchase_registry = build_default_purchase_registry()
+    discovery_registry = build_default_discovery_registry()
     purchase_policy = load_purchase_policy()
     if purchase_policy.enabled:
         logger.info(
@@ -122,6 +124,7 @@ async def main() -> None:
                 market_cache=market_cache,
                 purchase_registry=purchase_registry,
                 purchase_policy=purchase_policy,
+                discovery_registry=discovery_registry,
             )
     finally:
         session.close()

@@ -1,14 +1,17 @@
 """Continuous worker: ties engine.worker (monitoring) to app.notify
 (decision + Discord) and, when a decision allows and purchasing is wired
-up, to purchase.engine (Phase 19). The one place allowed to depend on
-all three, same reasoning as app/notify.py in Phase 9.
+up, to purchase.engine (Phase 19), plus the slow, periodic multi-merchant
+DISCOVERY PATH (Phase 22, app/discovery.py). The one place allowed to
+depend on all four, same reasoning as app/notify.py in Phase 9.
 
 No scheduling framework: a plain asyncio loop, woken every `poll_interval`
 seconds (or as soon as `stop_event` is set). Each WatchRule's own
 check_interval (plus a small deterministic jitter) decides whether it
 actually runs on a given tick (engine.worker.is_due) — the poll interval
 is just how often the worker looks, not how often any one rule is
-checked.
+checked. Each watched Product's own discovery_interval similarly decides
+whether a *discovery* run is due (app.discovery.is_discovery_due) —
+independently of, and typically much slower than, monitoring.
 
 A purchase attempt is fired via `asyncio.create_task(...)` — never
 awaited inline — so a slow or failing checkout can never delay checking
@@ -17,6 +20,28 @@ full reasoning. Tasks are kept in `_background_tasks` only so they are
 not garbage-collected mid-flight (a well-known asyncio footgun), and
 removed once done; any exception inside one is logged, never raised into
 the tick loop.
+
+Discovery is fired as a background task exactly like a purchase attempt
+(see purchase/engine.py's module docstring): `tick()` never awaits it,
+so a slow discovery (a real merchant search can take several seconds)
+can never delay the next due WatchRule's monitoring check, the next
+tick's Discord alert, or the next tick even starting — run_forever()'s
+loop moves on as soon as `tick()` returns, regardless of whether a
+discovery task is still running in the background. Inside
+app.discovery.run_discovery_for_product, each merchant's own network
+search is further offloaded to a worker thread via `asyncio.to_thread`
+(same reasoning as a purchase connector's revalidate()/checkout()) so it
+never blocks the shared event loop either; only the matching + DB-write
+logic around it runs synchronously on the caller's session, interleaved
+with (never concurrent with) the monitoring loop's own synchronous DB
+work, which is safe for a single-threaded event loop even with a
+non-async, non-thread-safe SQLAlchemy Session.
+
+At most one discovery runs at a time (`_discovery_in_flight`): a second
+due Product simply waits for the next tick where the first has finished
+— there is no due-product queue, no Celery/Redis, no second service.
+This keeps discovery a bounded background trickle rather than something
+that could pile up or compete with itself for the same Session.
 """
 
 from __future__ import annotations
@@ -24,21 +49,23 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from app.discovery import is_discovery_due, run_discovery_for_product
 from app.notify import notify_events_if_allowed
 from connectors.defaults import domains_for_merchant
+from database import crud
 from engine.backoff import BackoffTracker
 from engine.worker import run_monitoring_tick
 from purchase.engine import attempt_purchase
 
 if TYPE_CHECKING:
-    from datetime import datetime
-
     from sqlalchemy.orm import Session
 
     from app.notify import EmbedSender
     from connectors.registry import ConnectorRegistry
+    from discovery.registry import DiscoveryRegistry
     from engine.monitoring import MonitoringResult
     from market_data.cache import TTLCache
     from market_data.registry import MarketDataRegistry
@@ -50,6 +77,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_POLL_INTERVAL_SECONDS = 20
 
 _background_tasks: set[asyncio.Task[object]] = set()
+
+_discovery_in_flight = False
 
 
 def _fire_and_forget(coro: object) -> None:
@@ -67,6 +96,17 @@ def _background_task_done(task: asyncio.Task[object]) -> None:
         logger.exception("background purchase attempt crashed", exc_info=exc)
 
 
+def _discovery_task_done(task: asyncio.Task[object]) -> None:
+    global _discovery_in_flight
+    _discovery_in_flight = False
+    _background_tasks.discard(task)
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.exception("background discovery crashed", exc_info=exc)
+
+
 async def tick(
     session: Session,
     registry: ConnectorRegistry,
@@ -78,12 +118,14 @@ async def tick(
     market_cache: TTLCache | None = None,
     purchase_registry: PurchaseConnectorRegistry | None = None,
     purchase_policy: PurchasePolicy | None = None,
+    discovery_registry: DiscoveryRegistry | None = None,
 ) -> list[MonitoringResult]:
     """One full pass: run due checks, notify for whatever the Decision
-    Engine allows. Never notifies when a check failed, when there are no
-    events, or when the decision rejects — matches the guarantees already
-    built into engine.monitoring and engine.decision; nothing is
-    re-implemented here.
+    Engine allows, then (if discovery_registry is given) run discovery
+    for at most one due Product. Never notifies when a check failed, when
+    there are no events, or when the decision rejects — matches the
+    guarantees already built into engine.monitoring and engine.decision;
+    nothing is re-implemented here.
 
     purchase_registry/purchase_policy default to None so every existing
     caller (manual-purchase-mode setups) is unaffected; when both are
@@ -139,7 +181,34 @@ async def tick(
                 watch_rule.id,
                 decision.decision_code.value,
             )
+
+    if discovery_registry is not None:
+        _start_discovery_if_due(session, discovery_registry, now=now)
+
     return results
+
+
+def _start_discovery_if_due(
+    session: Session, discovery_registry: DiscoveryRegistry, *, now: datetime | None = None
+) -> None:
+    """Fires discovery for at most one due Product as a background task
+    — never awaited here, see module docstring. Skips if a discovery is
+    already in flight (concurrency capped at 1) so it never has to share
+    a Session write with itself."""
+    global _discovery_in_flight
+    if _discovery_in_flight:
+        return
+    now = now or datetime.now(UTC)
+    for product in crud.list_products(session, status="active"):
+        if not is_discovery_due(product, now):
+            continue
+        _discovery_in_flight = True
+        task = asyncio.ensure_future(
+            run_discovery_for_product(session, product, discovery_registry, now=now)
+        )
+        _background_tasks.add(task)
+        task.add_done_callback(_discovery_task_done)
+        return  # one due product per tick, regardless of outcome
 
 
 async def run_forever(
@@ -153,16 +222,17 @@ async def run_forever(
     market_cache: TTLCache | None = None,
     purchase_registry: PurchaseConnectorRegistry | None = None,
     purchase_policy: PurchasePolicy | None = None,
+    discovery_registry: DiscoveryRegistry | None = None,
 ) -> None:
     """Runs `tick()` in a loop until `stop_event` is set.
 
     One BackoffTracker is created here and reused for every tick of this
     run, so a rule that starts failing actually backs off across ticks
     instead of being retried every single poll. market_registry/
-    market_cache/purchase_registry/purchase_policy are similarly created
-    once by the caller (app/main_worker.py) and reused across ticks; all
-    default to None so a manual-mode-only, no-auto-purchase setup needs
-    none of them.
+    market_cache/purchase_registry/purchase_policy/discovery_registry are
+    similarly created once by the caller (app/main_worker.py) and reused
+    across ticks; all default to None so a manual-mode-only, no-auto-
+    purchase, no-discovery setup needs none of them.
 
     Waits on the stop event with a timeout instead of a plain sleep, so
     shutdown is immediate rather than waiting out the rest of the poll
@@ -185,6 +255,7 @@ async def run_forever(
                 market_cache=market_cache,
                 purchase_registry=purchase_registry,
                 purchase_policy=purchase_policy,
+                discovery_registry=discovery_registry,
             )
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(stop_event.wait(), timeout=poll_interval)
