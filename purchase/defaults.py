@@ -1,55 +1,70 @@
 """Single place defining which merchants have a working PurchaseConnector.
 
-Phase 20 recon result:
+Phase 20/21 recon result:
 
 - Kairyu and RelicTCG (both Shopify) publish a Universal Commerce
   Protocol (UCP — https://ucp.dev) merchant profile at /.well-known/ucp,
   Shopify's own sanctioned agent-commerce API: official MCP tools for
-  cart/checkout (create_cart, create_checkout, get_checkout, ...), and
-  complete_checkout explicitly requires buyer-approved payment — no
-  scraping, no anti-bot bypass, and it maps directly onto this project's
-  HUMAN_ACTION_REQUIRED-before-payment gate. But every UCP tool call
-  requires the calling agent to publish its own reachable
-  application/json profile document (no redirects) at a stable HTTPS
-  URL — a one-time external hosting step this project has no
-  infrastructure for yet (analogous to needing a registered eBay
-  developer app or Discord bot token). Until that exists, Kairyu/RelicTCG
-  stay on UnsupportedPurchaseConnector — the best future candidate, not
-  a dead end.
+  cart/checkout (search_catalog, create_checkout, update_checkout,
+  get_checkout, ...), and complete_checkout explicitly requires
+  buyer-approved payment — no scraping, no anti-bot bypass, and it maps
+  directly onto this project's HUMAN_ACTION_REQUIRED-before-payment gate.
+  Every UCP tool call requires the calling agent to publish its own
+  reachable application/json profile document (no redirects, and
+  Cache-Control must include `public` with max-age >= 60 — GitHub Pages'
+  default Cache-Control lacks `public`, so this project's profile is
+  hosted on Vercel instead, see docs/UCP_HOSTING.md) at a stable HTTPS
+  URL declared in PURCHASE_UCP_AGENT_PROFILE_URL. That profile's own
+  `capabilities` registry must also list the same capability names the
+  merchant advertises (confirmed live: an empty registry made every
+  tools/call fail with "Tool not found", even for tools the merchant's
+  own tools/list showed) — see ucp/profile.py. See
+  purchase/merchants/shopify_ucp.py for the connector this unlocks.
 - Fuji Store (WooCommerce) exposes the official, public, unauthenticated
   WooCommerce Store API (/wp-json/wc/store/v1/*) — the same API its own
-  block-based cart UI calls. No account, no CAPTCHA, no Cloudflare
-  challenge encountered: add-to-cart, shipping-rate lookup, and a real
-  total (item + shipping + tax) all work today. See
-  purchase/merchants/fuji_store.py — this is the first real
-  PurchaseConnector. Its checkout() always raises
-  HumanActionRequiredError: Fuji Store's only payment methods are PayPal
-  Commerce Platform gateways, and completing either requires a human
-  PayPal approval or card entry this project never automates.
+  block-based cart UI calls. See purchase/merchants/fuji_store.py.
 
-Adding a real connector for Kairyu/RelicTCG later means registering it
-here once UCP agent-profile hosting exists; nothing else in the pipeline
-would need to change.
+Both real connectors' checkout() always raises HumanActionRequiredError:
+Fuji Store only offers PayPal Commerce Platform gateways, and Shopify UCP
+checkout requires a buyer-approved payment instrument — neither is ever
+constructed by this project.
+
+Kairyu/RelicTCG fall back to UnsupportedPurchaseConnector if
+PURCHASE_UCP_AGENT_PROFILE_URL is not set — never crash, never guess a
+profile URL.
 """
 
 from __future__ import annotations
 
+import os
+
 from connectors.defaults import MERCHANTS
 from purchase.merchants.fuji_store import FujiStorePurchaseConnector
+from purchase.merchants.shopify_ucp import ShopifyUCPPurchaseConnector
 from purchase.merchants.unsupported import UnsupportedPurchaseConnector
 from purchase.registry import PurchaseConnectorRegistry
 
-_REAL_CONNECTORS = {
-    "Fuji Store": FujiStorePurchaseConnector,
+_UCP_SHOP_DOMAINS = {
+    "Kairyu": "kairyu.fr",
+    "RelicTCG": "www.relictcg.com",
 }
 
 
 def build_default_purchase_registry() -> PurchaseConnectorRegistry:
     registry = PurchaseConnectorRegistry()
+    agent_profile_url = os.environ.get("PURCHASE_UCP_AGENT_PROFILE_URL", "").strip()
+
     for merchant in MERCHANTS:
-        real_connector_cls = _REAL_CONNECTORS.get(merchant.name)
-        if real_connector_cls is not None:
-            registry.register(merchant.name, real_connector_cls())
+        if merchant.name == "Fuji Store":
+            registry.register(merchant.name, FujiStorePurchaseConnector())
+        elif merchant.name in _UCP_SHOP_DOMAINS and agent_profile_url:
+            registry.register(
+                merchant.name,
+                ShopifyUCPPurchaseConnector(
+                    shop_domain=_UCP_SHOP_DOMAINS[merchant.name],
+                    agent_profile_url=agent_profile_url,
+                ),
+            )
         else:
             registry.register(
                 merchant.name, UnsupportedPurchaseConnector(merchant_name=merchant.name)

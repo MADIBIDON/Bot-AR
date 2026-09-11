@@ -107,15 +107,19 @@ def discover(shop_domain: str, *, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> U
 
 def _classify_error(error: dict) -> None:
     code = error.get("code")
-    data = error.get("data") or {}
-    kind = data.get("code")
     message = error.get("message", "UCP tool call failed")
+    # `data` is a free-form JSON-RPC field: Shopify's UCP implementation
+    # uses a dict for structured errors (profile_unreachable, ...) but a
+    # plain string for others (confirmed live: "Tool not found: <tool>").
+    data = error.get("data")
+    data_dict = data if isinstance(data, dict) else {}
+    kind = data_dict.get("code")
+    detail = data if isinstance(data, str) else data_dict.get("content", "no detail given")
     if kind == "profile_unreachable":
         raise UCPProfileUnreachableError(
-            f"{message}: the agent profile URL could not be fetched by the merchant "
-            f"({data.get('content', 'no detail given')})."
+            f"{message}: the agent profile URL could not be fetched by the merchant ({detail})."
         )
-    raise UCPToolCallError(message, code=code, kind=kind)
+    raise UCPToolCallError(f"{message}: {detail}" if data else message, code=code, kind=kind)
 
 
 def _parse_tool_result(payload: dict) -> dict:

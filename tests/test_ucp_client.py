@@ -150,6 +150,38 @@ def test_call_tool_generic_json_rpc_error_is_wrapped(monkeypatch: pytest.MonkeyP
         )
 
 
+def test_call_tool_error_with_string_data_does_not_crash(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: the real "Tool not found" error observed live from
+    Kairyu/RelicTCG uses a plain string for `data`
+    ({"code": -32602, "data": "Tool not found: search_catalog"}), not a
+    dict — _classify_error() used to call data.get() unconditionally and
+    crashed with AttributeError on this exact real shape."""
+
+    def fake_request(method: str, url: str, **kwargs: object) -> httpx.Response:
+        return _rpc_response(
+            url,
+            {
+                "jsonrpc": "2.0",
+                "id": "1",
+                "error": {
+                    "code": -32602,
+                    "message": "Invalid params",
+                    "data": "Tool not found: search_catalog",
+                },
+            },
+        )
+
+    monkeypatch.setattr(httpx, "request", fake_request)
+
+    with pytest.raises(UCPToolCallError, match="Tool not found: search_catalog"):
+        call_tool(
+            "https://kairyushop.myshopify.com/api/ucp/mcp",
+            "search_catalog",
+            {"catalog": {"query": "x"}},
+            agent_profile_url="https://example.com/profile.json",
+        )
+
+
 def test_call_tool_success_with_structured_content(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_request(method: str, url: str, **kwargs: object) -> httpx.Response:
         return _rpc_response(

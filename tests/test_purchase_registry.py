@@ -56,8 +56,27 @@ def test_default_registry_wires_fuji_store_to_real_connector() -> None:
     assert isinstance(registry.get("Fuji Store"), FujiStorePurchaseConnector)
 
 
-def test_default_registry_kairyu_and_relictcg_stay_unsupported_pending_ucp_hosting() -> None:
+def test_default_registry_kairyu_and_relictcg_unsupported_without_ucp_profile_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("PURCHASE_UCP_AGENT_PROFILE_URL", raising=False)
+
     registry = build_default_purchase_registry()
 
     assert isinstance(registry.get("Kairyu"), UnsupportedPurchaseConnector)
     assert isinstance(registry.get("RelicTCG"), UnsupportedPurchaseConnector)
+
+
+def test_default_registry_wires_kairyu_and_relictcg_to_ucp_when_profile_url_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from purchase.merchants.shopify_ucp import ShopifyUCPPurchaseConnector
+
+    monkeypatch.setenv(
+        "PURCHASE_UCP_AGENT_PROFILE_URL", "https://ucp-profile.vercel.app/agent-profile.json"
+    )
+
+    registry = build_default_purchase_registry()
+
+    assert isinstance(registry.get("Kairyu"), ShopifyUCPPurchaseConnector)
+    assert isinstance(registry.get("RelicTCG"), ShopifyUCPPurchaseConnector)
