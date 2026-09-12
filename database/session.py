@@ -101,10 +101,50 @@ def _ensure_product_discovery_columns(engine: Engine) -> None:
         conn.commit()
 
 
+def _ensure_columns(engine: Engine, table: str, columns: dict[str, str]) -> None:
+    """Generic version of the idempotent ALTER TABLE patches above —
+    added in Phase 25 rather than converting the existing per-table
+    functions, so their proven behavior stays untouched."""
+    if not str(engine.url).startswith("sqlite"):
+        return
+    with engine.connect() as conn:
+        existing = {row[1] for row in conn.exec_driver_sql(f"PRAGMA table_info({table})")}
+        for column, sql_type in columns.items():
+            if column not in existing:
+                conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
+        conn.commit()
+
+
+# Phase 25 — profitability-based purchase decisions. Product gains the
+# same Opportunity Engine config WatchRule already had (Phase 15/16), so
+# it can be set once per Product Watch and shared by every auto-discovered
+# WatchRule (engine.decision's effective_*() fallback functions read
+# whichever level actually has a value). Both tables gain the same four
+# new threshold columns.
+_PRODUCT_OPPORTUNITY_COLUMNS = {
+    "platform_fee_pct": "NUMERIC(5, 2)",
+    "fixed_fee": "NUMERIC(10, 2)",
+    "shipping_cost": "NUMERIC(10, 2)",
+    "other_costs": "NUMERIC(10, 2)",
+    "resale_price_mode": "TEXT NOT NULL DEFAULT 'manual'",
+    "market_source": "TEXT",
+}
+
+_PROFITABILITY_THRESHOLD_COLUMNS = {
+    "minimum_net_profit": "NUMERIC(10, 2)",
+    "minimum_roi_pct": "NUMERIC(6, 2)",
+    "minimum_resale_confidence": "TEXT",
+    "estimated_resale_trusted": "BOOLEAN NOT NULL DEFAULT 0",
+}
+
+
 def create_all(engine: Engine) -> None:
     Base.metadata.create_all(engine)
     _ensure_watch_rule_opportunity_columns(engine)
     _ensure_product_discovery_columns(engine)
+    _ensure_columns(engine, "products", _PRODUCT_OPPORTUNITY_COLUMNS)
+    _ensure_columns(engine, "products", _PROFITABILITY_THRESHOLD_COLUMNS)
+    _ensure_columns(engine, "watch_rules", _PROFITABILITY_THRESHOLD_COLUMNS)
 
 
 def get_session_factory(engine: Engine) -> sessionmaker[Session]:

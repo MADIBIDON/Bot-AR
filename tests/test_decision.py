@@ -183,3 +183,119 @@ def test_product_mismatch_takes_priority_over_price_above_max() -> None:
 def test_decision_result_has_rule_id() -> None:
     result = evaluate(_rule(id=42), _observation(), _match())
     assert result.rule_id == 42
+
+
+# --- Phase 25: profitability mode relaxes target_price, never max_price ----
+
+
+def test_target_price_still_rejects_without_profitability_thresholds() -> None:
+    """Backward compatibility: a plain WatchRule (no minimum_net_profit/
+    minimum_roi_pct configured — every real WatchRule before Phase 25)
+    keeps the exact old behavior."""
+    rule = _rule(target_price=Decimal("56"))
+    observation = _observation(price=Decimal("60"))
+    result = evaluate(rule, observation, _match())
+    assert result.allowed is False
+    assert result.decision_code == DecisionCode.TARGET_NOT_REACHED
+
+
+def test_target_price_does_not_reject_in_profitability_mode() -> None:
+    """The exact scenario from the spec: a 56€ target buy price is no
+    longer a hard notification gate once minimum_net_profit/
+    minimum_roi_pct are configured — a 60€ restock can still alert."""
+    rule = _rule(target_price=Decimal("56"), minimum_net_profit=Decimal("20"))
+    observation = _observation(price=Decimal("60"))
+    result = evaluate(rule, observation, _match())
+    assert result.allowed is True
+
+
+def test_max_price_still_hard_rejects_in_profitability_mode() -> None:
+    """max_price (hard_max_total), when explicitly set, stays an absolute
+    ceiling even in profitability mode."""
+    rule = _rule(max_price=Decimal("59"), minimum_net_profit=Decimal("20"))
+    observation = _observation(price=Decimal("60"))
+    result = evaluate(rule, observation, _match())
+    assert result.allowed is False
+    assert result.decision_code == DecisionCode.PRICE_ABOVE_MAX
+
+
+def test_profitability_mode_via_roi_threshold_alone() -> None:
+    rule = _rule(target_price=Decimal("56"), minimum_roi_pct=Decimal("50"))
+    observation = _observation(price=Decimal("60"))
+    result = evaluate(rule, observation, _match())
+    assert result.allowed is True
+
+
+# --- Phase 25: effective_*() dual-homed (rule-then-Product) fallbacks ------
+
+
+def test_effective_helpers_fall_back_to_product() -> None:
+    from database.models import Product
+    from engine.decision import (
+        effective_fixed_fee,
+        effective_minimum_net_profit,
+        effective_minimum_resale_confidence,
+        effective_minimum_roi_pct,
+        effective_other_costs,
+        effective_platform_fee_pct,
+        effective_shipping_cost,
+        is_profitability_mode,
+    )
+
+    product = Product(
+        id=1,
+        name="X",
+        platform_fee_pct=Decimal("9"),
+        fixed_fee=Decimal("1"),
+        shipping_cost=Decimal("6.5"),
+        other_costs=Decimal("2"),
+        minimum_net_profit=Decimal("20"),
+        minimum_roi_pct=Decimal("30"),
+        minimum_resale_confidence="high",
+    )
+    rule = _rule(product=product)
+
+    assert effective_platform_fee_pct(rule) == Decimal("9")
+    assert effective_fixed_fee(rule) == Decimal("1")
+    assert effective_shipping_cost(rule) == Decimal("6.5")
+    assert effective_other_costs(rule) == Decimal("2")
+    assert effective_minimum_net_profit(rule) == Decimal("20")
+    assert effective_minimum_roi_pct(rule) == Decimal("30")
+    assert effective_minimum_resale_confidence(rule) == "high"
+    assert is_profitability_mode(rule) is True
+
+
+def test_effective_helpers_rule_value_wins_over_product() -> None:
+    from database.models import Product
+    from engine.decision import effective_minimum_net_profit
+
+    product = Product(id=1, name="X", minimum_net_profit=Decimal("20"))
+    rule = _rule(product=product, minimum_net_profit=Decimal("5"))
+
+    assert effective_minimum_net_profit(rule) == Decimal("5")
+
+
+def test_is_profitability_mode_false_without_any_threshold() -> None:
+    from engine.decision import is_profitability_mode
+
+    assert is_profitability_mode(_rule()) is False
+
+
+def test_effective_resale_price_mode_falls_back_to_product_market() -> None:
+    from database.models import Product
+    from engine.decision import effective_resale_price_mode
+
+    product = Product(id=1, name="X", resale_price_mode="market")
+    rule = _rule(product=product)  # rule itself defaults to "manual"
+
+    assert effective_resale_price_mode(rule) == "market"
+
+
+def test_effective_estimated_resale_trusted_true_from_product() -> None:
+    from database.models import Product
+    from engine.decision import effective_estimated_resale_trusted
+
+    product = Product(id=1, name="X", estimated_resale_trusted=True)
+    rule = _rule(product=product)
+
+    assert effective_estimated_resale_trusted(rule) is True

@@ -20,10 +20,17 @@ Checks run in this order, first failure wins:
        differently on "wrong product" vs. "right product, not confident
        enough"; the nuance lives in `reason`.
     4. price <= max_price, when max_price is set — an absolute ceiling.
+       Still enforced even in profitability mode (Phase 25) — when set,
+       it is an explicit hard cap the user chose to keep; leaving it unset
+       is how profitability mode goes uncapped on price alone.
     5. price <= target_price, when target_price is set — checked *after*
        max_price so a price that blows through both is reported as
        PRICE_ABOVE_MAX (the more fundamental violation), matching the
-       target=60/max=65/price=70 example.
+       target=60/max=65/price=70 example. Skipped entirely in
+       profitability mode (Phase 25): target_price there is a "target buy
+       price" reference shown in the opportunity breakdown, not a
+       notification gate — a restock above it can still be an excellent,
+       alertable opportunity if the margin justifies the extra spend.
     6. observation.available is True.
 
 Passing all of the above -> ALLOW.
@@ -36,6 +43,8 @@ from enum import StrEnum
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from decimal import Decimal
+
     from database.models import WatchRule
     from products.matcher import MatchResult
     from products.observation import ProductObservation
@@ -43,25 +52,101 @@ if TYPE_CHECKING:
 MIN_FINANCIAL_MATCH_CONFIDENCE = 80
 
 
-def effective_max_price(watch_rule: WatchRule):
+def _effective(value: object, watch_rule: WatchRule, attr: str) -> object:
+    """Shared fallback: a rule's own value wins when set, else the
+    parent Product's value, else None — the same rule effective_max_price
+    established in Phase 22, generalized (Phase 25) for every other
+    dual-homed field below rather than hand-writing the same three lines
+    for each one. `product` is only dereferenced when actually needed, so
+    a bare, unpersisted WatchRule with no `product` set (as many unit
+    tests construct) never crashes as long as it also sets its own value."""
+    if value is not None:
+        return value
+    return getattr(watch_rule.product, attr, None) if watch_rule.product is not None else None
+
+
+def effective_max_price(watch_rule: WatchRule) -> Decimal | None:
     """Phase 22: a WatchRule created by product-watch discovery has no
     max_price of its own — every Listing/WatchRule under one product
     watch shares the product's single ceiling instead, so a later change
     to it is picked up everywhere at once. A rule with its own explicit
     max_price (the pre-Phase-22 WatchRules, or any rule created directly)
-    always wins — never overridden by the product's value. `product` is
-    only dereferenced when actually needed, so a bare, unpersisted
-    WatchRule with no `product` set (as many unit tests construct) never
-    crashes as long as it also sets its own max_price/target_price."""
-    if watch_rule.max_price is not None:
-        return watch_rule.max_price
-    return watch_rule.product.max_price if watch_rule.product is not None else None
+    always wins — never overridden by the product's value."""
+    return _effective(watch_rule.max_price, watch_rule, "max_price")
 
 
-def effective_target_price(watch_rule: WatchRule):
-    if watch_rule.target_price is not None:
-        return watch_rule.target_price
-    return watch_rule.product.target_price if watch_rule.product is not None else None
+def effective_target_price(watch_rule: WatchRule) -> Decimal | None:
+    return _effective(watch_rule.target_price, watch_rule, "target_price")
+
+
+def effective_platform_fee_pct(watch_rule: WatchRule) -> Decimal | None:
+    return _effective(watch_rule.platform_fee_pct, watch_rule, "platform_fee_pct")
+
+
+def effective_fixed_fee(watch_rule: WatchRule) -> Decimal | None:
+    return _effective(watch_rule.fixed_fee, watch_rule, "fixed_fee")
+
+
+def effective_shipping_cost(watch_rule: WatchRule) -> Decimal | None:
+    return _effective(watch_rule.shipping_cost, watch_rule, "shipping_cost")
+
+
+def effective_other_costs(watch_rule: WatchRule) -> Decimal | None:
+    return _effective(watch_rule.other_costs, watch_rule, "other_costs")
+
+
+def effective_estimated_resale_price(watch_rule: WatchRule) -> Decimal | None:
+    return _effective(watch_rule.estimated_resale_price, watch_rule, "estimated_resale_price")
+
+
+def effective_resale_price_mode(watch_rule: WatchRule) -> str:
+    """Unlike the other fields here, resale_price_mode is NOT NULL on
+    both tables (default "manual"), so a rule's own value always wins —
+    "manual" from a fresh WatchRule would otherwise incorrectly shadow an
+    explicit "market" configured on the Product. None is treated the same
+    as "manual": a column default only actually lands in this attribute
+    once a row is inserted, so a transient, never-persisted WatchRule (as
+    plenty of unit tests construct) reads back as None here, not
+    "manual" — without this, such a rule could never see its Product's
+    "market" mode either."""
+    if watch_rule.resale_price_mode not in (None, "manual"):
+        return watch_rule.resale_price_mode
+    if watch_rule.product is not None and watch_rule.product.resale_price_mode == "market":
+        return "market"
+    return watch_rule.resale_price_mode or "manual"
+
+
+def effective_market_source(watch_rule: WatchRule) -> str | None:
+    return _effective(watch_rule.market_source, watch_rule, "market_source")
+
+
+def effective_minimum_net_profit(watch_rule: WatchRule) -> Decimal | None:
+    return _effective(watch_rule.minimum_net_profit, watch_rule, "minimum_net_profit")
+
+
+def effective_minimum_roi_pct(watch_rule: WatchRule) -> Decimal | None:
+    return _effective(watch_rule.minimum_roi_pct, watch_rule, "minimum_roi_pct")
+
+
+def effective_minimum_resale_confidence(watch_rule: WatchRule) -> str | None:
+    return _effective(watch_rule.minimum_resale_confidence, watch_rule, "minimum_resale_confidence")
+
+
+def effective_estimated_resale_trusted(watch_rule: WatchRule) -> bool:
+    if watch_rule.estimated_resale_trusted:
+        return True
+    return bool(watch_rule.product is not None and watch_rule.product.estimated_resale_trusted)
+
+
+def is_profitability_mode(watch_rule: WatchRule) -> bool:
+    """True once a Product Watch (or a rule directly) has configured a
+    profitability threshold — see the module docstring's item 5. This is
+    the one switch that changes evaluate()'s notification policy from
+    "hard price ceiling" to "profitability decides"."""
+    return (
+        effective_minimum_net_profit(watch_rule) is not None
+        or effective_minimum_roi_pct(watch_rule) is not None
+    )
 
 
 class DecisionCode(StrEnum):
@@ -123,7 +208,11 @@ def evaluate(
         )
 
     target_price = effective_target_price(watch_rule)
-    if target_price is not None and observation.price > target_price:
+    if (
+        target_price is not None
+        and observation.price > target_price
+        and not is_profitability_mode(watch_rule)
+    ):
         return _reject(
             watch_rule.id,
             DecisionCode.TARGET_NOT_REACHED,

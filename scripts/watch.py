@@ -28,6 +28,16 @@ Usage:
     python scripts/watch.py products
     python scripts/watch.py product <id>
     python scripts/watch.py discover <id>
+    python scripts/watch.py edit-product <id> [--target-price X] [--max-price X]
+                                               [--minimum-net-profit X]
+                                               [--minimum-roi-pct X]
+                                               [--minimum-resale-confidence low|medium|high]
+                                               [--estimated-resale-price X]
+                                               [--resale-trusted true|false]
+                                               [--platform-fee-pct X] [--fixed-fee X]
+                                               [--shipping-cost X] [--other-costs X]
+                                               [--resale-price-mode manual|market]
+                                               [--market-source ebay]
     python scripts/watch.py enable-product <id>
     python scripts/watch.py disable-product <id>
 
@@ -194,6 +204,28 @@ def _parse_market_source(raw: str) -> str:
             f"market_source must be one of {', '.join(SUPPORTED_MARKET_SOURCES)}, got {raw!r}"
         )
     return raw
+
+
+_RESALE_CONFIDENCE_LEVELS = ("low", "medium", "high")
+
+
+def _parse_resale_confidence(raw: str) -> str:
+    lowered = raw.strip().lower()
+    if lowered not in _RESALE_CONFIDENCE_LEVELS:
+        raise ValueError(
+            f"minimum_resale_confidence must be one of {', '.join(_RESALE_CONFIDENCE_LEVELS)}, "
+            f"got {raw!r}"
+        )
+    return lowered
+
+
+def _parse_bool(label: str, raw: str) -> bool:
+    lowered = raw.strip().lower()
+    if lowered in ("true", "1", "yes"):
+        return True
+    if lowered in ("false", "0", "no"):
+        return False
+    raise ValueError(f"{label} must be true/false, got {raw!r}")
 
 
 @dataclass
@@ -967,6 +999,83 @@ def cmd_discover(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_edit_product(args: argparse.Namespace) -> int:
+    """Phase 25 — profitability-based purchase decisions, configurable
+    per Product Watch (shared by every auto-discovered WatchRule under
+    it, same as max_price/target_price already are — see
+    engine.decision's effective_*() fallbacks)."""
+    session = _get_session()
+    product = crud.get_product(session, args.id)
+    if product is None:
+        print(f"No product={args.id}")
+        return 1
+
+    fields: dict[str, object] = {}
+    try:
+        if args.target_price is not None:
+            fields["target_price"] = _parse_positive_decimal("target_price", args.target_price)
+        if args.max_price is not None:
+            fields["max_price"] = _parse_positive_decimal("max_price", args.max_price)
+        if args.estimated_resale_price is not None:
+            fields["estimated_resale_price"] = _parse_positive_decimal(
+                "estimated_resale_price", args.estimated_resale_price
+            )
+        if args.resale_trusted is not None:
+            fields["estimated_resale_trusted"] = _parse_bool("resale_trusted", args.resale_trusted)
+        if args.platform_fee_pct is not None:
+            fields["platform_fee_pct"] = _parse_fee_pct(args.platform_fee_pct)
+        if args.fixed_fee is not None:
+            fields["fixed_fee"] = _parse_non_negative_decimal("fixed_fee", args.fixed_fee)
+        if args.shipping_cost is not None:
+            fields["shipping_cost"] = _parse_non_negative_decimal(
+                "shipping_cost", args.shipping_cost
+            )
+        if args.other_costs is not None:
+            fields["other_costs"] = _parse_non_negative_decimal("other_costs", args.other_costs)
+        if args.resale_price_mode is not None:
+            fields["resale_price_mode"] = args.resale_price_mode
+        if args.market_source is not None:
+            fields["market_source"] = _parse_market_source(args.market_source)
+        if args.minimum_net_profit is not None:
+            fields["minimum_net_profit"] = _parse_non_negative_decimal(
+                "minimum_net_profit", args.minimum_net_profit
+            )
+        if args.minimum_roi_pct is not None:
+            fields["minimum_roi_pct"] = _parse_non_negative_decimal(
+                "minimum_roi_pct", args.minimum_roi_pct
+            )
+        if args.minimum_resale_confidence is not None:
+            fields["minimum_resale_confidence"] = _parse_resale_confidence(
+                args.minimum_resale_confidence
+            )
+
+        effective_target = fields.get("target_price", product.target_price)
+        effective_max = fields.get("max_price", product.max_price)
+        _validate_price_order(effective_target, effective_max)
+
+        effective_mode = fields.get("resale_price_mode", product.resale_price_mode)
+        effective_source = fields.get("market_source", product.market_source)
+        if effective_mode == "market" and effective_source is None:
+            raise ValueError("resale_price_mode=market requires --market-source")
+    except ValueError as exc:
+        print(f"Invalid value: {exc}")
+        return 1
+
+    if not fields:
+        print(
+            "Nothing to update — pass at least one of --target-price/--max-price/"
+            "--estimated-resale-price/--resale-trusted/--platform-fee-pct/--fixed-fee/"
+            "--shipping-cost/--other-costs/--resale-price-mode/--market-source/"
+            "--minimum-net-profit/--minimum-roi-pct/--minimum-resale-confidence."
+        )
+        return 1
+
+    updated = crud.update_product(session, args.id, **fields)
+    changes = ", ".join(f"{key}={value}" for key, value in fields.items())
+    print(f"product={updated.id} updated: {changes}")
+    return 0
+
+
 def cmd_enable_product(args: argparse.Namespace) -> int:
     session = _get_session()
     product = crud.update_product(session, args.id, status="active")
@@ -1138,6 +1247,41 @@ def build_parser() -> argparse.ArgumentParser:
     )
     discover_parser.add_argument("id", type=int)
     discover_parser.set_defaults(func=cmd_discover)
+
+    edit_product_parser = subparsers.add_parser(
+        "edit-product",
+        help="Edit a product watch's price/profitability config (shared by every listing).",
+    )
+    edit_product_parser.add_argument("id", type=int)
+    edit_product_parser.add_argument("--target-price", dest="target_price")
+    edit_product_parser.add_argument("--max-price", dest="max_price")
+    edit_product_parser.add_argument("--estimated-resale-price", dest="estimated_resale_price")
+    edit_product_parser.add_argument(
+        "--resale-trusted",
+        dest="resale_trusted",
+        help="true/false — mark a manual estimated-resale-price as trusted enough for auto-buy",
+    )
+    edit_product_parser.add_argument("--platform-fee-pct", dest="platform_fee_pct")
+    edit_product_parser.add_argument("--fixed-fee", dest="fixed_fee")
+    edit_product_parser.add_argument("--shipping-cost", dest="shipping_cost")
+    edit_product_parser.add_argument("--other-costs", dest="other_costs")
+    edit_product_parser.add_argument(
+        "--resale-price-mode", dest="resale_price_mode", choices=("manual", "market")
+    )
+    edit_product_parser.add_argument("--market-source", dest="market_source")
+    edit_product_parser.add_argument(
+        "--minimum-net-profit",
+        dest="minimum_net_profit",
+        help="switches this product watch to profitability mode: target_price/max_price stop "
+        "being hard notification gates — see engine/decision.py",
+    )
+    edit_product_parser.add_argument("--minimum-roi-pct", dest="minimum_roi_pct")
+    edit_product_parser.add_argument(
+        "--minimum-resale-confidence",
+        dest="minimum_resale_confidence",
+        choices=("low", "medium", "high"),
+    )
+    edit_product_parser.set_defaults(func=cmd_edit_product)
 
     enable_product_parser = subparsers.add_parser(
         "enable-product", help="Enable a product watch and its WatchRules."

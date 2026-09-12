@@ -7,8 +7,19 @@ friends), computes gross/net profit, margin, ROI, and a break-even resale
 price, then classifies the result against configurable thresholds.
 
 No StockX/eBay/Vinted lookup exists yet — deliberately: this phase
-validates the arithmetic with a human-supplied resale price first. Never
-triggers a purchase; the returned status is analytical only.
+validates the arithmetic with a human-supplied resale price first.
+
+Phase 25: recommend_purchase() turns that classification plus a resale
+Confidence into the STRONG_BUY/BUY/ALERT_ONLY/REJECT label both
+app/notify.py (for the Discord embed) and purchase/engine.py (for the
+actual auto-buy gate) need — kept here, a peer of engine/decision.py,
+rather than in app/ or purchase/, specifically so both can share it
+without either importing the other (purchase/ must never depend on
+app/). It imports market_data.estimator.Confidence — a small,
+dependency-free StrEnum with no I/O of its own — but never anything that
+performs a market lookup; that stays app/resale.py's job. The status this
+module returns remains purely analytical: nothing here ever triggers a
+purchase on its own.
 """
 
 from __future__ import annotations
@@ -16,6 +27,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal
 from enum import StrEnum
+from typing import TYPE_CHECKING
+
+from engine.decision import (
+    effective_fixed_fee,
+    effective_minimum_net_profit,
+    effective_minimum_roi_pct,
+    effective_other_costs,
+    effective_platform_fee_pct,
+    effective_shipping_cost,
+)
+from market_data.estimator import Confidence
+
+if TYPE_CHECKING:
+    from database.models import WatchRule
 
 _CENTS = Decimal("0.01")
 _HUNDRED = Decimal("100")
@@ -55,6 +80,30 @@ class OpportunityThresholds:
     min_roi_pct: Decimal = Decimal("0")
     min_margin_pct: Decimal = Decimal("0")
     strong_buy_roi_pct: Decimal = Decimal("50")
+
+
+def build_opportunity_inputs(
+    watch_rule: WatchRule, resale_price: Decimal
+) -> tuple[OpportunityConfig, OpportunityThresholds]:
+    """Builds (config, thresholds) from a Product Watch's effective (Phase
+    22 rule-then-Product fallback) fee/shipping/threshold fields plus an
+    already-resolved resale price — the one place this assembly happens,
+    reused by app/notify.py (item price only, for the immediate alert)
+    and purchase/engine.py (the real revalidated total, for the
+    post-checkout-preparation profitability re-check) so the two never
+    drift apart."""
+    config = OpportunityConfig(
+        estimated_resale_price=resale_price,
+        platform_fee_pct=effective_platform_fee_pct(watch_rule) or Decimal("0"),
+        fixed_fee=effective_fixed_fee(watch_rule) or Decimal("0"),
+        shipping_cost=effective_shipping_cost(watch_rule) or Decimal("0"),
+        other_costs=effective_other_costs(watch_rule) or Decimal("0"),
+    )
+    thresholds = OpportunityThresholds(
+        min_net_profit=effective_minimum_net_profit(watch_rule) or Decimal("0"),
+        min_roi_pct=effective_minimum_roi_pct(watch_rule) or Decimal("0"),
+    )
+    return config, thresholds
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,3 +213,60 @@ def _classify(
         OpportunityStatus.BUY_CANDIDATE,
         "Meets the configured net profit, ROI, and margin thresholds.",
     )
+
+
+class PurchaseRecommendation(StrEnum):
+    STRONG_BUY = "strong_buy"
+    BUY = "buy"
+    ALERT_ONLY = "alert_only"
+    REJECT = "reject"
+
+
+_CONFIDENCE_RANK = {Confidence.LOW: 0, Confidence.MEDIUM: 1, Confidence.HIGH: 2}
+
+
+def recommend_purchase(
+    opportunity: OpportunityResult | None,
+    resale_confidence: Confidence,
+    minimum_resale_confidence: str | None,
+) -> tuple[PurchaseRecommendation, str]:
+    """Translates this module's pure financial classification plus how
+    much we trust the resale number into the one label Discord shows and
+    purchase/engine.py gates auto-buy on.
+
+    No opportunity computed at all (no resale price known) -> ALERT_ONLY:
+    there is a genuine restock to report, just nothing to judge
+    profitability by yet. REJECT/WATCH statuses stay REJECT/ALERT_ONLY
+    regardless of confidence — a bad number doesn't need a confidence
+    check to already be a reject. A profitable result
+    (BUY_CANDIDATE/STRONG_BUY_CANDIDATE) is only ever promoted to
+    BUY/STRONG_BUY when resale_confidence clears minimum_resale_confidence
+    (defaulting to requiring at least MEDIUM when nothing was configured)
+    — otherwise it is downgraded to ALERT_ONLY: profitable on paper, but
+    not confident enough to trust with real money.
+    """
+    if opportunity is None:
+        return PurchaseRecommendation.ALERT_ONLY, "No resale estimate available yet."
+
+    if opportunity.status == OpportunityStatus.REJECT:
+        return PurchaseRecommendation.REJECT, opportunity.reason
+
+    if opportunity.status == OpportunityStatus.WATCH:
+        return PurchaseRecommendation.ALERT_ONLY, opportunity.reason
+
+    required = (
+        Confidence(minimum_resale_confidence) if minimum_resale_confidence else Confidence.MEDIUM
+    )
+    if _CONFIDENCE_RANK[resale_confidence] < _CONFIDENCE_RANK[required]:
+        return (
+            PurchaseRecommendation.ALERT_ONLY,
+            (
+                f"Profitable ({opportunity.reason}) but resale confidence "
+                f"{resale_confidence.value} is below the required {required.value} — "
+                "too uncertain to auto-buy."
+            ),
+        )
+
+    if opportunity.status == OpportunityStatus.STRONG_BUY_CANDIDATE:
+        return PurchaseRecommendation.STRONG_BUY, opportunity.reason
+    return PurchaseRecommendation.BUY, opportunity.reason

@@ -17,11 +17,18 @@ from engine.change_detection import EventType
 
 if TYPE_CHECKING:
     from engine.change_detection import MonitoringEvent
-    from engine.opportunity import OpportunityResult
-    from market_data.estimator import ResaleEstimate
+    from engine.opportunity import OpportunityResult, PurchaseRecommendation
+    from market_data.estimator import Confidence, ResaleEstimate
     from products.matcher import MatchResult
     from products.observation import ProductObservation
     from purchase.models import PurchaseIntent
+
+_RECOMMENDATION_LABELS: dict[str, str] = {
+    "strong_buy": "STRONG BUY",
+    "buy": "BUY",
+    "alert_only": "ALERT ONLY",
+    "reject": "REJECT",
+}
 
 _EVENT_TITLES: dict[EventType, str] = {
     EventType.STOCK_AVAILABLE: "📦 Back in Stock",
@@ -55,6 +62,9 @@ def format_event_embed(
     *,
     opportunity: OpportunityResult | None = None,
     resale_estimate: ResaleEstimate | None = None,
+    resale_confidence: Confidence | None = None,
+    recommendation: PurchaseRecommendation | None = None,
+    recommendation_reason: str | None = None,
 ) -> discord.Embed:
     embed = discord.Embed(
         title=_EVENT_TITLES.get(event.event_type, str(event.event_type)),
@@ -87,6 +97,16 @@ def format_event_embed(
         embed.add_field(name="ROI", value=f"{opportunity.roi_pct}%", inline=True)
         embed.add_field(name="Margin", value=f"{opportunity.net_margin_pct}%", inline=True)
         embed.add_field(name="Opportunity", value=opportunity.status.value, inline=True)
+    if resale_confidence is not None:
+        embed.add_field(name="Resale confidence", value=resale_confidence.value, inline=True)
+    if recommendation is not None:
+        embed.add_field(
+            name="Decision",
+            value=_RECOMMENDATION_LABELS.get(recommendation.value, recommendation.value),
+            inline=True,
+        )
+    if recommendation_reason is not None:
+        embed.add_field(name="Reason", value=recommendation_reason, inline=False)
     if resale_estimate is not None and resale_estimate.sample_size > 0:
         embed.add_field(name="Market source", value=resale_estimate.source, inline=True)
         embed.add_field(

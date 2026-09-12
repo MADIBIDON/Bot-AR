@@ -19,9 +19,19 @@ import asyncio
 from decimal import Decimal
 from typing import TYPE_CHECKING, Protocol
 
-from app.resale import resolve_resale_price_for_opportunity
-from engine.decision import DecisionResult, evaluate
-from engine.opportunity import OpportunityConfig, OpportunityResult, evaluate_opportunity
+from app.resale import resolve_resale_confidence, resolve_resale_price_for_opportunity
+from engine.decision import (
+    DecisionResult,
+    effective_minimum_resale_confidence,
+    effective_resale_price_mode,
+    evaluate,
+)
+from engine.opportunity import (
+    OpportunityResult,
+    build_opportunity_inputs,
+    evaluate_opportunity,
+    recommend_purchase,
+)
 from notifications.discord.formatter import format_event_embed
 
 if TYPE_CHECKING:
@@ -29,8 +39,9 @@ if TYPE_CHECKING:
 
     from database.models import WatchRule
     from engine.change_detection import MonitoringEvent
+    from engine.opportunity import PurchaseRecommendation
     from market_data.cache import TTLCache
-    from market_data.estimator import ResaleEstimate
+    from market_data.estimator import Confidence, ResaleEstimate
     from market_data.registry import MarketDataRegistry
     from products.matcher import MatchResult
     from products.observation import ProductObservation
@@ -43,7 +54,7 @@ class EmbedSender(Protocol):
     async def send_embed(self, embed: discord.Embed) -> None: ...
 
 
-def _opportunity_for(
+def _compute_opportunity_sync(
     watch_rule: WatchRule,
     purchase_price: Decimal,
     market_registry: MarketDataRegistry | None,
@@ -54,14 +65,39 @@ def _opportunity_for(
     )
     if resale_price is None:
         return None, resale_estimate
-    config = OpportunityConfig(
-        estimated_resale_price=resale_price,
-        platform_fee_pct=watch_rule.platform_fee_pct or Decimal("0"),
-        fixed_fee=watch_rule.fixed_fee or Decimal("0"),
-        shipping_cost=watch_rule.shipping_cost or Decimal("0"),
-        other_costs=watch_rule.other_costs or Decimal("0"),
-    )
-    return evaluate_opportunity(purchase_price, config), resale_estimate
+    # Phase 25: shared with purchase/engine.py's post-revalidation
+    # profitability re-check, so a Product Watch's configured thresholds
+    # (0 when unset, matching engine.opportunity's own defaults) are
+    # always read the same way — previously this always used hardcoded
+    # defaults, so a configured minimum_net_profit/minimum_roi_pct never
+    # actually reached the classification.
+    config, thresholds = build_opportunity_inputs(watch_rule, resale_price)
+    return evaluate_opportunity(purchase_price, config, thresholds), resale_estimate
+
+
+async def compute_opportunity(
+    watch_rule: WatchRule,
+    purchase_price: Decimal,
+    market_registry: MarketDataRegistry | None,
+    cache: TTLCache | None,
+) -> tuple[OpportunityResult | None, ResaleEstimate | None]:
+    """Public (Phase 25) so app/worker.py can call this once and reuse the
+    result for both the immediate alert and, when profitability mode
+    applies, the purchase-path profitability gate — instead of each
+    computing it separately. Cheap to call twice regardless: market mode's
+    result is cached by resolve_resale_price_for_opportunity's TTLCache
+    key, so a second call within the same tick never repeats the network
+    lookup."""
+    if effective_resale_price_mode(watch_rule) == "market":
+        # Phase 23: offloaded to a thread so a slow/misbehaving market
+        # source can't block the event loop other concurrently-checked
+        # WatchRules' own alerts share.
+        return await asyncio.to_thread(
+            _compute_opportunity_sync, watch_rule, purchase_price, market_registry, cache
+        )
+    # "manual" mode is pure in-memory arithmetic — no thread-hop overhead
+    # for the common case (still true of every real WatchRule today).
+    return _compute_opportunity_sync(watch_rule, purchase_price, market_registry, cache)
 
 
 async def notify_events_if_allowed(
@@ -80,23 +116,27 @@ async def notify_events_if_allowed(
     what changed. market_registry/cache default to None so every existing
     caller and test (manual resale mode only) is unaffected; they are only
     needed when a WatchRule has resale_price_mode="market".
+
+    Phase 25: the restock alert itself is unaffected by profitability —
+    engine.decision.evaluate() already decided whether to allow this
+    (skipping the old hard target_price gate in profitability mode, see
+    its module docstring); here, when a resale price is known, the embed
+    is enriched with the net-profit/ROI breakdown, a resale-confidence
+    label, and a STRONG_BUY/BUY/ALERT_ONLY/REJECT recommendation —
+    display only, never a reason to withhold the alert.
     """
     decision = evaluate(watch_rule, observation, match_result)
     if decision.allowed:
-        if watch_rule.resale_price_mode == "market":
-            # Phase 23: the only path here with a real network call
-            # (eBay, via market_registry) — offloaded to a thread so a
-            # slow/misbehaving market source can't block the event loop
-            # other concurrently-checked WatchRules' own alerts share.
-            # "manual" mode (the only mode any real WatchRule uses today)
-            # is pure in-memory arithmetic and stays directly awaited —
-            # no thread-hop overhead for the common case.
-            opportunity, resale_estimate = await asyncio.to_thread(
-                _opportunity_for, watch_rule, observation.price, market_registry, cache
-            )
-        else:
-            opportunity, resale_estimate = _opportunity_for(
-                watch_rule, observation.price, market_registry, cache
+        opportunity, resale_estimate = await compute_opportunity(
+            watch_rule, observation.price, market_registry, cache
+        )
+        resale_confidence: Confidence | None = None
+        recommendation: PurchaseRecommendation | None = None
+        recommendation_reason: str | None = None
+        if opportunity is not None:
+            resale_confidence = resolve_resale_confidence(watch_rule, resale_estimate)
+            recommendation, recommendation_reason = recommend_purchase(
+                opportunity, resale_confidence, effective_minimum_resale_confidence(watch_rule)
             )
         for event in events:
             embed = format_event_embed(
@@ -105,6 +145,9 @@ async def notify_events_if_allowed(
                 match_result,
                 opportunity=opportunity,
                 resale_estimate=resale_estimate,
+                resale_confidence=resale_confidence,
+                recommendation=recommendation,
+                recommendation_reason=recommendation_reason,
             )
             await notifier.send_embed(embed)
     return decision

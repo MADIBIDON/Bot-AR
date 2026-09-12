@@ -33,6 +33,23 @@ evaluate_purchase_intent's caller, immediately before
 create_purchase_attempt(), with no `await` in between) is the
 "one active attempt per listing" lock — see database/models.py's
 PurchaseAttempt docstring for why that is safe in this architecture.
+
+Phase 25 — profitability-based decisions: a watch in profitability mode
+(engine.decision.is_profitability_mode) is no longer gated on a flat
+max_price alone. evaluate_purchase_intent() checks the pre-computed
+opportunity/resale_confidence (built by the caller from the item price —
+see app/notify.py's compute_opportunity, which purchase/ must not import
+directly: it depends on market_data/, and purchase/ stays a peer of
+engine/, never a dependent of app/). attempt_purchase() then re-checks
+profitability a second time after revalidate() returns, this time against
+the REAL revalidated total (item + real shipping + real tax) — matching
+"produit + livraison = 60€" needing to be evaluated as a whole, not just
+the item price — using engine.opportunity.build_opportunity_inputs(),
+which both this module and app/notify.py share so the same fee/threshold
+assumptions are never computed two different ways. This module does
+import market_data.estimator.Confidence directly (a small, dependency-
+free StrEnum with no I/O), the same pragmatic exception engine/opportunity.py
+already makes — never anything that performs a market lookup itself.
 """
 
 from __future__ import annotations
@@ -45,7 +62,19 @@ from decimal import Decimal
 from typing import TYPE_CHECKING
 
 from database import crud
-from engine.decision import MIN_FINANCIAL_MATCH_CONFIDENCE, effective_max_price
+from engine.decision import (
+    MIN_FINANCIAL_MATCH_CONFIDENCE,
+    effective_max_price,
+    effective_minimum_resale_confidence,
+    is_profitability_mode,
+)
+from engine.opportunity import (
+    PurchaseRecommendation,
+    build_opportunity_inputs,
+    evaluate_opportunity,
+    recommend_purchase,
+)
+from market_data.estimator import Confidence
 from notifications.discord.formatter import format_purchase_embed
 from purchase.base import AutomatedCheckoutUnsupportedError, HumanActionRequiredError
 from purchase.config import is_merchant_allowed
@@ -57,6 +86,7 @@ if TYPE_CHECKING:
 
     from app.notify import EmbedSender
     from database.models import WatchRule
+    from engine.opportunity import OpportunityResult
     from products.matcher import MatchResult
     from products.observation import ProductObservation
     from purchase.config import PurchasePolicy
@@ -75,9 +105,17 @@ def build_purchase_intent(
     """Builds the candidate from state the monitoring fast path already
     fetched — no network call here. max_price_allowed is the effective
     max_price (the rule's own, or its product's shared ceiling — see
-    engine.decision.effective_max_price): a rule with neither configured
-    never becomes a purchase candidate at all (see
-    evaluate_purchase_intent)."""
+    engine.decision.effective_max_price) when one is configured. A
+    profitability-mode rule (Phase 25) can legitimately have none —
+    profitability decides instead of a fixed cap — so this falls back to
+    the observed total cost rather than a bare 0, which would fail
+    PurchaseAttempt's "max_price_allowed > 0" check and also read as a
+    confusing "€0 allowed" in the Discord embed. A rule with neither a
+    max_price nor profitability thresholds configured never becomes a
+    purchase candidate at all (see evaluate_purchase_intent)."""
+    max_price = effective_max_price(watch_rule)
+    if max_price is None:
+        max_price = observation.price * watch_rule.max_quantity
     return PurchaseIntent(
         watch_rule_id=watch_rule.id,
         product_id=watch_rule.product_id,
@@ -86,7 +124,7 @@ def build_purchase_intent(
         product_name=watch_rule.product.name,
         url=observation.url,
         observed_price=observation.price,
-        max_price_allowed=effective_max_price(watch_rule) or Decimal("0"),
+        max_price_allowed=max_price,
         quantity=watch_rule.max_quantity,
         match_confidence=match_result.confidence,
         created_at=now or datetime.now(UTC),
@@ -105,10 +143,20 @@ def evaluate_purchase_intent(
     has_active_attempt: bool,
     seconds_since_last_attempt: float | None,
     spent_today: Decimal,
+    opportunity: OpportunityResult | None = None,
+    resale_confidence: Confidence | None = None,
 ) -> PurchaseDecision:
     """Every check fails closed: any missing or ambiguous signal refuses
     the purchase. Order matches the spec (Phase 19, item 16), checked
-    top to bottom, first failure wins."""
+    top to bottom, first failure wins.
+
+    opportunity/resale_confidence (Phase 25) are only consulted when the
+    watch is in profitability mode (engine.decision.is_profitability_mode
+    — a minimum_net_profit or minimum_roi_pct is configured, at rule or
+    Product level); every other watch keeps the original price-only gate
+    exactly as before. Both default to None so existing callers/tests
+    that never pass them are unaffected as long as they aren't in
+    profitability mode."""
 
     def _reject(reason: str) -> PurchaseDecision:
         return PurchaseDecision(
@@ -133,12 +181,24 @@ def evaluate_purchase_intent(
     if not available:
         return _reject("Product is out of stock.")
 
+    profitability_mode = is_profitability_mode(watch_rule)
     max_price = effective_max_price(watch_rule)
-    if max_price is None:
-        return _reject(f"Watch rule {watch_rule.id} has no max_price configured.")
+    if max_price is None and not profitability_mode:
+        return _reject(
+            f"Watch rule {watch_rule.id} has no max_price or profitability thresholds configured."
+        )
 
-    if total_cost > max_price:
+    if max_price is not None and total_cost > max_price:
         return _reject(f"Total cost {total_cost} exceeds this watch rule's max_price {max_price}.")
+
+    if profitability_mode:
+        recommendation, recommendation_reason = recommend_purchase(
+            opportunity,
+            resale_confidence or Confidence.LOW,
+            effective_minimum_resale_confidence(watch_rule),
+        )
+        if recommendation not in (PurchaseRecommendation.BUY, PurchaseRecommendation.STRONG_BUY):
+            return _reject(f"Profitability check failed: {recommendation_reason}")
 
     if intent.quantity > watch_rule.max_quantity:
         return _reject(
@@ -228,10 +288,19 @@ async def attempt_purchase(
     notifier: EmbedSender,
     *,
     now: datetime | None = None,
+    opportunity: OpportunityResult | None = None,
+    resale_confidence: Confidence | None = None,
 ) -> PurchaseOutcome:
     """Real attempt only — never call this for a dry run. Safe to run as
     a background asyncio task: any exception here is caught and reported
     (never propagated), and it never touches other WatchRules' state.
+
+    opportunity/resale_confidence (Phase 25) come pre-computed from the
+    caller (app/worker.py already computes them for the alert embed via
+    app.notify.compute_opportunity — purchase/ must not depend on app/ or
+    market_data/'s network-touching pieces itself, see
+    evaluate_purchase_intent's docstring) and only matter for a
+    profitability-mode watch; every other watch ignores both.
     """
     now = now or datetime.now(UTC)
     intent = build_purchase_intent(watch_rule, observation, match_result, now=now)
@@ -250,6 +319,8 @@ async def attempt_purchase(
         has_active_attempt=has_active,
         seconds_since_last_attempt=since_last,
         spent_today=spent_today,
+        opportunity=opportunity,
+        resale_confidence=resale_confidence,
     )
     if not decision.proceed:
         logger.info("watch_rule=%s purchase skipped: %s", watch_rule.id, decision.reason)
@@ -272,7 +343,11 @@ async def attempt_purchase(
         listing_id=watch_rule.listing_id,
         status=PurchaseStatus.CREATED.value,
         observed_price=intent.observed_price,
-        max_price_allowed=effective_max_price(watch_rule),
+        # max_price_allowed is NOT NULL and CHECK > 0; None (profitability
+        # mode with no hard_max_total set — Phase 25) has no fixed ceiling
+        # to record, so this uses intent's own value, which
+        # build_purchase_intent() already resolved the same way.
+        max_price_allowed=intent.max_price_allowed,
         quantity=intent.quantity,
     )
 
@@ -354,6 +429,34 @@ async def attempt_purchase(
             f"Revalidated total cost {revalidated_total} exceeds PURCHASE_MAX_ORDER_EUR "
             f"{policy.max_order_eur}.",
         )
+
+    if is_profitability_mode(watch_rule) and opportunity is not None:
+        # Re-run profitability against the REAL acquisition total (item +
+        # real shipping + real tax), not just the item price the initial
+        # alert used — "produit + livraison = 60€" only becomes knowable
+        # once revalidate() has actually quoted shipping/tax.
+        config, thresholds = build_opportunity_inputs(
+            watch_rule, opportunity.estimated_resale_price
+        )
+        revalidated_opportunity = evaluate_opportunity(revalidated_total, config, thresholds)
+        revalidated_recommendation, revalidated_reason = recommend_purchase(
+            revalidated_opportunity,
+            resale_confidence or Confidence.LOW,
+            effective_minimum_resale_confidence(watch_rule),
+        )
+        if revalidated_recommendation not in (
+            PurchaseRecommendation.BUY,
+            PurchaseRecommendation.STRONG_BUY,
+        ):
+            return await _finish(
+                session,
+                notifier,
+                attempt.id,
+                intent,
+                PurchaseStatus.CANCELLED,
+                f"Profitability check failed on the revalidated total {revalidated_total}: "
+                f"{revalidated_reason}",
+            )
 
     crud.update_purchase_attempt(session, attempt.id, status=PurchaseStatus.CHECKOUT_STARTED.value)
     await _notify_purchase(notifier, "PURCHASE STARTED", intent, reason="Checkout in progress.")

@@ -12,12 +12,24 @@ rule with no observation yet is always due (first run).
 Phase 23: due rules' network fetches (engine.monitoring.run_check — pure,
 no DB) run concurrently, bounded by MAX_CONCURRENT_MONITOR_CHECKS, each
 offloaded to a worker thread via asyncio.to_thread so a slow merchant
-never blocks the others. The SQLAlchemy Session is never touched from
-those threads: due-ness/backoff reads happen up front on the calling
-thread, and every write (engine.monitoring.store_check_result) happens
-afterwards, back on the calling thread, one rule at a time — the same
-"concurrent network, sequential Session" split already used for purchase
-attempts and discovery (see purchase/engine.py, app/discovery.py).
+never blocks the others. Every actual Session query happens on the
+calling thread: due-ness/backoff reads happen up front, and every write
+(engine.monitoring.store_check_result) happens afterwards, one rule at a
+time — the same "concurrent network, sequential Session" split already
+used for purchase attempts and discovery (see purchase/engine.py,
+app/discovery.py).
+
+One subtlety that split doesn't fully cover on its own: run_check()
+accesses watch_rule.product and watch_rule.listing.merchant, which are
+lazy-loaded SQLAlchemy relationships — the *first* access to either is
+itself a Session query. Left alone, two rules' threads could both trigger
+that first lazy-load at the same instant, which is exactly the "bad
+parameter or other API misuse" SQLite error that means a Session/
+connection got used from two threads at once — a real, timing-dependent
+bug this project hit in testing (Phase 25). _warm_relationships() forces
+both to load in the sequential due-rules pass below, before any thread
+ever sees the WatchRule, so every relationship access after that point is
+just a plain in-memory attribute read.
 """
 
 from __future__ import annotations
@@ -105,6 +117,18 @@ def _last_observed_at(session: Session, watch_rule: WatchRule) -> datetime | Non
     return observed_at
 
 
+def _warm_relationships(watch_rule: WatchRule) -> None:
+    """Forces watch_rule.product and watch_rule.listing.merchant to load
+    now, on the caller's thread, before this rule is handed to a
+    concurrent check — see the module docstring for why. A no-op once
+    already loaded (e.g. by a prior tick's warm-up, or eager loading
+    added later), so calling it is always safe."""
+    _ = watch_rule.product
+    listing = watch_rule.listing
+    if listing is not None:
+        _ = listing.merchant
+
+
 def _run_check_safe(rule: WatchRule, registry: ConnectorRegistry) -> MonitoringResult:
     """run_check() wrapped so a genuine bug in one rule's check (never
     expected — connector/observation failures already return
@@ -173,6 +197,7 @@ async def run_monitoring_tick(
                 backoff.current_delay_seconds(rule.id),
             )
             continue
+        _warm_relationships(rule)
         due_rules.append(rule)
 
     if not due_rules:

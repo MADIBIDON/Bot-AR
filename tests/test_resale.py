@@ -9,7 +9,11 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from app.resale import resolve_resale_estimate, resolve_resale_price_for_opportunity
+from app.resale import (
+    resolve_resale_confidence,
+    resolve_resale_estimate,
+    resolve_resale_price_for_opportunity,
+)
 from database.models import Product, WatchRule
 from market_data.base import MarketDataError, MarketDataSource
 from market_data.cache import TTLCache
@@ -161,3 +165,60 @@ def test_cache_expiration_triggers_refetch() -> None:
     resolve_resale_estimate(rule, registry, cache)
 
     assert source.calls == 2
+
+
+# --- Phase 25: resolve_resale_confidence() ---------------------------------
+
+
+def test_manual_mode_untrusted_estimate_is_low_confidence() -> None:
+    from market_data.estimator import Confidence
+
+    rule = _rule(resale_price_mode="manual", estimated_resale_trusted=False)
+
+    assert resolve_resale_confidence(rule, None) == Confidence.LOW
+
+
+def test_manual_mode_trusted_estimate_is_high_confidence() -> None:
+    from market_data.estimator import Confidence
+
+    rule = _rule(resale_price_mode="manual", estimated_resale_trusted=True)
+
+    assert resolve_resale_confidence(rule, None) == Confidence.HIGH
+
+
+def test_manual_mode_trust_falls_back_to_product() -> None:
+    from market_data.estimator import Confidence
+
+    product = Product(id=1, name="X", estimated_resale_trusted=True)
+    rule = _rule(product=product, resale_price_mode="manual")
+
+    assert resolve_resale_confidence(rule, None) == Confidence.HIGH
+
+
+def test_market_mode_uses_estimate_confidence() -> None:
+    from market_data.estimator import Confidence, ResaleEstimate
+
+    rule = _rule(resale_price_mode="market", market_source="ebay")
+    estimate = ResaleEstimate(
+        estimated_price=Decimal("100"),
+        sample_size=10,
+        min_price=Decimal("90"),
+        max_price=Decimal("110"),
+        median_price=Decimal("100"),
+        mean_price=Decimal("100"),
+        confidence=Confidence.HIGH,
+        source="ebay",
+        method="median",
+        based_on_sold_data=True,
+        reason="test",
+    )
+
+    assert resolve_resale_confidence(rule, estimate) == Confidence.HIGH
+
+
+def test_market_mode_with_no_estimate_is_low_confidence() -> None:
+    from market_data.estimator import Confidence
+
+    rule = _rule(resale_price_mode="market", market_source="ebay")
+
+    assert resolve_resale_confidence(rule, None) == Confidence.LOW

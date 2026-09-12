@@ -222,3 +222,99 @@ def test_disable_product_missing_returns_error(
     _patch_session(monkeypatch, session)
 
     assert watch.cmd_disable_product(argparse.Namespace(id=999)) == 1
+
+
+# --- Phase 25: edit-product (profitability config, per Product Watch) -----
+
+
+def _edit_product_args(id: int, **overrides: object) -> argparse.Namespace:
+    defaults: dict[str, object] = dict(
+        target_price=None,
+        max_price=None,
+        estimated_resale_price=None,
+        resale_trusted=None,
+        platform_fee_pct=None,
+        fixed_fee=None,
+        shipping_cost=None,
+        other_costs=None,
+        resale_price_mode=None,
+        market_source=None,
+        minimum_net_profit=None,
+        minimum_roi_pct=None,
+        minimum_resale_confidence=None,
+    )
+    defaults.update(overrides)
+    return argparse.Namespace(id=id, **defaults)
+
+
+def test_edit_product_updates_profitability_thresholds(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_session(monkeypatch, session)
+    product = crud.create_product(session, "ETB 30e", target_price=Decimal("56"))
+
+    rc = watch.cmd_edit_product(
+        _edit_product_args(
+            product.id,
+            minimum_net_profit="20",
+            minimum_roi_pct="30",
+            minimum_resale_confidence="medium",
+        )
+    )
+
+    assert rc == 0
+    updated = crud.get_product(session, product.id)
+    assert updated.minimum_net_profit == Decimal("20")
+    assert updated.minimum_roi_pct == Decimal("30")
+    assert updated.minimum_resale_confidence == "medium"
+
+
+def test_edit_product_sets_resale_trusted(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_session(monkeypatch, session)
+    product = crud.create_product(session, "ETB 30e", estimated_resale_price=Decimal("120"))
+
+    rc = watch.cmd_edit_product(_edit_product_args(product.id, resale_trusted="true"))
+
+    assert rc == 0
+    assert crud.get_product(session, product.id).estimated_resale_trusted is True
+
+
+def test_edit_product_rejects_invalid_resale_confidence(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_session(monkeypatch, session)
+    product = crud.create_product(session, "ETB 30e")
+
+    rc = watch.cmd_edit_product(_edit_product_args(product.id, minimum_resale_confidence="extreme"))
+
+    assert rc == 1
+
+
+def test_edit_product_missing_returns_error(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_session(monkeypatch, session)
+
+    assert watch.cmd_edit_product(_edit_product_args(999)) == 1
+
+
+def test_edit_product_with_no_fields_returns_error(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_session(monkeypatch, session)
+    product = crud.create_product(session, "ETB 30e")
+
+    assert watch.cmd_edit_product(_edit_product_args(product.id)) == 1
+
+
+def test_edit_product_market_mode_without_source_is_rejected(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_session(monkeypatch, session)
+    product = crud.create_product(session, "ETB 30e")
+
+    rc = watch.cmd_edit_product(_edit_product_args(product.id, resale_price_mode="market"))
+
+    assert rc == 1

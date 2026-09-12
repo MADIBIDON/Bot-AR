@@ -53,10 +53,12 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from app.discovery import is_discovery_due, run_discovery_for_product
-from app.notify import notify_events_if_allowed
+from app.notify import compute_opportunity, notify_events_if_allowed
+from app.resale import resolve_resale_confidence
 from connectors.defaults import domains_for_merchant
 from database import crud
 from engine.backoff import BackoffTracker
+from engine.decision import is_profitability_mode
 from engine.worker import run_monitoring_tick
 from purchase.engine import attempt_purchase
 
@@ -163,6 +165,17 @@ async def tick(
             logger.info("rule=%s notification sent", watch_rule.id)
             if purchase_registry is not None and purchase_policy is not None:
                 merchant_domains = domains_for_merchant(result.observation.merchant)
+                opportunity = resale_confidence = None
+                if is_profitability_mode(watch_rule):
+                    # Phase 25: recomputed here (cheap — see
+                    # compute_opportunity's docstring, market mode's
+                    # result is cache-backed) rather than threaded through
+                    # from notify_events_if_allowed, so purchase/engine.py
+                    # never has to depend on app/ or market_data/ itself.
+                    opportunity, _resale_estimate = await compute_opportunity(
+                        watch_rule, result.observation.price, market_registry, market_cache
+                    )
+                    resale_confidence = resolve_resale_confidence(watch_rule, _resale_estimate)
                 _fire_and_forget(
                     attempt_purchase(
                         session,
@@ -173,6 +186,8 @@ async def tick(
                         purchase_registry,
                         merchant_domains,
                         notifier,
+                        opportunity=opportunity,
+                        resale_confidence=resale_confidence,
                     )
                 )
         else:

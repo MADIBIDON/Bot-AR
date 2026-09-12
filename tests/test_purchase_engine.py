@@ -309,3 +309,131 @@ def test_no_previous_attempt_bypasses_cooldown() -> None:
     decision = _evaluate(watch_rule, intent, policy, seconds_since_last_attempt=None)
 
     assert decision.proceed is True
+
+
+# --- Phase 25: profitability mode -------------------------------------
+
+
+def _opportunity(watch_rule: WatchRule, *, resale_price: str = "120", purchase_price: str = "60"):
+    from engine.opportunity import build_opportunity_inputs, evaluate_opportunity
+
+    config, thresholds = build_opportunity_inputs(watch_rule, Decimal(resale_price))
+    return evaluate_opportunity(Decimal(purchase_price), config, thresholds)
+
+
+def test_profitability_mode_without_max_price_still_proceeds() -> None:
+    """The exact scenario from the spec: no hard_max_total set, but a
+    profitable, high-confidence opportunity — must proceed."""
+    from market_data.estimator import Confidence
+
+    watch_rule = _watch_rule(max_price=None, minimum_net_profit=Decimal("20"))
+    intent = _intent(watch_rule, price="60")
+
+    decision = evaluate_purchase_intent(
+        watch_rule=watch_rule,
+        intent=intent,
+        policy=_policy(),
+        merchant_domains=("kairyu.fr", "www.kairyu.fr"),
+        match_confidence=100,
+        available=True,
+        total_cost=Decimal("60"),
+        has_active_attempt=False,
+        seconds_since_last_attempt=None,
+        spent_today=Decimal("0"),
+        opportunity=_opportunity(watch_rule, resale_price="120", purchase_price="60"),
+        resale_confidence=Confidence.HIGH,
+    )
+
+    assert decision.proceed is True
+
+
+def test_profitability_mode_low_profit_rejects() -> None:
+    from market_data.estimator import Confidence
+
+    watch_rule = _watch_rule(max_price=None, minimum_net_profit=Decimal("50"))
+    intent = _intent(watch_rule, price="60")
+
+    decision = evaluate_purchase_intent(
+        watch_rule=watch_rule,
+        intent=intent,
+        policy=_policy(),
+        merchant_domains=("kairyu.fr", "www.kairyu.fr"),
+        match_confidence=100,
+        available=True,
+        total_cost=Decimal("60"),
+        has_active_attempt=False,
+        seconds_since_last_attempt=None,
+        spent_today=Decimal("0"),
+        opportunity=_opportunity(
+            watch_rule, resale_price="65", purchase_price="60"
+        ),  # profit=5 < 50
+        resale_confidence=Confidence.HIGH,
+    )
+
+    assert decision.proceed is False
+    assert "profitability" in decision.reason.lower()
+
+
+def test_profitability_mode_rejects_on_low_resale_confidence() -> None:
+    """Never auto-buy on a doubtful resale number, no matter how good the
+    math looks."""
+    from market_data.estimator import Confidence
+
+    watch_rule = _watch_rule(max_price=None, minimum_net_profit=Decimal("20"))
+    intent = _intent(watch_rule, price="60")
+
+    decision = evaluate_purchase_intent(
+        watch_rule=watch_rule,
+        intent=intent,
+        policy=_policy(),
+        merchant_domains=("kairyu.fr", "www.kairyu.fr"),
+        match_confidence=100,
+        available=True,
+        total_cost=Decimal("60"),
+        has_active_attempt=False,
+        seconds_since_last_attempt=None,
+        spent_today=Decimal("0"),
+        opportunity=_opportunity(watch_rule, resale_price="120", purchase_price="60"),
+        resale_confidence=Confidence.LOW,
+    )
+
+    assert decision.proceed is False
+
+
+def test_profitability_mode_still_respects_hard_max_total_when_set() -> None:
+    """hard_max_total (max_price), when explicitly configured, is still
+    an absolute ceiling even in profitability mode."""
+    from market_data.estimator import Confidence
+
+    watch_rule = _watch_rule(max_price=Decimal("55"), minimum_net_profit=Decimal("20"))
+    intent = _intent(watch_rule, price="60")
+
+    decision = evaluate_purchase_intent(
+        watch_rule=watch_rule,
+        intent=intent,
+        policy=_policy(),
+        merchant_domains=("kairyu.fr", "www.kairyu.fr"),
+        match_confidence=100,
+        available=True,
+        total_cost=Decimal("60"),
+        has_active_attempt=False,
+        seconds_since_last_attempt=None,
+        spent_today=Decimal("0"),
+        opportunity=_opportunity(watch_rule, resale_price="120", purchase_price="60"),
+        resale_confidence=Confidence.HIGH,
+    )
+
+    assert decision.proceed is False
+    assert "max_price" in decision.reason
+
+
+def test_no_max_price_and_no_profitability_thresholds_still_refuses() -> None:
+    """Backward compatibility: a watch with neither configured is refused
+    exactly as before Phase 25."""
+    watch_rule = _watch_rule(max_price=None)
+    intent = _intent(watch_rule, price="60")
+
+    decision = _evaluate(watch_rule, intent, _policy(), total_cost=Decimal("60"))
+
+    assert decision.proceed is False
+    assert "no max_price or profitability" in decision.reason

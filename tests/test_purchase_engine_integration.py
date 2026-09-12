@@ -478,3 +478,97 @@ def test_no_payment_data_field_exists_on_purchase_attempt(session: Session) -> N
     forbidden_substrings = ("card", "cvv", "password", "token", "cookie", "secret")
     for name in column_names:
         assert not any(bad in name.lower() for bad in forbidden_substrings), name
+
+
+# --- Phase 25: profitability mode re-checked against the REAL revalidated
+# total (item + real shipping), not just the item price the alert used ----
+
+
+def _profitability_opportunity(rule, *, resale_price: str, item_price: str):
+    from engine.opportunity import build_opportunity_inputs, evaluate_opportunity
+
+    config, thresholds = build_opportunity_inputs(rule, Decimal(resale_price))
+    return evaluate_opportunity(Decimal(item_price), config, thresholds)
+
+
+def test_profitability_mode_proceeds_when_revalidated_total_is_profitable(
+    session: Session,
+) -> None:
+    """The exact spec example: item 55.99 + shipping 4.00 = 59.99
+    acquisition, resale 120 -> STRONG BUY, proceeds through to checkout."""
+    from market_data.estimator import Confidence
+
+    rule_id, _ = _seed_rule(session, max_price="1000")
+    crud.update_watch_rule(session, rule_id, max_price=None, minimum_net_profit=Decimal("20"))
+    rule = crud.get_watch_rule(session, rule_id)
+    connector = FakeConnector(
+        revalidate_result=RevalidationResult(
+            available=True,
+            price=Decimal("55.99"),
+            shipping_cost=Decimal("4.00"),
+            quantity_available=None,
+        )
+    )
+    notifier = FakeNotifier()
+    opportunity = _profitability_opportunity(rule, resale_price="120", item_price="55.99")
+
+    outcome = asyncio.run(
+        attempt_purchase(
+            session,
+            rule,
+            _observation(price="55.99"),
+            _match(),
+            _policy(),
+            _registry(connector),
+            ("kairyu.fr",),
+            notifier,
+            opportunity=opportunity,
+            resale_confidence=Confidence.HIGH,
+        )
+    )
+
+    assert outcome.status == PurchaseStatus.PURCHASED
+    assert connector.checkout_calls == 1
+
+
+def test_profitability_mode_cancels_when_revalidated_total_is_not_profitable(
+    session: Session,
+) -> None:
+    """Same acquisition total (59.99), but a resale estimate too low to
+    clear minimum_net_profit -> cancelled before checkout, real money
+    never at risk regardless."""
+    from market_data.estimator import Confidence
+
+    rule_id, _ = _seed_rule(session, max_price="1000")
+    crud.update_watch_rule(session, rule_id, max_price=None, minimum_net_profit=Decimal("20"))
+    rule = crud.get_watch_rule(session, rule_id)
+    connector = FakeConnector(
+        revalidate_result=RevalidationResult(
+            available=True,
+            price=Decimal("55.99"),
+            shipping_cost=Decimal("4.00"),
+            quantity_available=None,
+        )
+    )
+    notifier = FakeNotifier()
+    # resale=65 vs acquisition ~60 -> profit ~5, below the 20 minimum.
+    opportunity = _profitability_opportunity(rule, resale_price="65", item_price="55.99")
+
+    outcome = asyncio.run(
+        attempt_purchase(
+            session,
+            rule,
+            _observation(price="55.99"),
+            _match(),
+            _policy(),
+            _registry(connector),
+            ("kairyu.fr",),
+            notifier,
+            opportunity=opportunity,
+            resale_confidence=Confidence.HIGH,
+        )
+    )
+
+    assert outcome.status == PurchaseStatus.CANCELLED
+    assert connector.checkout_calls == 0
+    assert "profitability" in outcome.reason.lower()

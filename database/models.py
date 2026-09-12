@@ -69,6 +69,32 @@ class Product(Base):
     discovery_interval: Mapped[int] = mapped_column(default=1800, nullable=False)
     last_discovery_at: Mapped[datetime | None] = mapped_column(default=None)
 
+    # Phase 25 — profitability-based purchase decisions, mirrored from
+    # WatchRule (Phase 15/16) so a Product Watch's many auto-discovered
+    # WatchRules can share one set of resale/fee assumptions the same way
+    # they already share max_price/target_price. See engine/decision.py's
+    # effective_*() fallback functions.
+    platform_fee_pct: Mapped[Decimal | None] = mapped_column(Numeric(5, 2), default=None)
+    fixed_fee: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), default=None)
+    shipping_cost: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), default=None)
+    other_costs: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), default=None)
+    resale_price_mode: Mapped[str] = mapped_column(default="manual", nullable=False)
+    market_source: Mapped[str | None] = mapped_column(default=None)
+
+    # target_price above doubles as "target buy price" (a particularly
+    # good price, no longer a hard notification gate once these are set —
+    # see engine.decision.evaluate()) and max_price doubles as an
+    # optional hard ceiling ("hard_max_total"): leave it unset to let
+    # profitability alone decide. minimum_resale_confidence is one of
+    # market_data.estimator.Confidence's values ("low"/"medium"/"high");
+    # estimated_resale_trusted opts a manually-entered
+    # estimated_resale_price into counting as sufficiently confident for
+    # auto-buy (mirrors "sold data" already doing that for market mode).
+    minimum_net_profit: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), default=None)
+    minimum_roi_pct: Mapped[Decimal | None] = mapped_column(Numeric(6, 2), default=None)
+    minimum_resale_confidence: Mapped[str | None] = mapped_column(default=None)
+    estimated_resale_trusted: Mapped[bool] = mapped_column(default=False, nullable=False)
+
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
@@ -181,6 +207,19 @@ class WatchRule(Base):
             "resale_price_mode IN ('manual', 'market')",
             name="ck_watch_rule_resale_price_mode_valid",
         ),
+        CheckConstraint(
+            "minimum_resale_confidence IS NULL OR minimum_resale_confidence IN "
+            "('low', 'medium', 'high')",
+            name="ck_watch_rule_minimum_resale_confidence_valid",
+        ),
+        CheckConstraint(
+            "minimum_net_profit IS NULL OR minimum_net_profit >= 0",
+            name="ck_watch_rule_minimum_net_profit_non_negative",
+        ),
+        CheckConstraint(
+            "minimum_roi_pct IS NULL OR minimum_roi_pct >= 0",
+            name="ck_watch_rule_minimum_roi_pct_non_negative",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -206,6 +245,15 @@ class WatchRule(Base):
     # then ignored (kept as an optional fallback value only).
     resale_price_mode: Mapped[str] = mapped_column(default="manual", nullable=False)
     market_source: Mapped[str | None] = mapped_column(default=None)
+
+    # Phase 25 — profitability-based purchase decisions. See the matching
+    # fields on Product for the full explanation; effective_*() in
+    # engine/decision.py falls back to the Product's value when a rule
+    # leaves these unset, same pattern as max_price/target_price.
+    minimum_net_profit: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), default=None)
+    minimum_roi_pct: Mapped[Decimal | None] = mapped_column(Numeric(6, 2), default=None)
+    minimum_resale_confidence: Mapped[str | None] = mapped_column(default=None)
+    estimated_resale_trusted: Mapped[bool] = mapped_column(default=False, nullable=False)
 
     enabled: Mapped[bool] = mapped_column(default=True, nullable=False)
     check_interval: Mapped[int] = mapped_column(nullable=False)

@@ -8,8 +8,12 @@ from engine.opportunity import (
     OpportunityConfig,
     OpportunityStatus,
     OpportunityThresholds,
+    PurchaseRecommendation,
+    build_opportunity_inputs,
     evaluate_opportunity,
+    recommend_purchase,
 )
+from market_data.estimator import Confidence
 
 
 def test_worked_example_matches_hand_calculation() -> None:
@@ -192,3 +196,122 @@ def test_default_thresholds_used_when_none_given() -> None:
     config = OpportunityConfig(estimated_resale_price=Decimal("100"))
     result = evaluate_opportunity(Decimal("50"), config)  # roi=100% >= default strong_buy 50%
     assert result.status == OpportunityStatus.STRONG_BUY_CANDIDATE
+
+
+# --- Phase 25: recommend_purchase() ----------------------------------------
+
+
+def _strong_buy_opportunity() -> object:
+    config = OpportunityConfig(estimated_resale_price=Decimal("120"))
+    return evaluate_opportunity(Decimal("60"), config)  # roi=100%
+
+
+def _watch_opportunity() -> object:
+    thresholds = OpportunityThresholds(min_roi_pct=Decimal("90"))
+    config = OpportunityConfig(estimated_resale_price=Decimal("65"))
+    return evaluate_opportunity(Decimal("60"), config, thresholds)  # roi=8.3% < 90%
+
+
+def _reject_opportunity() -> object:
+    thresholds = OpportunityThresholds(min_net_profit=Decimal("50"))
+    config = OpportunityConfig(estimated_resale_price=Decimal("65"))
+    return evaluate_opportunity(Decimal("60"), config, thresholds)  # net_profit=5 < 50
+
+
+def test_no_opportunity_is_alert_only() -> None:
+    recommendation, _reason = recommend_purchase(None, Confidence.HIGH, None)
+    assert recommendation == PurchaseRecommendation.ALERT_ONLY
+
+
+def test_reject_status_stays_reject_even_with_high_confidence() -> None:
+    recommendation, _reason = recommend_purchase(_reject_opportunity(), Confidence.HIGH, None)
+    assert recommendation == PurchaseRecommendation.REJECT
+
+
+def test_watch_status_is_alert_only_even_with_high_confidence() -> None:
+    recommendation, _reason = recommend_purchase(_watch_opportunity(), Confidence.HIGH, None)
+    assert recommendation == PurchaseRecommendation.ALERT_ONLY
+
+
+def test_strong_buy_candidate_with_high_confidence_is_strong_buy() -> None:
+    recommendation, _reason = recommend_purchase(_strong_buy_opportunity(), Confidence.HIGH, None)
+    assert recommendation == PurchaseRecommendation.STRONG_BUY
+
+
+def test_buy_candidate_with_sufficient_confidence_is_buy() -> None:
+    thresholds = OpportunityThresholds(strong_buy_roi_pct=Decimal("1000"))
+    config = OpportunityConfig(estimated_resale_price=Decimal("120"))
+    opportunity = evaluate_opportunity(Decimal("60"), config, thresholds)  # roi=100%, below 1000%
+
+    recommendation, _reason = recommend_purchase(opportunity, Confidence.MEDIUM, None)
+
+    assert recommendation == PurchaseRecommendation.BUY
+
+
+def test_profitable_but_low_confidence_is_downgraded_to_alert_only() -> None:
+    """Never auto-buy on a doubtful resale number, no matter how good the
+    math looks — "je préfère rater une opportunité ambiguë..."."""
+    recommendation, reason = recommend_purchase(_strong_buy_opportunity(), Confidence.LOW, None)
+
+    assert recommendation == PurchaseRecommendation.ALERT_ONLY
+    assert "confidence" in reason.lower()
+
+
+def test_explicit_minimum_confidence_is_honored() -> None:
+    """Even MEDIUM confidence is rejected when the watch explicitly
+    requires HIGH."""
+    recommendation, _reason = recommend_purchase(
+        _strong_buy_opportunity(), Confidence.MEDIUM, "high"
+    )
+    assert recommendation == PurchaseRecommendation.ALERT_ONLY
+
+    recommendation, _reason = recommend_purchase(_strong_buy_opportunity(), Confidence.HIGH, "high")
+    assert recommendation == PurchaseRecommendation.STRONG_BUY
+
+
+def test_explicit_low_minimum_confidence_allows_low_confidence_buy() -> None:
+    recommendation, _reason = recommend_purchase(_strong_buy_opportunity(), Confidence.LOW, "low")
+    assert recommendation == PurchaseRecommendation.STRONG_BUY
+
+
+# --- Phase 25: build_opportunity_inputs() ----------------------------------
+
+
+def test_build_opportunity_inputs_reads_effective_fields() -> None:
+    from database.models import Product, WatchRule
+
+    product = Product(
+        id=1,
+        name="X",
+        platform_fee_pct=Decimal("9"),
+        shipping_cost=Decimal("6.50"),
+        minimum_net_profit=Decimal("20"),
+        minimum_roi_pct=Decimal("30"),
+    )
+    rule = WatchRule(id=1, product_id=1, check_interval=60, max_quantity=1, product=product)
+
+    config, thresholds = build_opportunity_inputs(rule, Decimal("110"))
+
+    assert config.estimated_resale_price == Decimal("110")
+    assert config.platform_fee_pct == Decimal("9")
+    assert config.shipping_cost == Decimal("6.50")
+    assert thresholds.min_net_profit == Decimal("20")
+    assert thresholds.min_roi_pct == Decimal("30")
+
+
+def test_build_opportunity_inputs_rule_level_overrides_product() -> None:
+    from database.models import Product, WatchRule
+
+    product = Product(id=1, name="X", platform_fee_pct=Decimal("9"))
+    rule = WatchRule(
+        id=1,
+        product_id=1,
+        check_interval=60,
+        max_quantity=1,
+        platform_fee_pct=Decimal("5"),
+        product=product,
+    )
+
+    config, _thresholds = build_opportunity_inputs(rule, Decimal("110"))
+
+    assert config.platform_fee_pct == Decimal("5")
