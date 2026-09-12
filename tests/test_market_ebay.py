@@ -185,3 +185,43 @@ def test_token_fetch_failure_raises_market_data_error(monkeypatch: pytest.Monkey
 
     with pytest.raises(MarketDataError):
         _source().search("query")
+
+
+# --- Phase 26: real OAuth outcomes get recorded for healthcheck -----------
+
+
+def test_successful_token_fetch_records_ebay_status_success(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from market_data import ebay_status
+
+    monkeypatch.setattr(ebay_status, "_STATUS_FILE", tmp_path / "ebay_oauth_status.json")
+    monkeypatch.setattr(httpx, "post", lambda url, **kw: _token_response(url))
+    monkeypatch.setattr(httpx, "get", lambda url, **kw: _search_response(url, []))
+
+    _source().search("query")
+
+    status = ebay_status.get_status()
+    assert status.last_success_at is not None
+    assert status.last_failure_at is None
+
+
+def test_failed_token_fetch_records_ebay_status_failure_without_secrets(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from market_data import ebay_status
+
+    monkeypatch.setattr(ebay_status, "_STATUS_FILE", tmp_path / "ebay_oauth_status.json")
+    monkeypatch.setattr(
+        httpx, "post", lambda url, **kw: httpx.Response(401, request=httpx.Request("POST", url))
+    )
+
+    with pytest.raises(MarketDataError):
+        _source().search("query")
+
+    status = ebay_status.get_status()
+    assert status.last_success_at is None
+    assert status.last_failure_at is not None
+    assert status.last_failure_reason == "HTTP 401 obtaining eBay OAuth token"
+    assert "fake-id" not in status.last_failure_reason
+    assert "fake-secret" not in status.last_failure_reason

@@ -186,5 +186,6 @@ def test_backoff_recorded_correctly_under_concurrency(session: Session) -> None:
 
     bad_rule = results_by_success[False]
     good_rule = results_by_success[True]
-    assert backoff.is_blocked(bad_rule.id, now) is True
-    assert backoff.is_blocked(good_rule.id, now) is False
+    # Backoff is keyed by merchant (Phase 26, section 11), not rule.id.
+    assert backoff.is_blocked(f"merchant:{bad_rule.listing.merchant.name}", now) is True
+    assert backoff.is_blocked(f"merchant:{good_rule.listing.merchant.name}", now) is False

@@ -156,13 +156,20 @@ async def tick(
                 notifier,
                 market_registry,
                 market_cache,
+                # Phase 26: the actual Discord send is fired through this
+                # instead of awaited inline, so a slow/rate-limited
+                # Discord call can never delay this tick's return (and,
+                # by extension, the next tick's monitoring of every other
+                # WatchRule). Decision/opportunity computation above this
+                # line is unaffected — those still happen synchronously.
+                dispatch=_fire_and_forget,
             )
         except Exception:
             logger.exception("notification failed watch_rule=%s", watch_rule.id)
             continue
 
         if decision.allowed:
-            logger.info("rule=%s notification sent", watch_rule.id)
+            logger.info("rule=%s notification dispatched", watch_rule.id)
             if purchase_registry is not None and purchase_policy is not None:
                 merchant_domains = domains_for_merchant(result.observation.merchant)
                 opportunity = resale_confidence = None

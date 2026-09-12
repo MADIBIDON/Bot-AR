@@ -27,6 +27,7 @@ from decimal import Decimal, InvalidOperation
 
 import httpx
 
+from market_data import ebay_status
 from market_data.base import MarketDataError, MarketDataSource
 from market_data.models import MarketObservation
 
@@ -120,6 +121,19 @@ class EbayMarketDataSource(MarketDataSource):
             if now < self._token_expires_at:
                 return self._access_token
 
+        try:
+            token, expires_in = self._request_new_token()
+        except MarketDataError as exc:
+            ebay_status.record_failure(str(exc))
+            raise
+        ebay_status.record_success()
+
+        self._access_token = token
+        # Refresh a little early rather than exactly at expiry.
+        self._token_expires_at = now + timedelta(seconds=max(int(expires_in) - 60, 0))
+        return token
+
+    def _request_new_token(self) -> tuple[str, int]:
         credentials = base64.b64encode(
             f"{self._config.app_id}:{self._config.cert_id}".encode()
         ).decode()
@@ -148,11 +162,7 @@ class EbayMarketDataSource(MarketDataSource):
         expires_in = payload.get("expires_in", 0)
         if not isinstance(token, str) or not token:
             raise MarketDataError("eBay OAuth response had no access_token")
-
-        self._access_token = token
-        # Refresh a little early rather than exactly at expiry.
-        self._token_expires_at = now + timedelta(seconds=max(int(expires_in) - 60, 0))
-        return token
+        return token, expires_in
 
     def _parse_item(self, item: dict) -> MarketObservation | None:
         price_data = item.get("price")

@@ -10,6 +10,7 @@ and not machine learning.
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import StrEnum
@@ -130,6 +131,21 @@ def estimate_resale_price(
             reason="No market observations available.",
         )
 
+    # Phase 26 audit (section 6, "devise différente"): prices were pooled
+    # across observations regardless of currency — a single mismatched
+    # EBAY_MARKETPLACE_ID (or any future second market source) could
+    # silently mix e.g. USD and EUR listings into one median/mean, giving
+    # a confident-looking but financially wrong resale number. Keep only
+    # the majority currency's observations; the rest are dropped rather
+    # than pooled, matching this project's "never let unknown/mismatched
+    # data quietly make the opportunity look better" rule.
+    currencies = Counter(obs.currency for obs in observations)
+    dropped_for_currency = 0
+    if len(currencies) > 1:
+        majority_currency, _ = currencies.most_common(1)[0]
+        dropped_for_currency = len(observations) - currencies[majority_currency]
+        observations = [obs for obs in observations if obs.currency == majority_currency]
+
     source = observations[0].source
     based_on_sold_data = all(obs.sold is True for obs in observations)
 
@@ -152,6 +168,8 @@ def estimate_resale_price(
         f"Estimated from {sample_size} {quality} via {source} "
         f"(dropped {len(prices) - sample_size} outlier(s))."
     )
+    if dropped_for_currency:
+        reason += f" Also dropped {dropped_for_currency} observation(s) in a different currency."
 
     return ResaleEstimate(
         estimated_price=median_price,

@@ -6,8 +6,11 @@ network, matching the "no network during pytest" requirement.
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import UTC, datetime
 from decimal import Decimal
+
+import pytest
 
 from app.notify import notify_events_if_allowed
 from database.models import WatchRule
@@ -299,3 +302,85 @@ def test_slow_market_source_does_not_block_the_event_loop() -> None:
 
     assert asyncio.run(other_coroutine_finished_first()) is True
     assert len(notifier.sent_embeds) == 1
+
+
+# --- Phase 26: Discord send retry/timeout/dispatch --------------------------
+
+
+class AlwaysFailingNotifier:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def send_embed(self, embed: object) -> None:
+        self.calls += 1
+        raise RuntimeError("simulated Discord outage")
+
+
+class HangingNotifier:
+    """Never returns — proves the timeout actually fires rather than
+    hanging forever."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def send_embed(self, embed: object) -> None:
+        self.calls += 1
+        await asyncio.sleep(3600)
+
+
+def test_failing_notifier_is_retried_once_then_logged_not_raised(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+
+    notifier = AlwaysFailingNotifier()
+
+    with caplog.at_level(logging.ERROR, logger="app.notify"):
+        decision = asyncio.run(
+            notify_events_if_allowed(_rule(), _observation(), _match(), (_event(),), notifier)
+        )
+
+    assert decision.allowed is True  # the decision itself is unaffected by delivery failure
+    assert notifier.calls == 2  # one retry, per _SEND_MAX_ATTEMPTS
+    assert any("notification FAILED after" in r.message for r in caplog.records)
+
+
+def test_hanging_notifier_times_out_instead_of_blocking_forever(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.notify as notify_module
+
+    monkeypatch.setattr(notify_module, "_SEND_TIMEOUT_SECONDS", 0.2)
+    notifier = HangingNotifier()
+
+    async def scenario() -> float:
+        start = time.monotonic()
+        await notify_events_if_allowed(_rule(), _observation(), _match(), (_event(),), notifier)
+        return time.monotonic() - start
+
+    elapsed = asyncio.run(scenario())
+
+    assert elapsed < 2.0  # both 0.2s-bounded attempts timed out, nothing actually hung
+    assert notifier.calls == 2
+
+
+def test_dispatch_callback_receives_send_coroutine_instead_of_being_awaited_inline() -> None:
+    """When `dispatch` is given, notify_events_if_allowed must return
+    without the embed having been sent yet — the caller decides when/how
+    to run it (app/worker.py fires it as a background task)."""
+    notifier = FakeNotifier()
+    captured: list[object] = []
+
+    def fake_dispatch(coro: object) -> None:
+        captured.append(coro)
+        coro.close()  # never actually run — just prove it was handed over, not awaited
+
+    decision = asyncio.run(
+        notify_events_if_allowed(
+            _rule(), _observation(), _match(), (_event(),), notifier, dispatch=fake_dispatch
+        )
+    )
+
+    assert decision.allowed is True
+    assert len(captured) == 1
+    assert notifier.sent_embeds == []  # nothing was actually sent inline

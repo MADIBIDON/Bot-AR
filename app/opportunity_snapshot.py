@@ -14,13 +14,12 @@ to exclude those cleanly.
 
 from __future__ import annotations
 
-from datetime import UTC
-from decimal import Decimal
 from typing import TYPE_CHECKING
 
 from app.resale import resolve_resale_price_for_opportunity
 from database import crud
-from engine.opportunity import OpportunityConfig, evaluate_opportunity
+from database.time_utils import ensure_utc
+from engine.opportunity import build_opportunity_inputs, evaluate_opportunity
 from engine.ranking import OpportunityCandidate
 from products.matcher import match_product
 from products.observation import ProductObservation
@@ -48,13 +47,7 @@ def build_opportunity_candidate(
     if not records:
         return None
     latest = records[-1]
-    observed_at = latest.observed_at
-    if observed_at.tzinfo is None:
-        # SQLite does not preserve tzinfo across a round trip; every
-        # observed_at this system writes is UTC by construction
-        # (products/observation.py), so re-attach it here — same fix as
-        # engine/worker.py::_last_observed_at.
-        observed_at = observed_at.replace(tzinfo=UTC)
+    observed_at = ensure_utc(latest.observed_at)
 
     observation = ProductObservation(
         merchant=watch_rule.listing.merchant.name,
@@ -79,14 +72,16 @@ def build_opportunity_candidate(
 
     net_profit = roi_pct = net_margin_pct = None
     if resale_price is not None:
-        config = OpportunityConfig(
-            estimated_resale_price=resale_price,
-            platform_fee_pct=watch_rule.platform_fee_pct or Decimal("0"),
-            fixed_fee=watch_rule.fixed_fee or Decimal("0"),
-            shipping_cost=watch_rule.shipping_cost or Decimal("0"),
-            other_costs=watch_rule.other_costs or Decimal("0"),
-        )
-        opportunity = evaluate_opportunity(observation.price, config)
+        # Phase 26: was building OpportunityConfig from watch_rule's own
+        # fee fields directly, ignoring a Product-level fallback entirely
+        # — a rule relying on its Product's shared fee/threshold config
+        # (Phase 25) would silently rank differently here (all fees = 0,
+        # no thresholds) than the real Discord alert for the exact same
+        # opportunity. build_opportunity_inputs() is the one place this
+        # assembly happens now, shared with app/notify.py and
+        # purchase/engine.py.
+        config, thresholds = build_opportunity_inputs(watch_rule, resale_price)
+        opportunity = evaluate_opportunity(observation.price, config, thresholds)
         if opportunity is not None:
             net_profit = opportunity.net_profit
             roi_pct = opportunity.roi_pct

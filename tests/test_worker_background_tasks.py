@@ -59,6 +59,30 @@ def test_background_tasks_set_is_empty_after_many_complete(
     assert len(_background_tasks) == 0
 
 
+def test_background_tasks_set_never_leaks_at_thousands_scale() -> None:
+    """Phase 26 audit, section 16: explicitly asks for a stress test with
+    thousands of small synthetic tasks, not just a handful — confirms the
+    done-callback cleanup (task discard from _background_tasks) keeps up
+    and the set doesn't grow unbounded under a bursty flood."""
+
+    async def scenario() -> int:
+        peak = 0
+        for _ in range(5000):
+            _fire_and_forget(_sleep(0))
+            peak = max(peak, len(_background_tasks))
+        while _background_tasks:
+            await asyncio.sleep(0)
+        return peak
+
+    peak_size = asyncio.run(scenario())
+
+    assert len(_background_tasks) == 0
+    # Sanity that this actually exercised concurrent pending tasks rather
+    # than draining after every single one (which would make the "no
+    # leak" assertion trivially true for the wrong reason).
+    assert peak_size > 1
+
+
 def test_drain_background_tasks_waits_for_fast_task_to_finish() -> None:
     async def scenario() -> bool:
         _fire_and_forget(_sleep(0.02))

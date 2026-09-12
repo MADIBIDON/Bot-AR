@@ -41,6 +41,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from database import crud
+from database.time_utils import ensure_utc
 from engine.backoff import BackoffTracker
 from engine.monitoring import run_check, store_check_result
 
@@ -107,14 +108,7 @@ def _last_observed_at(session: Session, watch_rule: WatchRule) -> datetime | Non
     records = crud.list_observation_records_for_listing(session, watch_rule.listing_id)
     if not records:
         return None
-    observed_at = records[-1].observed_at
-    if observed_at.tzinfo is None:
-        # SQLite does not preserve tzinfo across a round trip. Every
-        # observed_at this system ever writes is UTC by construction
-        # (ProductObservation guarantees it — products/observation.py), so
-        # a naive value read back is safely re-attached to UTC here.
-        observed_at = observed_at.replace(tzinfo=UTC)
-    return observed_at
+    return ensure_utc(records[-1].observed_at)
 
 
 def _warm_relationships(watch_rule: WatchRule) -> None:
@@ -127,6 +121,20 @@ def _warm_relationships(watch_rule: WatchRule) -> None:
     listing = watch_rule.listing
     if listing is not None:
         _ = listing.merchant
+
+
+def _backoff_key(watch_rule: WatchRule) -> str:
+    """Backoff is scoped to the merchant being hit, not the individual
+    rule (Phase 26 audit, section 11) — three rules all watching the same
+    struggling merchant must all back off together once one of them gets
+    a 429/timeout/5xx, while a rule on a different merchant is
+    unaffected. Falls back to a per-rule key only if a rule somehow has
+    no linked listing/merchant yet (not the normal case for an enabled,
+    monitored rule)."""
+    listing = watch_rule.listing
+    if listing is not None and listing.merchant is not None:
+        return f"merchant:{listing.merchant.name}"
+    return f"rule:{watch_rule.id}"
 
 
 def _run_check_safe(rule: WatchRule, registry: ConnectorRegistry) -> MonitoringResult:
@@ -190,14 +198,18 @@ async def run_monitoring_tick(
         last_observed_at = _last_observed_at(session, rule)
         if not is_due(rule, last_observed_at, now):
             continue
-        if backoff.is_blocked(rule.id, now):
+        # Warmed here (still sequential, still safe) so _backoff_key can
+        # read watch_rule.listing.merchant below without a lazy load.
+        _warm_relationships(rule)
+        key = _backoff_key(rule)
+        if backoff.is_blocked(key, now):
             logger.info(
-                "rule=%s skipped (backing off %.0fs after recent failures)",
+                "rule=%s skipped (merchant %s backing off %.0fs after recent failures)",
                 rule.id,
-                backoff.current_delay_seconds(rule.id),
+                key,
+                backoff.current_delay_seconds(key),
             )
             continue
-        _warm_relationships(rule)
         due_rules.append(rule)
 
     if not due_rules:
@@ -213,13 +225,23 @@ async def run_monitoring_tick(
     raw_results = await asyncio.gather(*(_bounded_check(rule) for rule in due_rules))
 
     results: list[tuple[WatchRule, MonitoringResult]] = []
+    # Backoff outcomes are reconciled once per merchant *after* this loop,
+    # not inline per rule: several rules on the same merchant can land in
+    # the same tick (e.g. Kairyu A/B/C), and calling record_success() for
+    # a same-tick sibling that happened to succeed would immediately wipe
+    # out a sibling's record_failure() on the very same merchant key,
+    # defeating the isolation section 11 asks for. A failure anywhere on
+    # a merchant this tick wins over a success elsewhere on it this tick.
+    failed_keys: dict[str, str] = {}
+    succeeded_keys: set[str] = set()
     for rule, raw_result in zip(due_rules, raw_results, strict=True):
         try:
             result = store_check_result(session, rule, raw_result)
             results.append((rule, result))
+            key = _backoff_key(rule)
 
             if result.success:
-                backoff.record_success(rule.id)
+                succeeded_keys.add(key)
                 obs = result.observation
                 logger.info(
                     "rule=%s price=%.2f stock=%s",
@@ -228,8 +250,13 @@ async def run_monitoring_tick(
                     str(obs.available).lower(),
                 )
             else:
-                backoff.record_failure(rule.id, result.error or "", now)
+                failed_keys.setdefault(key, result.error or "")
                 logger.warning("rule=%s check failed: %s", rule.id, result.error)
         except Exception:
             logger.exception("unexpected error storing watch_rule=%s result", rule.id)
+
+    for key, error in failed_keys.items():
+        backoff.record_failure(key, error, now)
+    for key in succeeded_keys - failed_keys.keys():
+        backoff.record_success(key)
     return results

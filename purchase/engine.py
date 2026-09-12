@@ -62,6 +62,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING
 
 from database import crud
+from database.time_utils import ensure_utc
 from engine.decision import (
     MIN_FINANCIAL_MATCH_CONFIDENCE,
     effective_max_price,
@@ -242,10 +243,7 @@ def _seconds_since_last_attempt(session: Session, listing_id: int, now: datetime
     last = crud.get_most_recent_purchase_attempt_for_listing(session, listing_id)
     if last is None:
         return None
-    created_at = last.created_at
-    if created_at.tzinfo is None:
-        created_at = created_at.replace(tzinfo=UTC)
-    return (now - created_at).total_seconds()
+    return (now - ensure_utc(last.created_at)).total_seconds()
 
 
 def _spent_today(session: Session, now: datetime) -> Decimal:

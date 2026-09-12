@@ -7,12 +7,14 @@ from market_data.estimator import Confidence, EstimatorConfig, estimate_resale_p
 from market_data.models import MarketObservation
 
 
-def _obs(price: str, *, sold: bool | None = None, source: str = "ebay") -> MarketObservation:
+def _obs(
+    price: str, *, sold: bool | None = None, source: str = "ebay", currency: str = "EUR"
+) -> MarketObservation:
     return MarketObservation(
         source=source,
         product_name="Pokemon ETB Ecarlate Violet FR",
         price=Decimal(price),
-        currency="EUR",
+        currency=currency,
         listing_url="https://ebay.example/item/1",
         external_id="1",
         observed_at=datetime.now(UTC),
@@ -106,3 +108,42 @@ def test_custom_estimator_config_thresholds() -> None:
     result = estimate_resale_price([_obs("100")], config)
 
     assert result.confidence == Confidence.MEDIUM
+
+
+# --- Phase 26 audit, section 6: "devise différente" must never be pooled
+# silently with the majority currency into one number. ---------------------
+
+
+def test_minority_currency_observations_are_dropped_not_pooled() -> None:
+    """A few USD listings mixed into a mostly-EUR sample (e.g. a
+    misconfigured EBAY_MARKETPLACE_ID or a future second market source)
+    must never get averaged/medianed together with the EUR ones."""
+    observations = [_obs("100", currency="EUR"), _obs("110", currency="EUR")] + [
+        _obs("9999", currency="USD")
+    ]
+
+    result = estimate_resale_price(observations)
+
+    assert result.sample_size == 2  # only the EUR pair
+    assert result.median_price == Decimal("105")
+    assert "different currency" in result.reason
+
+
+def test_single_currency_sample_is_unaffected() -> None:
+    observations = [_obs(str(p)) for p in (100, 110, 120)]
+
+    result = estimate_resale_price(observations)
+
+    assert result.sample_size == 3
+    assert "different currency" not in result.reason
+
+
+def test_all_observations_same_minority_split_currency_keeps_the_majority() -> None:
+    observations = [_obs("50", currency="USD"), _obs("60", currency="USD")] + [
+        _obs("9999", currency="EUR")
+    ]
+
+    result = estimate_resale_price(observations)
+
+    assert result.sample_size == 2
+    assert result.median_price == Decimal("55")

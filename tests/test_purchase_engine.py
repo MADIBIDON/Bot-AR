@@ -347,6 +347,41 @@ def test_profitability_mode_without_max_price_still_proceeds() -> None:
     assert decision.proceed is True
 
 
+def test_kill_switch_beats_strong_buy_in_stock_high_profit_opportunity() -> None:
+    """Phase 26 audit, section 22 ("test obligatoire"): the single most
+    favorable case for a purchase to go through — STRONG_BUY, confirmed
+    in stock, highly profitable, high-confidence resale — must still be
+    refused when PURCHASES_ENABLED=false. Same fixture as
+    test_profitability_mode_without_max_price_still_proceeds, only
+    policy.enabled flips."""
+    from engine.opportunity import OpportunityStatus
+    from market_data.estimator import Confidence
+
+    watch_rule = _watch_rule(max_price=None, minimum_net_profit=Decimal("20"))
+    intent = _intent(watch_rule, price="60")
+    opportunity = _opportunity(watch_rule, resale_price="120", purchase_price="60")
+    assert opportunity is not None
+    assert opportunity.status == OpportunityStatus.STRONG_BUY_CANDIDATE  # confirms the setup
+
+    decision = evaluate_purchase_intent(
+        watch_rule=watch_rule,
+        intent=intent,
+        policy=_policy(enabled=False),  # the kill switch
+        merchant_domains=("kairyu.fr", "www.kairyu.fr"),
+        match_confidence=100,
+        available=True,
+        total_cost=Decimal("60"),
+        has_active_attempt=False,
+        seconds_since_last_attempt=None,
+        spent_today=Decimal("0"),
+        opportunity=opportunity,
+        resale_confidence=Confidence.HIGH,
+    )
+
+    assert decision.proceed is False
+    assert "PURCHASES_ENABLED" in decision.reason
+
+
 def test_profitability_mode_low_profit_rejects() -> None:
     from market_data.estimator import Confidence
 

@@ -164,3 +164,28 @@ def test_out_of_stock_observation_is_reflected(session: Session) -> None:
 
     assert candidate is not None
     assert candidate.in_stock is False
+
+
+def test_product_level_fee_config_is_honored_not_just_rule_level(session: Session) -> None:
+    """Phase 26: this used to build OpportunityConfig from the WatchRule's
+    own fee fields only, silently using 0 fees for a rule whose config
+    lives on its Product (Phase 25's shared-config pattern) — producing a
+    different net_profit here than the real Discord alert would compute
+    for the exact same opportunity. Must match now."""
+    rule_id = _seed_rule_with_observation(session, price="60")
+    rule = crud.get_watch_rule(session, rule_id)
+    crud.update_product(
+        session,
+        rule.product_id,
+        estimated_resale_price=Decimal("120"),
+        platform_fee_pct=Decimal("10"),
+        shipping_cost=Decimal("5"),
+    )
+    session.refresh(rule)
+
+    candidate = build_opportunity_candidate(session, rule, None, None)
+
+    assert candidate is not None
+    assert candidate.estimated_resale_price == Decimal("120")
+    # net = 120 - 60 - (12 platform fee) - 5 shipping = 43
+    assert candidate.net_profit == Decimal("43.00")

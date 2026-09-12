@@ -572,3 +572,61 @@ def test_profitability_mode_cancels_when_revalidated_total_is_not_profitable(
     assert outcome.status == PurchaseStatus.CANCELLED
     assert connector.checkout_calls == 0
     assert "profitability" in outcome.reason.lower()
+
+
+# --- Phase 26 audit, section 22: the kill switch is "obligatoire" tested
+# against the single most favorable case there is — a STRONG_BUY, in
+# stock, highly profitable opportunity — to prove PURCHASES_ENABLED=false
+# beats even that. ---------------------------------------------------------
+
+
+def test_kill_switch_blocks_strong_buy_in_stock_high_profit_opportunity(
+    session: Session,
+) -> None:
+    """Same exact STRONG_BUY fixture as
+    test_profitability_mode_proceeds_when_revalidated_total_is_profitable
+    (item 55.99 + shipping 4.00, resale 120, HIGH confidence — a real
+    STRONG_BUY recommendation) — the only difference is
+    PURCHASES_ENABLED=false. Must still refuse, and the connector must
+    never be touched at all: not revalidate(), not checkout()."""
+    from market_data.estimator import Confidence
+
+    rule_id, _ = _seed_rule(session, max_price="1000")
+    crud.update_watch_rule(session, rule_id, max_price=None, minimum_net_profit=Decimal("20"))
+    rule = crud.get_watch_rule(session, rule_id)
+    connector = FakeConnector(
+        revalidate_result=RevalidationResult(
+            available=True,
+            price=Decimal("55.99"),
+            shipping_cost=Decimal("4.00"),
+            quantity_available=None,
+        )
+    )
+    notifier = FakeNotifier()
+    opportunity = _profitability_opportunity(rule, resale_price="120", item_price="55.99")
+    assert opportunity is not None
+    from engine.opportunity import OpportunityStatus
+
+    assert opportunity.status == OpportunityStatus.STRONG_BUY_CANDIDATE  # confirms the setup
+
+    outcome = asyncio.run(
+        attempt_purchase(
+            session,
+            rule,
+            _observation(price="55.99", available=True),
+            _match(confidence=100),
+            _policy(enabled=False),  # the kill switch
+            _registry(connector),
+            ("kairyu.fr",),
+            notifier,
+            opportunity=opportunity,
+            resale_confidence=Confidence.HIGH,
+        )
+    )
+
+    assert outcome.status == PurchaseStatus.CANCELLED
+    assert "PURCHASES_ENABLED" in outcome.reason
+    assert connector.revalidate_calls == 0
+    assert connector.checkout_calls == 0
+    assert crud.list_purchase_attempts(session) == []
+    assert notifier.sent_embeds == []

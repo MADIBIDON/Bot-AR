@@ -15,6 +15,7 @@ import app.healthcheck as healthcheck
 from connectors.defaults import MERCHANTS
 from database import crud
 from market_data.ebay import MissingEbayConfigError
+from market_data.ebay_status import EbayOAuthStatus
 from notifications.discord.config import DiscordConfig, MissingDiscordConfigError
 
 _FAKE_TOKEN = "fake-token-should-never-appear-in-any-output"
@@ -178,16 +179,78 @@ def test_ebay_waiting_for_credentials_is_never_blocking(monkeypatch: pytest.Monk
 
     result = healthcheck._check_ebay()
 
-    assert result.detail == "WAITING FOR CREDENTIALS"
+    assert result.detail == "NOT_CONFIGURED"
     assert result.blocking_failure is False
 
 
-def test_ebay_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_ebay_configured_but_never_verified_is_honest_not_ok(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 26 regression: configured env vars alone must never read as
+    "OK" or plain "CONFIGURED" — only a real recorded OAuth success may."""
     monkeypatch.setattr(healthcheck, "build_default_market_registry", lambda: object())
+    monkeypatch.setattr(healthcheck.ebay_status, "get_status", lambda: EbayOAuthStatus())
 
     result = healthcheck._check_ebay()
 
-    assert result.detail == "CONFIGURED"
+    assert result.detail == "CONFIGURED_UNVERIFIED (last OAuth success: never)"
+    assert result.blocking_failure is False
+
+
+def test_ebay_reports_ok_after_a_real_recorded_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(healthcheck, "build_default_market_registry", lambda: object())
+    monkeypatch.setattr(
+        healthcheck.ebay_status,
+        "get_status",
+        lambda: EbayOAuthStatus(last_success_at="2026-01-01T00:00:00+00:00"),
+    )
+
+    result = healthcheck._check_ebay()
+
+    assert result.detail == "OK (last OAuth success: 2026-01-01T00:00:00+00:00)"
+
+
+def test_ebay_reports_failed_when_never_succeeded_but_attempt_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reproduces the reported real-world bug: env vars present, but the
+    only real OAuth attempt ever made came back 401 invalid_client."""
+    monkeypatch.setattr(healthcheck, "build_default_market_registry", lambda: object())
+    monkeypatch.setattr(
+        healthcheck.ebay_status,
+        "get_status",
+        lambda: EbayOAuthStatus(
+            last_failure_at="2026-01-01T00:00:00+00:00",
+            last_failure_reason="HTTP 401 obtaining eBay OAuth token",
+        ),
+    )
+
+    result = healthcheck._check_ebay()
+
+    assert result.detail == (
+        "FAILED (HTTP 401 obtaining eBay OAuth token) (last OAuth success: never)"
+    )
+    assert result.blocking_failure is False  # eBay stays optional enrichment
+
+
+def test_ebay_reports_degraded_when_a_past_success_now_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(healthcheck, "build_default_market_registry", lambda: object())
+    monkeypatch.setattr(
+        healthcheck.ebay_status,
+        "get_status",
+        lambda: EbayOAuthStatus(
+            last_success_at="2026-01-01T00:00:00+00:00",
+            last_failure_at="2026-01-02T00:00:00+00:00",
+            last_failure_reason="HTTP 401 obtaining eBay OAuth token",
+        ),
+    )
+
+    result = healthcheck._check_ebay()
+
+    assert "DEGRADED" in result.detail
+    assert "2026-01-01T00:00:00+00:00" in result.detail
 
 
 # --- last observation / recent errors ---------------------------------
@@ -244,7 +307,7 @@ def test_overall_ready_despite_ebay_missing(
 
     output = capsys.readouterr().out
     assert ready is True
-    assert "WAITING FOR CREDENTIALS" in output
+    assert "NOT_CONFIGURED" in output
     assert "OVERALL STATUS" in output
     assert "READY" in output
 

@@ -29,6 +29,7 @@ from app import pidfile
 from connectors.defaults import MERCHANTS
 from database import crud
 from database.session import create_all, get_engine, get_session_factory
+from market_data import ebay_status
 from market_data.defaults import build_default_market_registry
 from market_data.ebay import MissingEbayConfigError
 from notifications.discord.client import DiscordNotifier
@@ -96,11 +97,35 @@ def _check_worker() -> CheckResult:
 
 
 def _check_ebay() -> CheckResult:
+    """Phase 26 audit: this used to report "CONFIGURED" purely from
+    EBAY_APP_ID/EBAY_CERT_ID being present, even with a live 401
+    invalid_client — i.e. it never reflected whether OAuth had ever
+    actually worked. Deliberately does NOT make a network call itself
+    (that would add load/rate-limit risk on every healthcheck run);
+    instead it reads the outcome of the last real OAuth attempt made
+    during normal operation (see market_data/ebay_status.py)."""
     try:
         build_default_market_registry()
     except MissingEbayConfigError:
-        return CheckResult("eBay market data", "WAITING FOR CREDENTIALS")
-    return CheckResult("eBay market data", "CONFIGURED")
+        return CheckResult("eBay market data", "NOT_CONFIGURED")
+
+    status = ebay_status.get_status()
+    if status.last_success_at is None and status.last_failure_at is None:
+        return CheckResult("eBay market data", "CONFIGURED_UNVERIFIED (last OAuth success: never)")
+    if status.last_failure_at is None:
+        return CheckResult("eBay market data", f"OK (last OAuth success: {status.last_success_at})")
+    if status.last_success_at is None:
+        return CheckResult(
+            "eBay market data",
+            f"FAILED ({status.last_failure_reason}) (last OAuth success: never)",
+        )
+    if status.last_failure_at > status.last_success_at:
+        return CheckResult(
+            "eBay market data",
+            f"DEGRADED ({status.last_failure_reason})"
+            f" (last OAuth success: {status.last_success_at})",
+        )
+    return CheckResult("eBay market data", f"OK (last OAuth success: {status.last_success_at})")
 
 
 def _check_last_observation(session: Session) -> CheckResult:

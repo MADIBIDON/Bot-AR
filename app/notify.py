@@ -11,11 +11,24 @@ Opportunity scoring (Phase 15) only ever enriches an embed that was
 already going to be sent — it never triggers a notification on its own.
 The existing notification policy (allowed decision + at least one event)
 is unchanged.
+
+Phase 26 audit: Discord dispatch (notifier.send_embed) is the one real
+network I/O left directly in the fast path's own await chain. Bounded by
+a timeout + one retry (_send_embed_with_retry) so a hung/slow/rate-
+limited Discord call can never stall forever, and — when the caller
+passes `dispatch` (app/worker.py always does) — fired through it instead
+of awaited inline, so a slow send for one WatchRule's alert can never
+delay the next tick's monitoring of every other WatchRule. `dispatch`
+defaults to None (a plain inline `await`) so every existing caller/test
+keeps its exact original synchronous behavior; the timeout+retry wrapper
+still applies either way, since it was always a strict improvement.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
+from collections.abc import Callable, Coroutine
 from decimal import Decimal
 from typing import TYPE_CHECKING, Protocol
 
@@ -52,6 +65,46 @@ class EmbedSender(Protocol):
     and trivially by a fake in tests, with no discord.py client required."""
 
     async def send_embed(self, embed: discord.Embed) -> None: ...
+
+
+logger = logging.getLogger(__name__)
+
+_SEND_TIMEOUT_SECONDS = 10.0
+_SEND_MAX_ATTEMPTS = 2
+
+
+async def _send_embed_with_retry(
+    notifier: EmbedSender, embed: discord.Embed, *, watch_rule_id: int, event_type: str
+) -> None:
+    """At most _SEND_MAX_ATTEMPTS tries, each bounded by
+    _SEND_TIMEOUT_SECONDS — a hung, slow, or rate-limited Discord call
+    must never block its caller indefinitely. Every attempt failure is
+    logged; the final one at ERROR (a lost alert is a real, visible
+    event — the underlying restock/event stays in the database either
+    way, but nobody was told about it, which is worth knowing)."""
+    last_exc: BaseException | None = None
+    for attempt in range(1, _SEND_MAX_ATTEMPTS + 1):
+        try:
+            await asyncio.wait_for(notifier.send_embed(embed), timeout=_SEND_TIMEOUT_SECONDS)
+            return
+        except Exception as exc:  # noqa: BLE001 - a notifier bug must never crash the caller
+            last_exc = exc
+            logger.warning(
+                "watch_rule=%s event=%s notification attempt %d/%d failed: %s",
+                watch_rule_id,
+                event_type,
+                attempt,
+                _SEND_MAX_ATTEMPTS,
+                exc,
+            )
+    logger.error(
+        "watch_rule=%s event=%s notification FAILED after %d attempt(s) — "
+        "alert was not delivered: %s",
+        watch_rule_id,
+        event_type,
+        _SEND_MAX_ATTEMPTS,
+        last_exc,
+    )
 
 
 def _compute_opportunity_sync(
@@ -108,6 +161,8 @@ async def notify_events_if_allowed(
     notifier: EmbedSender,
     market_registry: MarketDataRegistry | None = None,
     cache: TTLCache | None = None,
+    *,
+    dispatch: Callable[[Coroutine[object, object, None]], None] | None = None,
 ) -> DecisionResult:
     """Evaluate current state once; notify one embed per event only if allowed.
 
@@ -124,6 +179,15 @@ async def notify_events_if_allowed(
     is enriched with the net-profit/ROI breakdown, a resale-confidence
     label, and a STRONG_BUY/BUY/ALERT_ONLY/REJECT recommendation —
     display only, never a reason to withhold the alert.
+
+    Phase 26: `dispatch`, when given, receives each event's send coroutine
+    instead of this function awaiting it inline — app/worker.py passes its
+    `_fire_and_forget` so a slow Discord call for one event can never
+    delay this function's return (and, by extension, the next WatchRule's
+    monitoring in the same tick). Left as None (the default), every event
+    is awaited in order exactly as before — every existing caller/test
+    keeps its exact original behavior. Either way, the actual send always
+    goes through _send_embed_with_retry (timeout + one retry).
     """
     decision = evaluate(watch_rule, observation, match_result)
     if decision.allowed:
@@ -149,5 +213,11 @@ async def notify_events_if_allowed(
                 recommendation=recommendation,
                 recommendation_reason=recommendation_reason,
             )
-            await notifier.send_embed(embed)
+            send_coro = _send_embed_with_retry(
+                notifier, embed, watch_rule_id=watch_rule.id, event_type=event.event_type.value
+            )
+            if dispatch is not None:
+                dispatch(send_coro)
+            else:
+                await send_coro
     return decision

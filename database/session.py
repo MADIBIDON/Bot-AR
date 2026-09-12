@@ -29,7 +29,34 @@ def get_engine(database_url: str | None = None) -> Engine:
     url = database_url or get_database_url()
     _ensure_sqlite_parent_dir(url)
     engine = create_engine(url)
-    if url.startswith("sqlite"):
+    if url.startswith("sqlite") and ":memory:" not in url:
+        # Phase 26 audit: the worker holds one long-lived connection while
+        # the CLI (add-product/discover/edit-product/status/...) opens its
+        # own, separate one against the same file — a real, observed
+        # pattern this session (running `discover` while the worker was
+        # mid-tick). SQLite's default journal mode locks the whole file
+        # for the duration of a writer's transaction, and the default
+        # busy_timeout is 0 — any other connection hitting that window
+        # fails immediately with "database is locked" instead of waiting
+        # a moment for the writer to finish. WAL lets readers proceed
+        # without blocking on a writer at all (and vice versa) — the
+        # right fit for "one writer process, occasional CLI reads/writes"
+        # — with busy_timeout as the backstop for the genuinely-concurrent
+        # writer-vs-writer case WAL doesn't eliminate. Skipped for
+        # ":memory:" URLs (pytest's fixtures): an in-memory database has
+        # no journal file, and WAL there is either a no-op or an error
+        # depending on SQLAlchemy/pysqlite version.
+        @event.listens_for(engine, "connect")
+        def _configure_sqlite_connection(
+            dbapi_connection: object, _connection_record: object
+        ) -> None:
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA busy_timeout=5000")
+            cursor.close()
+
+    elif url.startswith("sqlite"):
 
         @event.listens_for(engine, "connect")
         def _enable_sqlite_foreign_keys(

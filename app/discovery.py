@@ -46,7 +46,10 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from sqlalchemy.exc import IntegrityError
+
 from database import crud
+from database.time_utils import ensure_utc
 from discovery.base import DiscoveryError, DiscoveryUnavailableError
 from discovery.matcher import classify_candidate
 
@@ -54,7 +57,7 @@ if TYPE_CHECKING:
     from sqlalchemy.orm import Session
 
     from connectors.base import ConnectorProduct
-    from database.models import Product
+    from database.models import Listing, Merchant, Product
     from discovery.base import RetailDiscoverySource
     from discovery.registry import DiscoveryRegistry
 
@@ -184,6 +187,50 @@ async def run_discovery_for_product(
     return DiscoveryRunResult(product_id=product.id, merchants=outcomes)
 
 
+def _get_or_create_merchant(session: Session, merchant_name: str) -> Merchant:
+    """Merchant.name is UNIQUE — a genuine TOCTOU race (this worker's own
+    background discovery and a manually-run `discover` CLI process both
+    seeing "no merchant yet" for the same name at once) raises
+    IntegrityError on the second create, not a silent duplicate. Caught
+    here and turned into a plain re-query: the other side's row is simply
+    reused, exactly as if this call had seen it in the first place."""
+    merchant = crud.get_merchant_by_name(session, merchant_name)
+    if merchant is not None:
+        return merchant
+    try:
+        return crud.create_merchant(session, merchant_name)
+    except IntegrityError:
+        session.rollback()
+        merchant = crud.get_merchant_by_name(session, merchant_name)
+        if merchant is None:
+            raise  # something other than the expected race — surface it
+        return merchant
+
+
+def _get_or_create_listing(
+    session: Session, *, product_id: int, merchant_id: int, url: str, external_id: str
+) -> Listing:
+    """Same race, same fix, for Listing's (merchant_id, external_id)
+    unique index — see _get_or_create_merchant()."""
+    listing = crud.get_listing_by_merchant_and_external_id(session, merchant_id, external_id)
+    if listing is not None:
+        return listing
+    try:
+        return crud.create_listing(
+            session,
+            product_id=product_id,
+            merchant_id=merchant_id,
+            url=url,
+            external_id=external_id,
+        )
+    except IntegrityError:
+        session.rollback()
+        listing = crud.get_listing_by_merchant_and_external_id(session, merchant_id, external_id)
+        if listing is None:
+            raise
+        return listing
+
+
 def _link_or_report(
     session: Session,
     product: Product,
@@ -196,20 +243,14 @@ def _link_or_report(
     already_monitored = False
 
     if match.verdict == "auto_link":
-        merchant = crud.get_merchant_by_name(session, merchant_name)
-        if merchant is None:
-            merchant = crud.create_merchant(session, merchant_name)
-        listing = crud.get_listing_by_merchant_and_external_id(
-            session, merchant.id, candidate.external_id
+        merchant = _get_or_create_merchant(session, merchant_name)
+        listing = _get_or_create_listing(
+            session,
+            product_id=product.id,
+            merchant_id=merchant.id,
+            url=candidate.url,
+            external_id=candidate.external_id,
         )
-        if listing is None:
-            listing = crud.create_listing(
-                session,
-                product_id=product.id,
-                merchant_id=merchant.id,
-                url=candidate.url,
-                external_id=candidate.external_id,
-            )
         listing_id = listing.id
 
         existing_rule = crud.get_watch_rule_by_listing_id(session, listing.id)
@@ -249,7 +290,5 @@ def _link_or_report(
 def is_discovery_due(product: Product, now: datetime) -> bool:
     if product.last_discovery_at is None:
         return True
-    last = product.last_discovery_at
-    if last.tzinfo is None:
-        last = last.replace(tzinfo=UTC)
+    last = ensure_utc(product.last_discovery_at)
     return (now - last).total_seconds() >= product.discovery_interval
