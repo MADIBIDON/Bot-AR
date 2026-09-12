@@ -999,7 +999,25 @@ def cmd_product(args: argparse.Namespace) -> int:
 
     print()
     print("LOCAL AVAILABILITY:")
-    print("  not implemented this session (see final report — a real, documented blocker)")
+    listing_ids = [r.listing.id for r in rules]
+    local_rows = []
+    if listing_ids:
+        from database.models import LocalStockState, RetailStore
+
+        local_rows = (
+            session.query(LocalStockState, RetailStore)
+            .join(RetailStore, LocalStockState.store_id == RetailStore.id)
+            .filter(LocalStockState.listing_id.in_(listing_ids))
+            .order_by(RetailStore.retailer, RetailStore.city)
+            .all()
+        )
+    if not local_rows:
+        print("  none checked yet (only JouéClub/La Grande Récré support this — Phase 29)")
+    for state, store in local_rows:
+        print(
+            f"  {store.retailer:<16} {store.name:<28} {store.city or '?':<10} "
+            f"{state.stock_state:<18} last check: {state.updated_at.isoformat()}"
+        )
     return 0
 
 
@@ -1122,22 +1140,48 @@ def _worker_status() -> str:
 
 
 def _print_retailer_capabilities() -> None:
-    """Phase 28: capability facts are defined in code (connectors/
+    """Phase 28/29: capability facts are defined in code (connectors/
     defaults.py) — see that module's docstring for why a DB mirror would
-    add sync-drift risk with no behavioral benefit."""
+    add sync-drift risk with no behavioral benefit. ONLINE and LOCAL are
+    reported independently — a retailer whose product page is blocked
+    but whose store API isn't (or vice versa) is a real, possible state
+    this project has explicitly kept room for, even though no retailer
+    confirmed this session actually lands there (every UNSUPPORTED
+    retailer below was found blocked on both, not guessed)."""
     print("Retailers")
     for merchant in MERCHANTS:
         caps = merchant.capabilities
-        parts = ["ONLINE OK"]
-        if CATALOG_SEARCH in caps:
-            parts.append("SEARCH OK")
-        if LOCAL_STOCK in caps or CLICK_AND_COLLECT in caps:
-            parts.append("LOCAL OK")
-        else:
-            parts.append("LOCAL not implemented")
-        print(f"  {merchant.name:<18}{' | '.join(parts)}")
+        online = "ONLINE OK" + (" | SEARCH OK" if CATALOG_SEARCH in caps else "")
+        local = (
+            "LOCAL OK"
+            if (LOCAL_STOCK in caps or CLICK_AND_COLLECT in caps)
+            else "LOCAL not implemented"
+        )
+        print(f"  {merchant.name:<18}{online} | {local}")
     for name, reason in UNSUPPORTED_RETAILERS:
-        print(f"  {name:<18}UNSUPPORTED ({reason})")
+        print(f"  {name:<18}ONLINE UNSUPPORTED | LOCAL UNSUPPORTED  ({reason})")
+
+
+def cmd_stores(args: argparse.Namespace) -> int:
+    session = _get_session()
+    stores = crud.list_retail_stores(
+        session, retailer=getattr(args, "retailer", None), city=getattr(args, "city", None)
+    )
+    if not stores:
+        print("0 STORE")
+        return 0
+    for store in stores:
+        coords = (
+            f"{store.latitude},{store.longitude}"
+            if store.latitude is not None and store.longitude is not None
+            else "no coordinates"
+        )
+        print(
+            f"[{store.id}] {store.retailer:<16} {store.name:<30} "
+            f"{store.city or '?':<12} {store.postal_code or '?':<8} {coords}"
+        )
+    print(f"\n{len(stores)} store(s)")
+    return 0
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -1182,8 +1226,13 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     print()
     print("Stores monitored:")
-    for city in ("Paris", "Brest", "Quimper", "Lorient"):
-        print(f"  {city}: 0 (local store monitoring not implemented this session)")
+    for city in ("PARIS", "BREST", "QUIMPER", "LORIENT"):
+        city_stores = crud.list_retail_stores(session, city=city)
+        retailers = sorted({s.retailer for s in city_stores})
+        print(
+            f"  {city.title()}: {len(city_stores)} store(s)"
+            + (f" ({', '.join(retailers)})" if retailers else "")
+        )
 
     print()
     print(f"Test Watches: {len(active)} enabled")
@@ -1273,6 +1322,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     status_parser = subparsers.add_parser("status", help="Show overall system status.")
     status_parser.set_defaults(func=cmd_status)
+
+    stores_parser = subparsers.add_parser("stores", help="List discovered retail stores.")
+    stores_parser.add_argument("--retailer", help="Filter by retailer name")
+    stores_parser.add_argument("--city", help="Filter by city (exact match, e.g. PARIS)")
+    stores_parser.set_defaults(func=cmd_stores)
 
     add_product_parser = subparsers.add_parser(
         "add-product",

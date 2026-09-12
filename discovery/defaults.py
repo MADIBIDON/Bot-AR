@@ -12,6 +12,18 @@ them without touching the other merchants.
 
 Fuji Store: WooCommerce's public Store API search (`?search=`), no
 configuration needed.
+
+Phase 29: JouéClub and La Grande Récré have no public catalog-search API
+(confirmed this session), but both publish a single, reasonably-sized
+product sitemap (~18k-40k URLs) — see discovery/sitemap.py. Cultura and
+E.Leclerc were investigated the same way and REJECTED for this: their
+product sitemaps are 75-87 files of 50,000 URLs each (3.75-4.35 million
+SKUs total, a general-merchandise catalog, not toy-specialist) — a full
+crawl of that size on a periodic discovery cycle would be exactly the
+"grosse charge" this project avoids, and there is no evident way to
+scope it to a smaller, relevant slice without more research than this
+session had time for. A real, documented gap, not a guessed-and-skipped
+one — see connectors/defaults.py's module docstring.
 """
 
 from __future__ import annotations
@@ -20,6 +32,7 @@ from config.settings import get_ucp_agent_profile_url
 from connectors.defaults import MERCHANTS
 from discovery.registry import DiscoveryRegistry
 from discovery.shopify_ucp import ShopifyUCPDiscoverySource
+from discovery.sitemap import SitemapDiscoverySource
 from discovery.woocommerce import WooCommerceDiscoverySource
 
 _UCP_SHOP_DOMAINS = {
@@ -28,6 +41,12 @@ _UCP_SHOP_DOMAINS = {
 }
 _WOOCOMMERCE_SHOP_DOMAINS = {
     "Fuji Store": "fuji-store.fr",
+}
+_SITEMAP_DISCOVERY_URLS = {
+    "JouéClub": "https://www.joueclub.fr/Assets/Rbs/Seo/100185/fr_FR/Rbs_Catalog_Product.1.xml",
+    "La Grande Récré": (
+        "https://www.lagranderecre.fr/Assets/Rbs/Seo/100052/fr_FR/Rbs_Catalog_Product.1.xml"
+    ),
 }
 
 
@@ -53,8 +72,17 @@ def build_default_discovery_registry() -> DiscoveryRegistry:
                     merchant_name=merchant.name,
                 ),
             )
-        # Merchants with neither a configured UCP profile nor a
-        # WooCommerce Store API are simply not registered — the
-        # orchestrator (app/discovery.py) reports DISCOVERY_UNAVAILABLE
-        # for any unregistered merchant and continues with the others.
+        elif merchant.name in _SITEMAP_DISCOVERY_URLS:
+            registry.register(
+                merchant.name,
+                SitemapDiscoverySource(
+                    sitemap_index_url=_SITEMAP_DISCOVERY_URLS[merchant.name],
+                    connector=merchant.build_connector(),
+                    merchant_name=merchant.name,
+                ),
+            )
+        # Merchants with none of the above are simply not registered —
+        # the orchestrator (app/discovery.py) reports
+        # DISCOVERY_UNAVAILABLE for any unregistered merchant and
+        # continues with the others.
     return registry

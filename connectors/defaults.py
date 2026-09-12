@@ -48,6 +48,15 @@ _ONLINE_ONLY_CAPABILITIES = frozenset({ONLINE_STOCK, PRICE})
 # API search) — unlike the four Phase 28 retailers below, which are
 # product-page monitoring only (no confirmed public search endpoint).
 _ONLINE_WITH_SEARCH_CAPABILITIES = frozenset({CATALOG_SEARCH, ONLINE_STOCK, PRICE})
+# Phase 29: JouéClub and La Grande Récré run the same Proximis/Rbs
+# platform — confirmed (real JS inspection, not guessed) to expose a
+# sitemap-based catalog search (discovery/sitemap.py) AND a genuinely
+# public store-locator + per-SKU store-stock API (discovery/store_locator.py
+# / market stock check) — see connectors/defaults.py and
+# local_stock/store_locator modules for exactly what was verified.
+_FULL_RBS_PLATFORM_CAPABILITIES = frozenset(
+    {CATALOG_SEARCH, ONLINE_STOCK, PRICE, LOCAL_STORE_SEARCH, LOCAL_STOCK, CLICK_AND_COLLECT}
+)
 
 
 @dataclass(frozen=True)
@@ -105,7 +114,7 @@ MERCHANTS: tuple[MerchantDefinition, ...] = (
             shop_domain="www.joueclub.fr", merchant_name="JouéClub"
         ),
         full_path_external_id=True,
-        capabilities=_ONLINE_ONLY_CAPABILITIES,
+        capabilities=_FULL_RBS_PLATFORM_CAPABILITIES,
     ),
     MerchantDefinition(
         name="E.Leclerc",
@@ -123,7 +132,7 @@ MERCHANTS: tuple[MerchantDefinition, ...] = (
             shop_domain="www.lagranderecre.fr", merchant_name="La Grande Récré"
         ),
         full_path_external_id=True,
-        capabilities=_ONLINE_ONLY_CAPABILITIES,
+        capabilities=_FULL_RBS_PLATFORM_CAPABILITIES,
     ),
 )
 

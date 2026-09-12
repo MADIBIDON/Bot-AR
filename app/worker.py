@@ -68,6 +68,8 @@ from database import crud
 from engine.backoff import BackoffTracker
 from engine.decision import is_profitability_mode
 from engine.worker import run_monitoring_tick
+from local_stock.delivery import process_due_local_deliveries
+from local_stock.worker import run_local_stock_tick
 from purchase.engine import attempt_purchase
 
 if TYPE_CHECKING:
@@ -86,9 +88,18 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_POLL_INTERVAL_SECONDS = 20
 
+# Phase 29: local stock is intentionally much slower than online
+# monitoring (see local_stock/monitor.py's module docstring — one call
+# per retailer per SKU already covers every store nationwide, but it's
+# still real network traffic against a real retailer's site, so it runs
+# on its own cadence, not every tick).
+LOCAL_STOCK_INTERVAL_SECONDS = 300
+
 _background_tasks: set[asyncio.Task[object]] = set()
 
 _discovery_in_flight = False
+_local_stock_in_flight = False
+_last_local_stock_check_at: datetime | None = None
 
 
 def _fire_and_forget(coro: object) -> None:
@@ -115,6 +126,19 @@ def _discovery_task_done(task: asyncio.Task[object]) -> None:
     exc = task.exception()
     if exc is not None:
         logger.exception("background discovery crashed", exc_info=exc)
+
+
+def _local_stock_task_done(task: asyncio.Task[object]) -> None:
+    global _local_stock_in_flight
+    _local_stock_in_flight = False
+    _background_tasks.discard(task)
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.exception("background local stock check crashed", exc_info=exc)
+    else:
+        logger.info("local stock check: %d (listing, store) pair(s) checked", task.result())
 
 
 async def tick(
@@ -218,14 +242,39 @@ async def tick(
     if discovery_registry is not None:
         _start_discovery_if_due(session, discovery_registry, now=now)
 
+    _start_local_stock_check_if_due(session, now=now)
+
     # Phase 27: recovers any pending/overdue-retry alert — including one
     # left behind by a crash before this process started — and retries
     # whatever is due, every tick. Fired as a background task, same as a
     # purchase attempt or discovery run, so a backlog of deliveries (or a
     # single slow one) can never delay the next tick's monitoring either.
     _fire_and_forget(process_due_deliveries(session, notifier, now=now))
+    # Phase 29: same durable-delivery sweep, for local-stock alerts.
+    _fire_and_forget(process_due_local_deliveries(session, notifier, now=now))
 
     return results
+
+
+def _start_local_stock_check_if_due(session: Session, *, now: datetime | None = None) -> None:
+    """Fires one local-stock check pass as a background thread (see
+    local_stock/worker.py — it's synchronous, real network I/O) at most
+    once every LOCAL_STOCK_INTERVAL_SECONDS, and never two overlapping
+    passes at once (same single-flight guard as discovery)."""
+    global _local_stock_in_flight, _last_local_stock_check_at
+    if _local_stock_in_flight:
+        return
+    now = now or datetime.now(UTC)
+    if (
+        _last_local_stock_check_at is not None
+        and (now - _last_local_stock_check_at).total_seconds() < LOCAL_STOCK_INTERVAL_SECONDS
+    ):
+        return
+    _local_stock_in_flight = True
+    _last_local_stock_check_at = now
+    task = asyncio.ensure_future(asyncio.to_thread(run_local_stock_tick, session, now=now))
+    _background_tasks.add(task)
+    task.add_done_callback(_local_stock_task_done)
 
 
 def _start_discovery_if_due(

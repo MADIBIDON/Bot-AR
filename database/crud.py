@@ -16,11 +16,15 @@ from sqlalchemy.orm import Session
 from database.models import (
     EventRecord,
     Listing,
+    LocalNotificationDelivery,
+    LocalStockEvent,
+    LocalStockState,
     Merchant,
     NotificationDelivery,
     ObservationRecord,
     Product,
     PurchaseAttempt,
+    RetailStore,
     WatchRule,
 )
 
@@ -139,6 +143,11 @@ def get_listing(session: Session, listing_id: int) -> Listing | None:
 
 def list_listings_for_product(session: Session, product_id: int) -> list[Listing]:
     stmt = select(Listing).where(Listing.product_id == product_id)
+    return list(session.scalars(stmt))
+
+
+def list_listings_for_merchant(session: Session, merchant_id: int) -> list[Listing]:
+    stmt = select(Listing).where(Listing.merchant_id == merchant_id)
     return list(session.scalars(stmt))
 
 
@@ -606,3 +615,239 @@ def sum_purchased_total_since(session: Session, since: datetime) -> Decimal:
     )
     total = session.scalar(stmt)
     return total if total is not None else Decimal("0")
+
+
+# --- Phase 29: RetailStore --------------------------------------------
+
+
+def upsert_retail_store(
+    session: Session,
+    *,
+    retailer: str,
+    external_store_id: str,
+    name: str,
+    city: str | None = None,
+    postal_code: str | None = None,
+    address: str | None = None,
+    latitude: Decimal | None = None,
+    longitude: Decimal | None = None,
+    url: str | None = None,
+    now: datetime,
+) -> RetailStore:
+    """Idempotent by (retailer, external_store_id) — running store
+    discovery again just refreshes the existing row (name/address can
+    legitimately change) rather than creating a duplicate."""
+    stmt = select(RetailStore).where(
+        RetailStore.retailer == retailer, RetailStore.external_store_id == external_store_id
+    )
+    store = session.scalars(stmt).first()
+    if store is None:
+        store = RetailStore(retailer=retailer, external_store_id=external_store_id, name=name)
+        session.add(store)
+    store.name = name
+    store.city = city
+    store.postal_code = postal_code
+    store.address = address
+    store.latitude = latitude
+    store.longitude = longitude
+    store.url = url
+    store.last_discovered_at = now
+    session.commit()
+    session.refresh(store)
+    return store
+
+
+def list_retail_stores(
+    session: Session, *, retailer: str | None = None, city: str | None = None
+) -> list[RetailStore]:
+    stmt = select(RetailStore).where(RetailStore.enabled.is_(True))
+    if retailer is not None:
+        stmt = stmt.where(RetailStore.retailer == retailer)
+    if city is not None:
+        stmt = stmt.where(RetailStore.city == city)
+    stmt = stmt.order_by(RetailStore.retailer, RetailStore.name)
+    return list(session.scalars(stmt))
+
+
+def get_retail_store(session: Session, store_id: int) -> RetailStore | None:
+    return session.get(RetailStore, store_id)
+
+
+# --- Phase 29: local stock state / events / delivery -------------------
+
+
+def get_local_stock_state(
+    session: Session, *, store_id: int, listing_id: int
+) -> LocalStockState | None:
+    stmt = select(LocalStockState).where(
+        LocalStockState.store_id == store_id, LocalStockState.listing_id == listing_id
+    )
+    return session.scalars(stmt).first()
+
+
+def upsert_local_stock_state(
+    session: Session,
+    *,
+    store_id: int,
+    listing_id: int,
+    stock_state: str,
+    click_and_collect: bool,
+    observed_at: datetime,
+) -> LocalStockState:
+    row = get_local_stock_state(session, store_id=store_id, listing_id=listing_id)
+    if row is None:
+        row = LocalStockState(store_id=store_id, listing_id=listing_id, stock_state="unknown")
+        session.add(row)
+    row.stock_state = stock_state
+    row.click_and_collect = click_and_collect
+    row.observed_at = observed_at
+    session.commit()
+    session.refresh(row)
+    return row
+
+
+def create_local_stock_event(
+    session: Session,
+    *,
+    store_id: int,
+    listing_id: int,
+    event_type: str,
+    previous_state: str | None,
+    current_state: str,
+    occurred_at: datetime,
+) -> LocalStockEvent | None:
+    """Same dedup contract as create_event_record(): None means an
+    identical event already exists, not a failure."""
+    event = LocalStockEvent(
+        store_id=store_id,
+        listing_id=listing_id,
+        event_type=event_type,
+        previous_state=previous_state,
+        current_state=current_state,
+        occurred_at=occurred_at,
+    )
+    session.add(event)
+    try:
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        return None
+    session.refresh(event)
+    return event
+
+
+_LOCAL_DELIVERABLE_STATUSES = ("pending", "failed_retryable")
+
+
+def create_local_notification_delivery(
+    session: Session, *, local_stock_event_id: int, provider: str, payload_json: str
+) -> LocalNotificationDelivery:
+    existing = get_local_notification_delivery(
+        session, local_stock_event_id=local_stock_event_id, provider=provider
+    )
+    if existing is not None:
+        return existing
+    delivery = LocalNotificationDelivery(
+        local_stock_event_id=local_stock_event_id, provider=provider, payload_json=payload_json
+    )
+    session.add(delivery)
+    try:
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        existing = get_local_notification_delivery(
+            session, local_stock_event_id=local_stock_event_id, provider=provider
+        )
+        if existing is None:
+            raise
+        return existing
+    session.refresh(delivery)
+    return delivery
+
+
+def get_local_notification_delivery(
+    session: Session, *, local_stock_event_id: int, provider: str
+) -> LocalNotificationDelivery | None:
+    stmt = select(LocalNotificationDelivery).where(
+        LocalNotificationDelivery.local_stock_event_id == local_stock_event_id,
+        LocalNotificationDelivery.provider == provider,
+    )
+    return session.scalars(stmt).first()
+
+
+def claim_local_delivery_for_sending(
+    session: Session, delivery_id: int, *, now: datetime
+) -> LocalNotificationDelivery | None:
+    """Same atomic-conditional-UPDATE claim as claim_delivery_for_sending
+    (database/crud.py, Phase 27) — see that function's docstring for why
+    synchronize_session=False + expire_all() is required."""
+    stmt = (
+        update(LocalNotificationDelivery)
+        .where(
+            LocalNotificationDelivery.id == delivery_id,
+            LocalNotificationDelivery.status.in_(_LOCAL_DELIVERABLE_STATUSES),
+            (LocalNotificationDelivery.next_retry_at.is_(None))
+            | (LocalNotificationDelivery.next_retry_at <= now),
+        )
+        .values(
+            status="sending",
+            last_attempt_at=now,
+            attempt_count=LocalNotificationDelivery.attempt_count + 1,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    result = session.execute(stmt)
+    session.commit()
+    if result.rowcount == 0:
+        return None
+    session.expire_all()
+    return session.get(LocalNotificationDelivery, delivery_id)
+
+
+def mark_local_delivery_sent(session: Session, delivery_id: int, *, now: datetime) -> None:
+    delivery = session.get(LocalNotificationDelivery, delivery_id)
+    if delivery is None:
+        return
+    delivery.status = "sent"
+    delivery.sent_at = now
+    session.commit()
+
+
+def mark_local_delivery_failed_retryable(
+    session: Session, delivery_id: int, *, error_type: str, next_retry_at: datetime
+) -> None:
+    delivery = session.get(LocalNotificationDelivery, delivery_id)
+    if delivery is None:
+        return
+    delivery.status = "failed_retryable"
+    delivery.last_error_type = error_type
+    delivery.next_retry_at = next_retry_at
+    session.commit()
+
+
+def mark_local_delivery_failed_permanent(
+    session: Session, delivery_id: int, *, error_type: str
+) -> None:
+    delivery = session.get(LocalNotificationDelivery, delivery_id)
+    if delivery is None:
+        return
+    delivery.status = "failed_permanent"
+    delivery.last_error_type = error_type
+    delivery.next_retry_at = None
+    session.commit()
+
+
+def list_due_local_deliveries(
+    session: Session, *, now: datetime, provider: str = "discord"
+) -> list[LocalNotificationDelivery]:
+    stmt = (
+        select(LocalNotificationDelivery)
+        .where(
+            LocalNotificationDelivery.provider == provider,
+            LocalNotificationDelivery.status.in_(_LOCAL_DELIVERABLE_STATUSES),
+            (LocalNotificationDelivery.next_retry_at.is_(None))
+            | (LocalNotificationDelivery.next_retry_at <= now),
+        )
+        .order_by(LocalNotificationDelivery.id)
+    )
+    return list(session.scalars(stmt))

@@ -473,3 +473,183 @@ class PurchaseAttempt(Base):
             f"PurchaseAttempt(id={self.id!r}, listing_id={self.listing_id!r}, "
             f"status={self.status!r})"
         )
+
+
+class RetailStore(Base):
+    """One physical store belonging to a retailer — Phase 29.
+
+    `retailer` is a plain string matching MerchantDefinition.name
+    (connectors/defaults.py), not a foreign key to Merchant: a
+    RetailStore can exist for a retailer discovered here before it has
+    any online Listing/Merchant row at all (store discovery and online
+    monitoring are independent). UNIQUE(retailer, external_store_id) is
+    the idempotency anchor for store_discovery's upsert — running
+    discovery twice a day never duplicates a store, and a store the
+    retailer removes from its own directory simply stops being
+    refreshed rather than being force-deleted (its history stays valid).
+    """
+
+    __tablename__ = "retail_stores"
+    __table_args__ = (
+        UniqueConstraint(
+            "retailer", "external_store_id", name="uq_retail_store_retailer_external_id"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    retailer: Mapped[str] = mapped_column(nullable=False)
+    external_store_id: Mapped[str] = mapped_column(nullable=False)
+    name: Mapped[str] = mapped_column(nullable=False)
+    city: Mapped[str | None] = mapped_column(default=None)
+    postal_code: Mapped[str | None] = mapped_column(default=None)
+    address: Mapped[str | None] = mapped_column(default=None)
+    latitude: Mapped[Decimal | None] = mapped_column(Numeric(9, 6), default=None)
+    longitude: Mapped[Decimal | None] = mapped_column(Numeric(9, 6), default=None)
+    url: Mapped[str | None] = mapped_column(default=None)
+    enabled: Mapped[bool] = mapped_column(nullable=False, default=True)
+
+    last_discovered_at: Mapped[datetime | None] = mapped_column(default=None)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+    def __repr__(self) -> str:
+        return (
+            f"RetailStore(id={self.id!r}, retailer={self.retailer!r}, "
+            f"external_store_id={self.external_store_id!r}, city={self.city!r})"
+        )
+
+
+class LocalStockState(Base):
+    """Current in-store availability for one (store, listing) pair —
+    Phase 29. Deliberately a single upserted row, not an append-only
+    observation log like ObservationRecord: local stock isn't part of
+    the mature, audited online pipeline and doesn't need full history —
+    the previous value this row held (read right before the upsert) IS
+    the "previous observation" a transition is computed from, exactly
+    once, in local_stock/monitor.py. UNIQUE(store_id, listing_id) makes
+    "upsert" well-defined.
+
+    stock_state is one of the values in database/models.py's
+    LOCAL_STOCK_STATES tuple; never fabricated — see
+    local_stock/monitor.py's mapping from RbsStoreStock."""
+
+    __tablename__ = "local_stock_states"
+    __table_args__ = (
+        UniqueConstraint("store_id", "listing_id", name="uq_local_stock_state_store_listing"),
+        CheckConstraint(
+            "stock_state IN ('unknown', 'out_of_stock', 'in_stock', 'low_stock', "
+            "'click_and_collect', 'reservation_available', 'store_only')",
+            name="ck_local_stock_state_valid",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    store_id: Mapped[int] = mapped_column(ForeignKey("retail_stores.id"), nullable=False)
+    listing_id: Mapped[int] = mapped_column(ForeignKey("listings.id"), nullable=False)
+    stock_state: Mapped[str] = mapped_column(nullable=False, default="unknown")
+    click_and_collect: Mapped[bool] = mapped_column(nullable=False, default=False)
+    observed_at: Mapped[datetime] = mapped_column(nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+    def __repr__(self) -> str:
+        return (
+            f"LocalStockState(store_id={self.store_id!r}, listing_id={self.listing_id!r}, "
+            f"stock_state={self.stock_state!r})"
+        )
+
+
+class LocalStockEvent(Base):
+    """One detected local-stock transition worth alerting on — Phase 29.
+    Parallel to EventRecord, not a subtype of it: a local event needs
+    store_id, which EventRecord's schema has no room for. Deduplicated
+    on (store_id, listing_id, event_type, current_state) so reprocessing
+    the same transition can never create a duplicate row — mirrors
+    EventRecord's own dedup contract."""
+
+    __tablename__ = "local_stock_events"
+    __table_args__ = (
+        UniqueConstraint(
+            "store_id",
+            "listing_id",
+            "event_type",
+            "current_state",
+            name="uq_local_stock_event_store_listing_type_state",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    store_id: Mapped[int] = mapped_column(ForeignKey("retail_stores.id"), nullable=False)
+    listing_id: Mapped[int] = mapped_column(ForeignKey("listings.id"), nullable=False)
+    event_type: Mapped[str] = mapped_column(nullable=False)
+    previous_state: Mapped[str | None] = mapped_column(default=None)
+    current_state: Mapped[str] = mapped_column(nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(nullable=False)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    def __repr__(self) -> str:
+        return (
+            f"LocalStockEvent(id={self.id!r}, store_id={self.store_id!r}, "
+            f"listing_id={self.listing_id!r}, event_type={self.event_type!r})"
+        )
+
+
+class LocalNotificationDelivery(Base):
+    """Durable delivery tracking for one LocalStockEvent — Phase 29.
+
+    A parallel table to NotificationDelivery (app/delivery.py, Phase 27)
+    rather than a shared/polymorphic one: NotificationDelivery.event_id
+    has a real foreign key into event_records, and local_stock_events is
+    a different table with an independent id sequence — relaxing that FK
+    to make one column point at either table would trade away real
+    referential integrity for a small amount of code reuse. The state
+    machine and semantics are identical; see local_stock/delivery.py,
+    which reuses app/delivery.py's pure classification/backoff logic
+    directly (that part has no EventRecord coupling at all)."""
+
+    __tablename__ = "local_notification_deliveries"
+    __table_args__ = (
+        UniqueConstraint(
+            "local_stock_event_id", "provider", name="uq_local_notification_delivery_event_provider"
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'sending', 'sent', 'failed_retryable', 'failed_permanent')",
+            name="ck_local_notification_delivery_status_valid",
+        ),
+        CheckConstraint(
+            "attempt_count >= 0", name="ck_local_notification_delivery_attempt_count_non_negative"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    local_stock_event_id: Mapped[int] = mapped_column(
+        ForeignKey("local_stock_events.id"), nullable=False
+    )
+    provider: Mapped[str] = mapped_column(nullable=False, default="discord")
+    status: Mapped[str] = mapped_column(nullable=False, default="pending")
+    payload_json: Mapped[str] = mapped_column(nullable=False)
+
+    attempt_count: Mapped[int] = mapped_column(nullable=False, default=0)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(default=None)
+    next_retry_at: Mapped[datetime | None] = mapped_column(default=None)
+    sent_at: Mapped[datetime | None] = mapped_column(default=None)
+    last_error_type: Mapped[str | None] = mapped_column(default=None)
+
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+    def __repr__(self) -> str:
+        return (
+            f"LocalNotificationDelivery(id={self.id!r}, "
+            f"local_stock_event_id={self.local_stock_event_id!r}, status={self.status!r})"
+        )
+
+
+LOCAL_STOCK_STATES = (
+    "unknown",
+    "out_of_stock",
+    "in_stock",
+    "low_stock",
+    "click_and_collect",
+    "reservation_available",
+    "store_only",
+)

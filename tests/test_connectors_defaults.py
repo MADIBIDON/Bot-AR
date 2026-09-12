@@ -4,6 +4,8 @@ import pytest
 
 from connectors.defaults import (
     CATALOG_SEARCH,
+    CLICK_AND_COLLECT,
+    LOCAL_STOCK,
     MERCHANTS,
     ONLINE_STOCK,
     PRICE,
@@ -115,13 +117,20 @@ def test_phase_28_merchants_use_full_path_external_id() -> None:
         assert by_name[name].full_path_external_id is True
 
 
-def test_existing_merchants_have_catalog_search_new_ones_dont() -> None:
+def test_catalog_search_capability_matches_a_real_working_source() -> None:
+    """Phase 28: Cultura/E.Leclerc have no confirmed public catalog
+    search at all. Phase 29: JouéClub/La Grande Récré gained one via
+    sitemap-based discovery (discovery/sitemap.py) — both run the same
+    Proximis/Rbs platform and publish a single, reasonably-sized product
+    sitemap; Cultura/E.Leclerc's sitemaps are 75-87 files of 50,000 URLs
+    each and were deliberately not wired up for that (see
+    discovery/defaults.py)."""
     by_name = {m.name: m for m in MERCHANTS}
 
-    for name in ("Kairyu", "RelicTCG", "Fuji Store"):
+    for name in ("Kairyu", "RelicTCG", "Fuji Store", "JouéClub", "La Grande Récré"):
         assert CATALOG_SEARCH in by_name[name].capabilities
 
-    for name in ("Cultura", "JouéClub", "E.Leclerc", "La Grande Récré"):
+    for name in ("Cultura", "E.Leclerc"):
         assert CATALOG_SEARCH not in by_name[name].capabilities
         assert ONLINE_STOCK in by_name[name].capabilities
         assert PRICE in by_name[name].capabilities
@@ -132,3 +141,19 @@ def test_unsupported_retailers_are_documented_not_silently_dropped() -> None:
     assert {"Fnac", "King Jouet", "Smyths Toys", "Carrefour", "Micromania", "Amazon"} <= names
     for _name, reason in UNSUPPORTED_RETAILERS:
         assert reason  # every documented blocker has an actual reason, never blank
+
+
+def test_local_stock_capability_matches_a_real_confirmed_platform() -> None:
+    """Phase 29: only JouéClub and La Grande Récré were confirmed on the
+    Rbs/Proximis platform this session (real store-locator + per-SKU
+    store-stock endpoints, see local_stock/rbs_platform.py) — every
+    other retailer, supported or not, has none of these capabilities."""
+    by_name = {m.name: m for m in MERCHANTS}
+
+    for name in ("JouéClub", "La Grande Récré"):
+        assert LOCAL_STOCK in by_name[name].capabilities
+        assert CLICK_AND_COLLECT in by_name[name].capabilities
+
+    for name in ("Kairyu", "RelicTCG", "Fuji Store", "Cultura", "E.Leclerc"):
+        assert LOCAL_STOCK not in by_name[name].capabilities
+        assert CLICK_AND_COLLECT not in by_name[name].capabilities
