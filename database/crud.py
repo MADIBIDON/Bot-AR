@@ -9,7 +9,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -17,6 +17,7 @@ from database.models import (
     EventRecord,
     Listing,
     Merchant,
+    NotificationDelivery,
     ObservationRecord,
     Product,
     PurchaseAttempt,
@@ -339,6 +340,183 @@ def get_most_recent_observation(session: Session) -> ObservationRecord | None:
 
 def get_most_recent_event(session: Session) -> EventRecord | None:
     stmt = select(EventRecord).order_by(EventRecord.occurred_at.desc()).limit(1)
+    return session.scalars(stmt).first()
+
+
+# --- Phase 27: durable notification delivery -------------------------------
+
+_DELIVERABLE_STATUSES = ("pending", "failed_retryable")
+
+
+def create_notification_delivery(
+    session: Session, *, event_id: int, provider: str, payload_json: str
+) -> NotificationDelivery:
+    """Idempotent: (event_id, provider) is UNIQUE, so a second call for an
+    event that already has a delivery row (e.g. the immediate in-tick path
+    and a recovery sweep both reaching the same still-new event) returns
+    the existing row untouched rather than raising or duplicating —
+    same get-or-create-with-IntegrityError-retry pattern as
+    app/discovery.py's _get_or_create_merchant/_get_or_create_listing."""
+    existing = get_notification_delivery(session, event_id=event_id, provider=provider)
+    if existing is not None:
+        return existing
+    delivery = NotificationDelivery(event_id=event_id, provider=provider, payload_json=payload_json)
+    session.add(delivery)
+    try:
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        existing = get_notification_delivery(session, event_id=event_id, provider=provider)
+        if existing is None:
+            raise
+        return existing
+    session.refresh(delivery)
+    return delivery
+
+
+def get_notification_delivery(
+    session: Session, *, event_id: int, provider: str
+) -> NotificationDelivery | None:
+    stmt = select(NotificationDelivery).where(
+        NotificationDelivery.event_id == event_id, NotificationDelivery.provider == provider
+    )
+    return session.scalars(stmt).first()
+
+
+def claim_delivery_for_sending(
+    session: Session, delivery_id: int, *, now: datetime
+) -> NotificationDelivery | None:
+    """Atomically transitions one delivery row from pending/failed_retryable
+    to sending, incrementing attempt_count — a single conditional UPDATE,
+    not a check-then-write, so two callers racing on the exact same row
+    (the immediate in-tick attempt and a periodic recovery sweep, or in
+    principle two separate processes) can never both believe they claimed
+    it: the UPDATE's WHERE clause only matches once, and SQLAlchemy's
+    result.rowcount tells the loser it got nothing. Also gates on
+    next_retry_at so a failed_retryable row isn't reclaimed before its
+    backoff window elapses.
+
+    synchronize_session=False: SQLAlchemy's default ("evaluate") tries to
+    apply this WHERE clause in plain Python against any matching object
+    already in this Session's identity map, to update it without a fresh
+    SELECT — and crashes comparing next_retry_at (naive, once read back
+    from SQLite — the same tzinfo-dropping behavior database/time_utils.py
+    exists for) against `now` (timezone-aware). Turning that off avoids
+    the comparison entirely; session.expire_all() below is what makes the
+    session.get() just after this actually re-read the row from the DB
+    (reflecting the UPDATE) instead of returning a stale cached object —
+    real, not theoretical: this is exactly what happens the first time a
+    freshly-started worker process touches a delivery row after
+    restart."""
+    stmt = (
+        update(NotificationDelivery)
+        .where(
+            NotificationDelivery.id == delivery_id,
+            NotificationDelivery.status.in_(_DELIVERABLE_STATUSES),
+            (NotificationDelivery.next_retry_at.is_(None))
+            | (NotificationDelivery.next_retry_at <= now),
+        )
+        .values(
+            status="sending",
+            last_attempt_at=now,
+            attempt_count=NotificationDelivery.attempt_count + 1,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    result = session.execute(stmt)
+    session.commit()
+    if result.rowcount == 0:
+        return None
+    session.expire_all()
+    return session.get(NotificationDelivery, delivery_id)
+
+
+def mark_delivery_sent(session: Session, delivery_id: int, *, now: datetime) -> None:
+    delivery = session.get(NotificationDelivery, delivery_id)
+    if delivery is None:
+        return
+    delivery.status = "sent"
+    delivery.sent_at = now
+    session.commit()
+
+
+def mark_delivery_failed_retryable(
+    session: Session, delivery_id: int, *, error_type: str, next_retry_at: datetime
+) -> None:
+    delivery = session.get(NotificationDelivery, delivery_id)
+    if delivery is None:
+        return
+    delivery.status = "failed_retryable"
+    delivery.last_error_type = error_type
+    delivery.next_retry_at = next_retry_at
+    session.commit()
+
+
+def mark_delivery_failed_permanent(session: Session, delivery_id: int, *, error_type: str) -> None:
+    delivery = session.get(NotificationDelivery, delivery_id)
+    if delivery is None:
+        return
+    delivery.status = "failed_permanent"
+    delivery.last_error_type = error_type
+    delivery.next_retry_at = None
+    session.commit()
+
+
+def list_due_deliveries(
+    session: Session, *, now: datetime, provider: str = "discord"
+) -> list[NotificationDelivery]:
+    """Pending rows are always due; failed_retryable rows are due once
+    their backoff window (next_retry_at) has elapsed. Ordered oldest
+    first so a backlog after an outage drains fairly rather than newest-
+    first."""
+    stmt = (
+        select(NotificationDelivery)
+        .where(
+            NotificationDelivery.provider == provider,
+            NotificationDelivery.status.in_(_DELIVERABLE_STATUSES),
+            (NotificationDelivery.next_retry_at.is_(None))
+            | (NotificationDelivery.next_retry_at <= now),
+        )
+        .order_by(NotificationDelivery.id)
+    )
+    return list(session.scalars(stmt))
+
+
+def list_event_records_missing_delivery(
+    session: Session, *, provider: str = "discord"
+) -> list[EventRecord]:
+    """Closes the narrow crash window between an EventRecord commit and
+    its NotificationDelivery row ever being created (see app/delivery.py)
+    — an EventRecord with no delivery row at all for this provider is
+    exactly as "not yet notified" as a fresh pending row, just missing
+    its payload; the caller rebuilds one."""
+    subquery = select(NotificationDelivery.event_id).where(
+        NotificationDelivery.provider == provider
+    )
+    stmt = select(EventRecord).where(EventRecord.id.not_in(subquery)).order_by(EventRecord.id)
+    return list(session.scalars(stmt))
+
+
+def notification_delivery_status_counts(
+    session: Session, *, provider: str = "discord"
+) -> dict[str, int]:
+    stmt = (
+        select(NotificationDelivery.status, func.count())
+        .where(NotificationDelivery.provider == provider)
+        .group_by(NotificationDelivery.status)
+    )
+    return dict(session.execute(stmt).all())
+
+
+def get_last_successful_delivery_at(
+    session: Session, *, provider: str = "discord"
+) -> datetime | None:
+    stmt = (
+        select(NotificationDelivery.sent_at)
+        .where(NotificationDelivery.provider == provider, NotificationDelivery.status == "sent")
+        .order_by(NotificationDelivery.sent_at.desc())
+        .limit(1)
+    )
     return session.scalars(stmt).first()
 
 

@@ -29,6 +29,7 @@ from app import pidfile
 from connectors.defaults import MERCHANTS
 from database import crud
 from database.session import create_all, get_engine, get_session_factory
+from database.time_utils import ensure_utc
 from market_data import ebay_status
 from market_data.defaults import build_default_market_registry
 from market_data.ebay import MissingEbayConfigError
@@ -128,6 +129,24 @@ def _check_ebay() -> CheckResult:
     return CheckResult("eBay market data", f"OK (last OAuth success: {status.last_success_at})")
 
 
+def _check_notifications(session: Session) -> CheckResult:
+    """Phase 27: visibility into durable Discord delivery state — never
+    blocking (a stuck/failed alert is a real problem worth seeing, not a
+    reason to report the whole bot NOT READY, same reasoning as eBay
+    being optional enrichment)."""
+    counts = crud.notification_delivery_status_counts(session)
+    last_success = crud.get_last_successful_delivery_at(session)
+    pending = counts.get("pending", 0) + counts.get("sending", 0)
+    retryable_failed = counts.get("failed_retryable", 0)
+    permanent_failed = counts.get("failed_permanent", 0)
+    detail = (
+        f"pending={pending} retryable_failed={retryable_failed} "
+        f"permanent_failed={permanent_failed} "
+        f"last_success={ensure_utc(last_success).isoformat() if last_success else 'never'}"
+    )
+    return CheckResult("Notifications", detail)
+
+
 def _check_last_observation(session: Session) -> CheckResult:
     record = crud.get_most_recent_observation(session)
     if record is None:
@@ -168,6 +187,7 @@ async def run() -> bool:
     results.append(_check_ebay())
     if session is not None:
         results.append(_check_last_observation(session))
+        results.append(_check_notifications(session))
     results.append(_check_recent_errors())
 
     for result in results[1:]:

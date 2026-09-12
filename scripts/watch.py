@@ -90,6 +90,7 @@ from connectors.defaults import (
 from database import crud
 from database.models import WatchRule
 from database.session import create_all, get_engine, get_session_factory
+from database.time_utils import ensure_utc
 from discovery.defaults import build_default_discovery_registry
 from engine.monitoring import run_check_and_store
 from engine.opportunity import OpportunityConfig, evaluate_opportunity
@@ -556,6 +557,7 @@ async def _run_test(session: Session, rule: WatchRule) -> int:
             notifier,
             market_registry,
             _market_cache,
+            session=session,
         )
 
     event_names = [e.event_type.value for e in result.events] or ["none"]
@@ -1130,6 +1132,16 @@ def cmd_status(args: argparse.Namespace) -> int:
         print("last event:     none")
 
     print(f"worker:         {_worker_status()}")
+
+    counts = crud.notification_delivery_status_counts(session)
+    last_success = crud.get_last_successful_delivery_at(session)
+    print(
+        "notifications:  "
+        f"pending={counts.get('pending', 0) + counts.get('sending', 0)} "
+        f"retryable_failed={counts.get('failed_retryable', 0)} "
+        f"permanent_failed={counts.get('failed_permanent', 0)} "
+        f"last_success={ensure_utc(last_success).isoformat() if last_success else 'never'}"
+    )
     return 0
 
 

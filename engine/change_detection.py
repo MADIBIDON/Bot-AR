@@ -50,6 +50,13 @@ class MonitoringEvent:
     previous_value: str | None = None
     current_value: str | None = None
     observation_record_id: int | None = None
+    # Phase 27: the persisted EventRecord.id, attached by
+    # engine/monitoring.py::store_check_result() once create_event_record()
+    # actually writes the row — None here (detect_changes() never sets it,
+    # since nothing is persisted yet at that point) is how a caller detects
+    # "this event was never durably identifiable" and must not create a
+    # NotificationDelivery row for it (see app/delivery.py).
+    record_id: int | None = None
 
 
 def detect_changes(

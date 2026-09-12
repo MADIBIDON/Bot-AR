@@ -42,6 +42,13 @@ due Product simply waits for the next tick where the first has finished
 — there is no due-product queue, no Celery/Redis, no second service.
 This keeps discovery a bounded background trickle rather than something
 that could pile up or compete with itself for the same Session.
+
+Phase 27: every tick also fires app.delivery.process_due_deliveries() as
+a background task — recovers any alert left pending or mid-retry by a
+crash, and retries whatever else is due (see app/delivery.py). Never
+awaited here for the same reason a purchase attempt or discovery run
+isn't: a backlog of deliveries, or one slow send, must never delay the
+next tick's monitoring.
 """
 
 from __future__ import annotations
@@ -52,6 +59,7 @@ import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from app.delivery import process_due_deliveries
 from app.discovery import is_discovery_due, run_discovery_for_product
 from app.notify import compute_opportunity, notify_events_if_allowed
 from app.resale import resolve_resale_confidence
@@ -163,6 +171,9 @@ async def tick(
                 # WatchRule). Decision/opportunity computation above this
                 # line is unaffected — those still happen synchronously.
                 dispatch=_fire_and_forget,
+                # Phase 27: durable delivery tracking (app/delivery.py) —
+                # see notify_events_if_allowed's docstring.
+                session=session,
             )
         except Exception:
             logger.exception("notification failed watch_rule=%s", watch_rule.id)
@@ -206,6 +217,13 @@ async def tick(
 
     if discovery_registry is not None:
         _start_discovery_if_due(session, discovery_registry, now=now)
+
+    # Phase 27: recovers any pending/overdue-retry alert — including one
+    # left behind by a crash before this process started — and retries
+    # whatever is due, every tick. Fired as a background task, same as a
+    # purchase attempt or discovery run, so a backlog of deliveries (or a
+    # single slow one) can never delay the next tick's monitoring either.
+    _fire_and_forget(process_due_deliveries(session, notifier, now=now))
 
     return results
 

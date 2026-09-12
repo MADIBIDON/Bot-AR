@@ -22,6 +22,18 @@ delay the next tick's monitoring of every other WatchRule. `dispatch`
 defaults to None (a plain inline `await`) so every existing caller/test
 keeps its exact original synchronous behavior; the timeout+retry wrapper
 still applies either way, since it was always a strict improvement.
+
+Phase 27: a failed send used to just be logged — the alert was gone for
+good. When the caller now also passes `session`, each event's embed is
+frozen into a durable NotificationDelivery row (app/delivery.py) *before*
+any send is attempted, and the actual attempt goes through
+app/delivery.py's claim/retry/backoff machinery instead of the old
+in-process-only _send_embed_with_retry. `session` defaults to None (no
+durable tracking, exact old inline-retry behavior) for the same reason
+`dispatch` does — every existing caller/test that only cares about
+decision logic is unaffected. app/worker.py (the real worker) and
+scripts/watch.py's `test` command (a real, user-triggered send) both pass
+it; nothing else needs to.
 """
 
 from __future__ import annotations
@@ -32,6 +44,7 @@ from collections.abc import Callable, Coroutine
 from decimal import Decimal
 from typing import TYPE_CHECKING, Protocol
 
+from app.delivery import attempt_delivery, create_pending_delivery
 from app.resale import resolve_resale_confidence, resolve_resale_price_for_opportunity
 from engine.decision import (
     DecisionResult,
@@ -49,6 +62,7 @@ from notifications.discord.formatter import format_event_embed
 
 if TYPE_CHECKING:
     import discord
+    from sqlalchemy.orm import Session
 
     from database.models import WatchRule
     from engine.change_detection import MonitoringEvent
@@ -163,6 +177,7 @@ async def notify_events_if_allowed(
     cache: TTLCache | None = None,
     *,
     dispatch: Callable[[Coroutine[object, object, None]], None] | None = None,
+    session: Session | None = None,
 ) -> DecisionResult:
     """Evaluate current state once; notify one embed per event only if allowed.
 
@@ -186,8 +201,20 @@ async def notify_events_if_allowed(
     delay this function's return (and, by extension, the next WatchRule's
     monitoring in the same tick). Left as None (the default), every event
     is awaited in order exactly as before — every existing caller/test
-    keeps its exact original behavior. Either way, the actual send always
-    goes through _send_embed_with_retry (timeout + one retry).
+    keeps its exact original behavior.
+
+    Phase 27: when `session` is given, each event's embed is frozen into
+    a durable NotificationDelivery row (app/delivery.py) before the send
+    is even attempted, and the coroutine handed to `dispatch`/awaited is
+    app/delivery.py's attempt_delivery() (claim + timeout + classify +
+    bounded retry with backoff, persisted) instead of the old in-process-
+    only _send_embed_with_retry. `session` defaults to None — every
+    existing caller/test that only cares about decision logic keeps the
+    exact old inline-retry behavior with no durable tracking at all. An
+    event somehow missing its record_id (see engine/change_detection.py's
+    MonitoringEvent docstring — not expected in practice) also falls back
+    to the old inline path for that one event, since there is nothing to
+    key a delivery row on.
     """
     decision = evaluate(watch_rule, observation, match_result)
     if decision.allowed:
@@ -213,9 +240,13 @@ async def notify_events_if_allowed(
                 recommendation=recommendation,
                 recommendation_reason=recommendation_reason,
             )
-            send_coro = _send_embed_with_retry(
-                notifier, embed, watch_rule_id=watch_rule.id, event_type=event.event_type.value
-            )
+            if session is not None and event.record_id is not None:
+                delivery = create_pending_delivery(session, event_id=event.record_id, embed=embed)
+                send_coro = attempt_delivery(session, delivery.id, notifier)
+            else:
+                send_coro = _send_embed_with_retry(
+                    notifier, embed, watch_rule_id=watch_rule.id, event_type=event.event_type.value
+                )
             if dispatch is not None:
                 dispatch(send_coro)
             else:

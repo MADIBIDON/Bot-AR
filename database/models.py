@@ -311,8 +311,9 @@ class EventRecord(Base):
 
     Deduplicated on (event_type, watch_rule_id, observation_record_id): the
     same observation can never produce the same event twice, even if a check
-    is reprocessed. No `processed`/dispatch-tracking field yet — that
-    belongs to whichever later phase adds Discord delivery.
+    is reprocessed. Whether/how this event was ever delivered to Discord is
+    tracked separately, in NotificationDelivery (Phase 27) — this table
+    only ever records that the business event itself happened.
     """
 
     __tablename__ = "event_records"
@@ -343,6 +344,68 @@ class EventRecord(Base):
         return (
             f"EventRecord(id={self.id!r}, event_type={self.event_type!r}, "
             f"watch_rule_id={self.watch_rule_id!r})"
+        )
+
+
+class NotificationDelivery(Base):
+    """Phase 27: durable at-least-once delivery tracking for one
+    (EventRecord, provider) pair. EventRecord only records that a business
+    event happened; this tracks whether anyone was ever actually told
+    about it, so a crash between "event persisted" and "Discord sent" is
+    recoverable without either losing the alert or sending it twice.
+    app/delivery.py is the only writer.
+
+    payload_json is the fully-rendered notification (a discord.Embed's
+    to_dict(), JSON-encoded) captured once, at the moment the alert is
+    first prepared — every attempt, including a retry after a restart,
+    resends this exact frozen payload rather than recomputing it (which
+    would re-run resale/opportunity calculations against numbers that may
+    have since drifted, and could re-hit a market data source). Contains
+    only this project's own formatted business data — product name,
+    price, merchant, ROI — never a token, credential, or other secret.
+
+    UNIQUE(event_id, provider) is the idempotency anchor: creating a
+    delivery row for an event that already has one (from an earlier,
+    possibly-crashed attempt) always returns the existing row instead of
+    a second one — the same get-or-create-with-IntegrityError-retry
+    pattern already used for Merchant/Listing (see app/discovery.py).
+
+    status transitions: pending -> sending -> sent, or pending/sending ->
+    failed_retryable (until attempts run out) -> failed_permanent.
+    Nothing ever moves backward out of 'sent'.
+    """
+
+    __tablename__ = "notification_deliveries"
+    __table_args__ = (
+        UniqueConstraint("event_id", "provider", name="uq_notification_delivery_event_provider"),
+        CheckConstraint(
+            "status IN ('pending', 'sending', 'sent', 'failed_retryable', 'failed_permanent')",
+            name="ck_notification_delivery_status_valid",
+        ),
+        CheckConstraint(
+            "attempt_count >= 0", name="ck_notification_delivery_attempt_count_non_negative"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    event_id: Mapped[int] = mapped_column(ForeignKey("event_records.id"), nullable=False)
+    provider: Mapped[str] = mapped_column(nullable=False, default="discord")
+    status: Mapped[str] = mapped_column(nullable=False, default="pending")
+    payload_json: Mapped[str] = mapped_column(nullable=False)
+
+    attempt_count: Mapped[int] = mapped_column(nullable=False, default=0)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(default=None)
+    next_retry_at: Mapped[datetime | None] = mapped_column(default=None)
+    sent_at: Mapped[datetime | None] = mapped_column(default=None)
+    last_error_type: Mapped[str | None] = mapped_column(default=None)
+
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+    def __repr__(self) -> str:
+        return (
+            f"NotificationDelivery(id={self.id!r}, event_id={self.event_id!r}, "
+            f"provider={self.provider!r}, status={self.status!r})"
         )
 
 

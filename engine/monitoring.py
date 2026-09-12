@@ -175,7 +175,10 @@ def store_check_result(
                 current_value=event.current_value,
             )
             if record is not None:
-                persisted.append(event)
+                # Phase 27: carry the persisted row's id forward — the one
+                # durable identifier app/delivery.py needs to track this
+                # specific event's notification delivery across restarts.
+                persisted.append(replace(event, record_id=record.id))
         events = tuple(persisted)
 
     return replace(result, events=events)
