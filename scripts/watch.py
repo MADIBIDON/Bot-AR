@@ -82,6 +82,11 @@ from app.opportunity_snapshot import build_opportunity_candidate
 from app.resale import resolve_resale_estimate
 from connectors.base import ConnectorError, ConnectorProduct, ProductNotFoundError
 from connectors.defaults import (
+    CATALOG_SEARCH,
+    CLICK_AND_COLLECT,
+    LOCAL_STOCK,
+    MERCHANTS,
+    UNSUPPORTED_RETAILERS,
     build_default_registry,
     domains_for_merchant,
     find_merchant_for_domain,
@@ -255,6 +260,12 @@ def _detect_from_url(url: str, merchant_override: str | None) -> DetectedProduct
             handle=handle,
             connector_product=None,
         )
+
+    # Phase 28: a GenericSchemaOrgConnector merchant's external_id is the
+    # entire URL path (no single fixed prefix to re-derive it from) —
+    # see connectors/generic_schema_org.py.
+    if merchant_def.full_path_external_id:
+        handle = parsed.path.lstrip("/")
 
     merchant_name = merchant_override or merchant_def.name
     connector = merchant_def.build_connector()
@@ -967,7 +978,7 @@ def cmd_product(args: argparse.Namespace) -> int:
     last_discovery = product.last_discovery_at.isoformat() if product.last_discovery_at else "never"
     print(f"Last discovery: {last_discovery}")
     print()
-    print("Listings:")
+    print("ONLINE LISTINGS:")
     rules = crud.list_watch_rules(session, product_id=product.id)
     if not rules:
         print("  none yet")
@@ -985,6 +996,10 @@ def cmd_product(args: argparse.Namespace) -> int:
         print(f"    stock: {stock}")
         print(f"    last check: {last.observed_at.isoformat() if last else 'never'}")
         print(f"    watch_rule={r.id} enabled={r.enabled}")
+
+    print()
+    print("LOCAL AVAILABILITY:")
+    print("  not implemented this session (see final report — a real, documented blocker)")
     return 0
 
 
@@ -1106,8 +1121,30 @@ def _worker_status() -> str:
     return pidfile.describe_status(pidfile.get_status(PID_FILE))
 
 
+def _print_retailer_capabilities() -> None:
+    """Phase 28: capability facts are defined in code (connectors/
+    defaults.py) — see that module's docstring for why a DB mirror would
+    add sync-drift risk with no behavioral benefit."""
+    print("Retailers")
+    for merchant in MERCHANTS:
+        caps = merchant.capabilities
+        parts = ["ONLINE OK"]
+        if CATALOG_SEARCH in caps:
+            parts.append("SEARCH OK")
+        if LOCAL_STOCK in caps or CLICK_AND_COLLECT in caps:
+            parts.append("LOCAL OK")
+        else:
+            parts.append("LOCAL not implemented")
+        print(f"  {merchant.name:<18}{' | '.join(parts)}")
+    for name, reason in UNSUPPORTED_RETAILERS:
+        print(f"  {name:<18}UNSUPPORTED ({reason})")
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     session = _get_session()
+    _print_retailer_capabilities()
+    print()
+
     active = crud.list_watch_rules(session, enabled=True)
     disabled = crud.list_watch_rules(session, enabled=False)
     print(f"active rules:   {len(active)}")
@@ -1142,6 +1179,18 @@ def cmd_status(args: argparse.Namespace) -> int:
         f"permanent_failed={counts.get('failed_permanent', 0)} "
         f"last_success={ensure_utc(last_success).isoformat() if last_success else 'never'}"
     )
+
+    print()
+    print("Stores monitored:")
+    for city in ("Paris", "Brest", "Quimper", "Lorient"):
+        print(f"  {city}: 0 (local store monitoring not implemented this session)")
+
+    print()
+    print(f"Test Watches: {len(active)} enabled")
+
+    print()
+    policy = load_purchase_policy()
+    print(f"Purchases: {'ENABLED' if policy.enabled else 'DISABLED'}")
     return 0
 
 

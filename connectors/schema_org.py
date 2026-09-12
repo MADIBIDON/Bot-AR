@@ -238,6 +238,15 @@ def _build_connector_product(
     mpn = product_data.get("mpn")
     mpn = mpn.strip() if isinstance(mpn, str) and mpn.strip() else None
 
+    offer_url = offer.get("url")
+    # Phase 28: E.Leclerc's own JSON-LD ships a relative offer.url (e.g.
+    # "fp/<slug>", not "https://www.e.leclerc/fp/<slug>") — a data-quality
+    # issue on their end, not a parsing bug. A relative link in a Discord
+    # embed is broken (nothing to resolve it against on the reader's
+    # side), so only trust offer.url when it is actually absolute;
+    # page_url (what was just fetched) always is.
+    url = offer_url if isinstance(offer_url, str) and offer_url.startswith("http") else page_url
+
     return ConnectorProduct(
         external_id=external_id,
         name=name.strip(),
@@ -245,7 +254,7 @@ def _build_connector_product(
         currency=currency.strip().upper(),
         available=available,
         seller=merchant_name,
-        url=offer.get("url") if isinstance(offer.get("url"), str) else page_url,
+        url=url,
         ean=_first_gtin(product_data),
         mpn=mpn,
     )

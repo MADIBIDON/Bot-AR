@@ -230,3 +230,109 @@ def test_missing_set_code_on_one_side_is_not_a_conflict() -> None:
     match = classify_candidate(product, candidate)
 
     assert match.verdict != "no_match"
+
+
+# --- Phase 28: the 30th Anniversary drop's own near-identical siblings --
+# ("Nymphali-ex" / "Amphinobi-ex" ETBs share the exact same product type,
+# language, and most descriptive words as the plain 30th Anniversary ETB
+# and each other — the Pokemon name is the ONLY thing that differs. None
+# of these carry a classic ME04-style set code, so the auto-link path
+# that requires one never fires; the real protection here is exact-name
+# non-identity (step 5) plus, whenever a real EAN is known, EAN mismatch
+# (step 1) — tested both ways below.
+
+
+def test_etb_30e_does_not_match_nymphali_ex_30e_by_name_alone() -> None:
+    product = _product(name="Pokemon Coffret Dresseur d'Elite 30eme Anniversaire", ean=None)
+    candidate = _candidate(name="Pokemon Coffret 30eme Anniversaire Nymphali-ex", ean=None)
+
+    match = classify_candidate(product, candidate)
+
+    assert match.verdict != "auto_link"
+
+
+def test_etb_30e_does_not_match_amphinobi_ex_30e_by_name_alone() -> None:
+    product = _product(name="Pokemon Coffret Dresseur d'Elite 30eme Anniversaire", ean=None)
+    candidate = _candidate(name="Pokemon Coffret 30eme Anniversaire Amphinobi-ex", ean=None)
+
+    match = classify_candidate(product, candidate)
+
+    assert match.verdict != "auto_link"
+
+
+def test_nymphali_ex_does_not_match_amphinobi_ex() -> None:
+    product = _product(name="Pokemon Coffret 30eme Anniversaire Nymphali-ex", ean=None)
+    candidate = _candidate(name="Pokemon Coffret 30eme Anniversaire Amphinobi-ex", ean=None)
+
+    match = classify_candidate(product, candidate)
+
+    assert match.verdict != "auto_link"
+
+
+def test_nymphali_ex_hard_rejected_when_real_eans_disagree() -> None:
+    product = _product(name="Pokemon Coffret 30eme Anniversaire Nymphali-ex", ean="1111111111111")
+    candidate = _candidate(
+        name="Pokemon Coffret 30eme Anniversaire Amphinobi-ex", ean="2222222222222"
+    )
+
+    match = classify_candidate(product, candidate)
+
+    assert match.verdict == "no_match"
+
+
+def test_etb_30e_hard_rejected_against_nymphali_ex_when_eans_disagree() -> None:
+    product = _product(
+        name="Pokemon Coffret Dresseur d'Elite 30eme Anniversaire", ean="3333333333333"
+    )
+    candidate = _candidate(
+        name="Pokemon Coffret 30eme Anniversaire Nymphali-ex", ean="4444444444444"
+    )
+
+    match = classify_candidate(product, candidate)
+
+    assert match.verdict == "no_match"
+
+
+# --- Phase 28: "Collection Illustration Premiers Partenaires" series ----
+# Same collection name, only the series number differs — must never be
+# confused with each other by name alone, and must hard-reject on a
+# known EAN mismatch.
+
+
+def test_series_3_does_not_match_series_2_by_name_alone() -> None:
+    product = _product(
+        name="Pokemon Collection Illustration Premiers Partenaires Serie 3", ean=None
+    )
+    candidate = _candidate(
+        name="Pokemon Collection Illustration Premiers Partenaires Serie 2", ean=None
+    )
+
+    match = classify_candidate(product, candidate)
+
+    assert match.verdict != "auto_link"
+
+
+def test_series_3_does_not_match_series_1_by_name_alone() -> None:
+    product = _product(
+        name="Pokemon Collection Illustration Premiers Partenaires Serie 3", ean=None
+    )
+    candidate = _candidate(
+        name="Pokemon Collection Illustration Premiers Partenaires Serie 1", ean=None
+    )
+
+    match = classify_candidate(product, candidate)
+
+    assert match.verdict != "auto_link"
+
+
+def test_series_3_hard_rejected_against_series_2_when_eans_disagree() -> None:
+    product = _product(
+        name="Pokemon Collection Illustration Premiers Partenaires Serie 3", ean="5555555555555"
+    )
+    candidate = _candidate(
+        name="Pokemon Collection Illustration Premiers Partenaires Serie 2", ean="6666666666666"
+    )
+
+    match = classify_candidate(product, candidate)
+
+    assert match.verdict == "no_match"
