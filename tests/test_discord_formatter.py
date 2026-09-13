@@ -3,8 +3,10 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from decimal import Decimal
 
+from engine.alerting import AlertTier, OpportunityIntelligence
 from engine.change_detection import EventType, MonitoringEvent
 from engine.opportunity import OpportunityConfig, evaluate_opportunity
+from engine.ranking import Priority
 from notifications.discord.formatter import format_event_embed
 from products.matcher import MatchResult
 from products.observation import ProductObservation
@@ -180,3 +182,76 @@ def test_embed_with_empty_resale_estimate_has_no_market_fields() -> None:
     )
 
     assert _field(embed, "Market source") is None
+
+
+def _evaluation(**overrides: object) -> OpportunityIntelligence:
+    defaults: dict[str, object] = dict(
+        alert_tier=AlertTier.HIGH,
+        reason_codes=("HIGH_ROI", "GOOD_NET_PROFIT"),
+        score=Decimal("78.50"),
+        priority=Priority.HIGH,
+        net_profit=Decimal("25"),
+        roi_pct=Decimal("33"),
+        net_margin_pct=Decimal("22"),
+        estimated_resale_price=Decimal("110"),
+        resale_confidence="high",
+        resale_price_source="manual",
+        match_confidence=95,
+        market_sample_size=None,
+        in_stock=True,
+    )
+    defaults.update(overrides)
+    return OpportunityIntelligence(**defaults)  # type: ignore[arg-type]
+
+
+def test_embed_shows_score_priority_and_reason_codes_for_a_real_opportunity() -> None:
+    embed = format_event_embed(
+        _event(EventType.STOCK_AVAILABLE), _observation(), _match(), evaluation=_evaluation()
+    )
+
+    assert _field(embed, "Score") == "78.50/100"
+    assert _field(embed, "Priority") == "HIGH"
+    assert _field(embed, "Resale price source") == "manual"
+    assert _field(embed, "Reason codes") == "HIGH_ROI, GOOD_NET_PROFIT"
+    assert _field(embed, "⚠️ Market Data") is None
+
+
+def test_embed_shows_market_data_missing_instead_of_a_bad_verdict() -> None:
+    evaluation = _evaluation(
+        alert_tier=AlertTier.NEEDS_MARKET_DATA,
+        reason_codes=("NEEDS_MARKET_DATA",),
+        net_profit=None,
+        roi_pct=None,
+        net_margin_pct=None,
+        estimated_resale_price=None,
+        resale_confidence=None,
+        resale_price_source=None,
+    )
+
+    embed = format_event_embed(
+        _event(EventType.STOCK_AVAILABLE), _observation(), _match(), evaluation=evaluation
+    )
+
+    assert "MARKET DATA MISSING" in _field(embed, "⚠️ Market Data")
+    assert _field(embed, "Score") is None
+    assert _field(embed, "Priority") is None
+
+
+def test_embed_without_evaluation_has_no_new_fields() -> None:
+    embed = format_event_embed(_event(EventType.STOCK_AVAILABLE), _observation(), _match())
+
+    assert _field(embed, "Score") is None
+    assert _field(embed, "Priority") is None
+    assert _field(embed, "Reason codes") is None
+    assert _field(embed, "⚠️ Market Data") is None
+
+
+def test_opportunity_score_improved_event_has_its_own_title() -> None:
+    embed = format_event_embed(
+        _event(EventType.OPPORTUNITY_SCORE_IMPROVED),
+        _observation(),
+        _match(),
+        evaluation=_evaluation(),
+    )
+
+    assert embed.title == "🚀 Opportunity Improved"

@@ -255,6 +255,19 @@ class WatchRule(Base):
     minimum_resale_confidence: Mapped[str | None] = mapped_column(default=None)
     estimated_resale_trusted: Mapped[bool] = mapped_column(default=False, nullable=False)
 
+    # Phase 31 — Opportunity Intelligence. last_alert_tier remembers the
+    # most recent engine.alerting.AlertTier this rule was notified (or
+    # explicitly not notified) at, so app/opportunity_alerts.py can detect
+    # a genuine upward crossing (e.g. WATCH -> HIGH) instead of re-alerting
+    # on every tick the score merely stays HIGH. scheduled_release_at is
+    # set only for a known scheduled-release product (e.g. the Nike SNKRS
+    # test case) — engine/worker.py's is_due() consults it, via
+    # engine/release_awareness.py, to check more frequently as a real,
+    # Nike-published release time approaches; both stay NULL (no behavior
+    # change at all) for every other WatchRule.
+    last_alert_tier: Mapped[str | None] = mapped_column(default=None)
+    scheduled_release_at: Mapped[datetime | None] = mapped_column(default=None)
+
     enabled: Mapped[bool] = mapped_column(default=True, nullable=False)
     check_interval: Mapped[int] = mapped_column(nullable=False)
     max_quantity: Mapped[int] = mapped_column(nullable=False)

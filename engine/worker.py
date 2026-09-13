@@ -44,6 +44,7 @@ from database import crud
 from database.time_utils import ensure_utc
 from engine.backoff import BackoffTracker
 from engine.monitoring import run_check, store_check_result
+from engine.release_awareness import dynamic_check_interval
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
@@ -89,15 +90,27 @@ def jitter_seconds(watch_rule_id: int, check_interval: int) -> float:
     return fraction * max_jitter
 
 
+def _base_check_interval(watch_rule: WatchRule, now: datetime) -> int:
+    """watch_rule.check_interval, unless the rule has a real,
+    source-published scheduled_release_at (Phase 31 section 12 — e.g. the
+    Nike SNKRS launch page's own commerceStartDate) close enough to shrink
+    it. Every rule without one (the overwhelming majority) is completely
+    unaffected — this is a pure passthrough in that case."""
+    if watch_rule.scheduled_release_at is None:
+        return watch_rule.check_interval
+    return dynamic_check_interval(
+        ensure_utc(watch_rule.scheduled_release_at), now, watch_rule.check_interval
+    )
+
+
 def is_due(watch_rule: WatchRule, last_observed_at: datetime | None, now: datetime) -> bool:
     """True if `check_interval` seconds (plus this rule's small jitter)
     have elapsed since the last observation — or if there has never been
     one (first run)."""
     if last_observed_at is None:
         return True
-    effective_interval = watch_rule.check_interval + jitter_seconds(
-        watch_rule.id, watch_rule.check_interval
-    )
+    base_interval = _base_check_interval(watch_rule, now)
+    effective_interval = base_interval + jitter_seconds(watch_rule.id, base_interval)
     elapsed = (now - last_observed_at).total_seconds()
     return elapsed >= effective_interval
 

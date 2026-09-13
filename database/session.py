@@ -164,6 +164,13 @@ _PROFITABILITY_THRESHOLD_COLUMNS = {
     "estimated_resale_trusted": "BOOLEAN NOT NULL DEFAULT 0",
 }
 
+# Phase 31 — Opportunity Intelligence. See WatchRule's own field comments
+# in database/models.py for what each column is for.
+_WATCH_RULE_ALERTING_COLUMNS = {
+    "last_alert_tier": "TEXT",
+    "scheduled_release_at": "DATETIME",
+}
+
 
 def create_all(engine: Engine) -> None:
     Base.metadata.create_all(engine)
@@ -172,6 +179,7 @@ def create_all(engine: Engine) -> None:
     _ensure_columns(engine, "products", _PRODUCT_OPPORTUNITY_COLUMNS)
     _ensure_columns(engine, "products", _PROFITABILITY_THRESHOLD_COLUMNS)
     _ensure_columns(engine, "watch_rules", _PROFITABILITY_THRESHOLD_COLUMNS)
+    _ensure_columns(engine, "watch_rules", _WATCH_RULE_ALERTING_COLUMNS)
 
 
 def get_session_factory(engine: Engine) -> sessionmaker[Session]:

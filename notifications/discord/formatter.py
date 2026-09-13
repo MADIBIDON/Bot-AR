@@ -13,9 +13,11 @@ from typing import TYPE_CHECKING
 
 import discord
 
+from engine.alerting import AlertTier
 from engine.change_detection import EventType
 
 if TYPE_CHECKING:
+    from engine.alerting import OpportunityIntelligence
     from engine.change_detection import MonitoringEvent
     from engine.opportunity import OpportunityResult, PurchaseRecommendation
     from market_data.estimator import Confidence, ResaleEstimate
@@ -37,6 +39,7 @@ _EVENT_TITLES: dict[EventType, str] = {
     EventType.PRICE_INCREASE: "📈 Price Increase",
     EventType.TARGET_PRICE_REACHED: "🎯 Target Price Reached",
     EventType.PRICE_CHANGED: "💱 Price Changed",
+    EventType.OPPORTUNITY_SCORE_IMPROVED: "🚀 Opportunity Improved",
 }
 
 _EVENT_COLORS: dict[EventType, discord.Color] = {
@@ -46,6 +49,15 @@ _EVENT_COLORS: dict[EventType, discord.Color] = {
     EventType.PRICE_INCREASE: discord.Color.orange(),
     EventType.TARGET_PRICE_REACHED: discord.Color.gold(),
     EventType.PRICE_CHANGED: discord.Color.blue(),
+    EventType.OPPORTUNITY_SCORE_IMPROVED: discord.Color.gold(),
+}
+
+_ALERT_TIER_LABELS: dict[AlertTier, str] = {
+    AlertTier.IGNORE: "IGNORE",
+    AlertTier.NEEDS_MARKET_DATA: "NEEDS MARKET DATA",
+    AlertTier.WATCH: "WATCH",
+    AlertTier.HIGH: "HIGH",
+    AlertTier.URGENT: "URGENT",
 }
 
 _PRICE_EVENTS_WITH_PREVIOUS = (
@@ -65,6 +77,7 @@ def format_event_embed(
     resale_confidence: Confidence | None = None,
     recommendation: PurchaseRecommendation | None = None,
     recommendation_reason: str | None = None,
+    evaluation: OpportunityIntelligence | None = None,
 ) -> discord.Embed:
     embed = discord.Embed(
         title=_EVENT_TITLES.get(event.event_type, str(event.event_type)),
@@ -115,7 +128,43 @@ def format_event_embed(
         embed.add_field(
             name="Market confidence", value=resale_estimate.confidence.value, inline=True
         )
+    if evaluation is not None:
+        _add_opportunity_intelligence_fields(embed, evaluation)
     return embed
+
+
+def _add_opportunity_intelligence_fields(
+    embed: discord.Embed, evaluation: OpportunityIntelligence
+) -> None:
+    """Phase 31: the opportunity-scoring layer on top of whatever
+    engine.opportunity/market_data fields format_event_embed already
+    added above — never duplicates them, only adds Score/Priority/Reason
+    codes, plus an explicit MARKET DATA MISSING callout for a real stock/
+    price event on a listing with no resale estimate at all (a genuine
+    restock is still worth knowing about even with nothing to judge
+    profitability by yet — see engine/alerting.py's module docstring)."""
+    if evaluation.alert_tier == AlertTier.NEEDS_MARKET_DATA:
+        embed.add_field(
+            name="⚠️ Market Data",
+            value=(
+                "MARKET DATA MISSING — a real stock/price event was detected, but no resale "
+                "estimate is configured yet. Still being monitored."
+            ),
+            inline=False,
+        )
+        return
+    embed.add_field(name="Score", value=f"{evaluation.score}/100", inline=True)
+    embed.add_field(
+        name="Priority",
+        value=_ALERT_TIER_LABELS.get(evaluation.alert_tier, evaluation.alert_tier.value),
+        inline=True,
+    )
+    if evaluation.resale_price_source is not None:
+        embed.add_field(
+            name="Resale price source", value=evaluation.resale_price_source, inline=True
+        )
+    if evaluation.reason_codes:
+        embed.add_field(name="Reason codes", value=", ".join(evaluation.reason_codes), inline=False)
 
 
 _PURCHASE_TITLE_COLORS: dict[str, discord.Color] = {

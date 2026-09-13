@@ -34,13 +34,6 @@ _RESALE_CONFIDENCE_SCORES: dict[str, Decimal] = {
     "medium": Decimal("60"),
     "low": Decimal("20"),
 }
-# A manual price (resale_confidence=None) carries no market-derived
-# confidence signal, but it is not "unknown" either — the user explicitly
-# vouches for it. Scoring it as full confidence keeps manual-mode
-# opportunities comparable to market-mode ones instead of being
-# systematically capped below them for lacking a signal they were never
-# meant to produce.
-_MANUAL_RESALE_CONFIDENCE_SCORE = Decimal("100")
 
 
 class Priority(StrEnum):
@@ -62,10 +55,17 @@ class OpportunityCandidate:
     unset, or market data unavailable) — that candidate is then
     excluded, not scored as if profit were zero.
 
-    resale_confidence is None specifically for a manually-supplied resale
-    price (WatchRule.resale_price_mode == "manual"), which carries no
-    market-derived confidence signal at all — see _score_candidate for how
-    that is scored (deliberately not the same as a "low" market estimate).
+    resale_confidence is None only when there is no resale price at all
+    (the candidate is then excluded before scoring ever runs). Whenever a
+    resale price exists — manual or market mode alike — this is always a
+    real "low"/"medium"/"high" value from app.resale.resolve_resale_confidence:
+    Phase 31 fix — manual mode used to leave this None and be scored as a
+    hardcoded 100 ("the user vouches for it"), which meant an untrusted,
+    never-verified manual guess scored identically to a well-sampled market
+    estimate. Manual mode now scores "high" only when the WatchRule was
+    explicitly marked estimated_resale_trusted, else "low" — the same rule
+    app/notify.py's Discord embed and the auto-buy gate already applied,
+    just not previously wired into ranking.
     """
 
     watch_rule_id: int
@@ -76,10 +76,14 @@ class OpportunityCandidate:
     net_profit: Decimal | None
     roi_pct: Decimal | None
     net_margin_pct: Decimal | None
-    resale_confidence: str | None  # "low" | "medium" | "high", or None for manual mode
+    resale_confidence: str | None  # "low" | "medium" | "high", or None if no resale price at all
     in_stock: bool
     match_confidence: int
     market_sample_size: int | None = None
+    # Phase 31: "manual" | a market_data source name (e.g. "ebay") | None
+    # when no resale price exists at all. Purely informational (Discord
+    # display, reason-code derivation) — never used in scoring itself.
+    resale_price_source: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,11 +224,7 @@ def _score_candidate(
         "roi": _normalized_score(candidate.roi_pct, config.roi_normalization_cap_pct),
         "profit": _normalized_score(candidate.net_profit, config.profit_normalization_cap),
         "margin": _normalized_score(candidate.net_margin_pct, config.margin_normalization_cap_pct),
-        "resale_confidence": (
-            _MANUAL_RESALE_CONFIDENCE_SCORE
-            if candidate.resale_confidence is None
-            else _RESALE_CONFIDENCE_SCORES.get(candidate.resale_confidence, _ZERO)
-        ),
+        "resale_confidence": _RESALE_CONFIDENCE_SCORES.get(candidate.resale_confidence, _ZERO),
         "match_confidence": _clamp(Decimal(candidate.match_confidence)),
         "sample_size": _sample_size_score(candidate.market_sample_size),
     }

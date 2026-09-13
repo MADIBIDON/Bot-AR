@@ -62,11 +62,13 @@ from typing import TYPE_CHECKING
 from app.delivery import process_due_deliveries
 from app.discovery import is_discovery_due, run_discovery_for_product
 from app.notify import compute_opportunity, notify_events_if_allowed
+from app.opportunity_alerts import maybe_notify_opportunity_shift
+from app.opportunity_snapshot import evaluate_opportunity_intelligence
 from app.resale import resolve_resale_confidence
 from connectors.defaults import domains_for_merchant
 from database import crud
 from engine.backoff import BackoffTracker
-from engine.decision import is_profitability_mode
+from engine.decision import effective_resale_price_mode, is_profitability_mode
 from engine.worker import run_monitoring_tick
 from local_stock.delivery import process_due_local_deliveries
 from local_stock.worker import run_local_stock_tick
@@ -77,6 +79,7 @@ if TYPE_CHECKING:
 
     from app.notify import EmbedSender
     from connectors.registry import ConnectorRegistry
+    from database.models import WatchRule
     from discovery.registry import DiscoveryRegistry
     from engine.monitoring import MonitoringResult
     from market_data.cache import TTLCache
@@ -141,6 +144,45 @@ def _local_stock_task_done(task: asyncio.Task[object]) -> None:
         logger.info("local stock check: %d (listing, store) pair(s) checked", task.result())
 
 
+async def _maybe_notify_opportunity_shift_safe(
+    session: Session,
+    watch_rule: WatchRule,
+    result: MonitoringResult,
+    notifier: EmbedSender,
+    market_registry: MarketDataRegistry | None,
+    market_cache: TTLCache | None,
+) -> None:
+    """Phase 31 section 7/11: on a tick with no stock/price event, check
+    whether the opportunity score alone crossed into HIGH/URGENT (see
+    app/opportunity_alerts.py). Scoped to resale_price_mode="manual" only
+    for now: market mode's resale lookup is real network I/O, and doing
+    it here would mean either blocking this tick's event loop on it (the
+    exact anti-pattern Phase 26 eliminated elsewhere) or building the same
+    "network in a thread, Session on the caller's own thread" split
+    local_stock/worker.py needed this session — deferred to Phase 32
+    rather than rushed. Manual mode's evaluation is pure, cheap, in-memory
+    arithmetic (no I/O at all), so it's always safe to run inline here.
+    Never allowed to raise into the tick loop — a bug in this optional,
+    additive path must never stop the next WatchRule's own monitoring."""
+    if effective_resale_price_mode(watch_rule) == "market":
+        return
+    try:
+        evaluation = evaluate_opportunity_intelligence(
+            session, watch_rule, market_registry, market_cache
+        )
+        await maybe_notify_opportunity_shift(
+            session,
+            watch_rule,
+            result.observation,
+            result.match_result,
+            evaluation,
+            notifier,
+            dispatch=_fire_and_forget,
+        )
+    except Exception:
+        logger.exception("opportunity-shift check failed watch_rule=%s", watch_rule.id)
+
+
 async def tick(
     session: Session,
     registry: ConnectorRegistry,
@@ -174,6 +216,9 @@ async def tick(
         if not (result.success and result.events):
             if result.success:
                 logger.info("rule=%s no event", watch_rule.id)
+                await _maybe_notify_opportunity_shift_safe(
+                    session, watch_rule, result, notifier, market_registry, market_cache
+                )
             continue
 
         for event in result.events:

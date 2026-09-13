@@ -38,6 +38,16 @@ class EventType(StrEnum):
     PRICE_DROP = "price_drop"
     PRICE_INCREASE = "price_increase"
     TARGET_PRICE_REACHED = "target_price_reached"
+    # Phase 31: not produced by detect_changes() below — this fires from
+    # app/opportunity_alerts.py when a WatchRule's opportunity score
+    # crosses into HIGH/URGENT alert-tier territory on a tick where
+    # nothing else changed (no stock/price transition), most relevant for
+    # resale_price_mode="market" rules whose resale estimate can drift
+    # tick to tick with no change on the retailer side at all. Kept here,
+    # not in a separate enum, so it shares EventRecord's dedup machinery
+    # and the durable NotificationDelivery pipeline (Phase 27) like every
+    # other event type.
+    OPPORTUNITY_SCORE_IMPROVED = "opportunity_score_improved"
 
 
 @dataclass(frozen=True, slots=True)

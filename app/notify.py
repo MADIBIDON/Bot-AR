@@ -46,8 +46,10 @@ from typing import TYPE_CHECKING, Protocol
 
 from app.delivery import attempt_delivery, create_pending_delivery
 from app.resale import resolve_resale_confidence, resolve_resale_price_for_opportunity
+from engine.alerting import build_opportunity_intelligence
 from engine.decision import (
     DecisionResult,
+    effective_market_source,
     effective_minimum_resale_confidence,
     effective_resale_price_mode,
     evaluate,
@@ -58,6 +60,7 @@ from engine.opportunity import (
     evaluate_opportunity,
     recommend_purchase,
 )
+from engine.ranking import OpportunityCandidate, RankingConfig, rank_opportunities
 from notifications.discord.formatter import format_event_embed
 
 if TYPE_CHECKING:
@@ -65,6 +68,7 @@ if TYPE_CHECKING:
     from sqlalchemy.orm import Session
 
     from database.models import WatchRule
+    from engine.alerting import OpportunityIntelligence
     from engine.change_detection import MonitoringEvent
     from engine.opportunity import PurchaseRecommendation
     from market_data.cache import TTLCache
@@ -167,6 +171,56 @@ async def compute_opportunity(
     return _compute_opportunity_sync(watch_rule, purchase_price, market_registry, cache)
 
 
+def _build_evaluation(
+    watch_rule: WatchRule,
+    observation: ProductObservation,
+    match_result: MatchResult,
+    opportunity: OpportunityResult | None,
+    resale_confidence: Confidence | None,
+    resale_estimate: ResaleEstimate | None,
+) -> OpportunityIntelligence:
+    """Phase 31: builds the OpportunityCandidate straight from data this
+    function's caller already computed (opportunity/resale_confidence/
+    resale_estimate) — deliberately NOT calling
+    app/opportunity_snapshot.py's build_opportunity_candidate() again,
+    which would re-fetch ObservationRecords and re-run match_product()
+    from the database; this module already has the equivalent, freshly-
+    computed values in hand and must not redo that work (or need a
+    Session, which this function doesn't always have) just to reshape
+    them. rank_opportunities() itself is still the single, unduplicated
+    scoring path — only the candidate assembly is inlined here."""
+    resale_price_source: str | None = None
+    if opportunity is not None:
+        resale_price_source = (
+            (effective_market_source(watch_rule) or "unknown")
+            if effective_resale_price_mode(watch_rule) == "market"
+            else "manual"
+        )
+    candidate = OpportunityCandidate(
+        watch_rule_id=watch_rule.id,
+        merchant=observation.merchant,
+        # observation.name (this check's own observed name), not
+        # watch_rule.product.name: this function only ever has data the
+        # caller already fetched in hand, never a reason to touch the
+        # product relationship (which some lightweight orchestration
+        # tests construct a bare WatchRule without loading at all).
+        product_name=observation.name,
+        purchase_price=observation.price,
+        estimated_resale_price=opportunity.estimated_resale_price if opportunity else None,
+        net_profit=opportunity.net_profit if opportunity else None,
+        roi_pct=opportunity.roi_pct if opportunity else None,
+        net_margin_pct=opportunity.net_margin_pct if opportunity else None,
+        resale_confidence=resale_confidence.value if resale_confidence else None,
+        in_stock=observation.available,
+        match_confidence=match_result.confidence,
+        market_sample_size=resale_estimate.sample_size if resale_estimate else None,
+        resale_price_source=resale_price_source,
+    )
+    ranking_config = RankingConfig()
+    ranked = rank_opportunities([candidate], ranking_config)[0]
+    return build_opportunity_intelligence(candidate, ranked, ranking_config)
+
+
 async def notify_events_if_allowed(
     watch_rule: WatchRule,
     observation: ProductObservation,
@@ -229,6 +283,9 @@ async def notify_events_if_allowed(
             recommendation, recommendation_reason = recommend_purchase(
                 opportunity, resale_confidence, effective_minimum_resale_confidence(watch_rule)
             )
+        evaluation = _build_evaluation(
+            watch_rule, observation, match_result, opportunity, resale_confidence, resale_estimate
+        )
         for event in events:
             embed = format_event_embed(
                 event,
@@ -239,6 +296,7 @@ async def notify_events_if_allowed(
                 resale_confidence=resale_confidence,
                 recommendation=recommendation,
                 recommendation_reason=recommendation_reason,
+                evaluation=evaluation,
             )
             if session is not None and event.record_id is not None:
                 delivery = create_pending_delivery(session, event_id=event.record_id, embed=embed)

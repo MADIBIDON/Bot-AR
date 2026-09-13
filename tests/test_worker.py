@@ -92,10 +92,39 @@ def test_not_due_when_interval_not_elapsed() -> None:
     assert is_due(_dummy_rule(check_interval=3600), last, now) is False
 
 
-def _dummy_rule(check_interval: int):
+def _dummy_rule(check_interval: int, scheduled_release_at=None):
     from database.models import WatchRule
 
-    return WatchRule(id=1, product_id=1, check_interval=check_interval, max_quantity=1)
+    return WatchRule(
+        id=1,
+        product_id=1,
+        check_interval=check_interval,
+        max_quantity=1,
+        scheduled_release_at=scheduled_release_at,
+    )
+
+
+def test_is_due_scheduled_release_speeds_up_checks_near_the_drop() -> None:
+    """Phase 31 section 12: a rule with a real scheduled_release_at checks
+    faster than its own base check_interval as the release approaches —
+    but never faster than engine.worker.MIN_CHECK_INTERVAL_SECONDS."""
+    release_at = datetime(2026, 9, 15, 7, 0, 0, tzinfo=UTC)
+    rule = _dummy_rule(check_interval=300, scheduled_release_at=release_at)
+
+    now = release_at - timedelta(seconds=30)
+    last_observed = now - timedelta(seconds=35)
+    # 35s elapsed < base 300s interval -> would NOT be due without release
+    # awareness, but T-30s is inside the high-frequency window (30s floor).
+    assert is_due(rule, last_observed, now) is True
+
+
+def test_is_due_unaffected_when_no_scheduled_release() -> None:
+    """A rule with scheduled_release_at=None (every existing WatchRule)
+    behaves byte-identical to before this phase."""
+    rule = _dummy_rule(check_interval=300)
+    now = datetime.now(UTC)
+    last_observed = now - timedelta(seconds=35)
+    assert is_due(rule, last_observed, now) is False
 
 
 def test_rule_not_due_is_skipped(session: Session) -> None:
@@ -241,6 +270,93 @@ def test_event_with_rejected_decision_sends_no_notification(session: Session) ->
     asyncio.run(tick(session, registry, notifier, now=t0 + timedelta(seconds=2)))
 
     assert notifier.sent_embeds == []
+
+
+def test_opportunity_score_improved_notifies_without_stock_or_price_change(
+    session: Session,
+) -> None:
+    """Phase 31: editing a rule's manual resale config between two ticks
+    (no stock/price change at all — a real scenario, e.g. a human raising
+    estimated_resale_price after spotting a hot resale market) must still
+    surface as a Discord alert once the score crosses into HIGH/URGENT —
+    section 7/11's "score crossed an important threshold" trigger."""
+    _, _, _, rule = _setup_rule(session, external_id="fake-123", check_interval=1)
+    connector = FakeStoreConnector(products={"fake-123": _fake_product(price=20.0)})
+    registry = ConnectorRegistry()
+    registry.register("RetailerA", connector)
+    notifier = FakeNotifier()
+
+    t0 = datetime.now(UTC)
+    asyncio.run(tick(session, registry, notifier, now=t0))  # baseline, no opportunity configured
+    assert notifier.sent_embeds == []
+
+    crud.update_watch_rule(
+        session,
+        rule.id,
+        estimated_resale_price=Decimal("200"),
+        estimated_resale_trusted=True,
+    )
+    # Same price, same stock -> zero MonitoringEvents this tick, yet the
+    # opportunity score just became excellent.
+    asyncio.run(tick(session, registry, notifier, now=t0 + timedelta(seconds=2)))
+
+    assert len(notifier.sent_embeds) == 1
+    refreshed = crud.get_watch_rule(session, rule.id)
+    assert refreshed.last_alert_tier in ("high", "urgent")
+
+    # A third, unchanged tick must not re-notify for the same tier.
+    asyncio.run(tick(session, registry, notifier, now=t0 + timedelta(seconds=4)))
+    assert len(notifier.sent_embeds) == 1
+
+
+def test_opportunity_shift_bug_never_blocks_other_rules_monitoring(
+    session: Session, monkeypatch
+) -> None:
+    """Phase 31 section 15: a genuine bug in the new, optional opportunity-
+    shift path (here: evaluate_opportunity_intelligence raising) must never
+    stop the rest of tick()'s for-loop — a *later* WatchRule in the same
+    tick with a real stock event still gets checked and still notified.
+    The "quiet" rule is created first (and so processed first, same insert
+    order tick() iterates in) specifically so its exception has a chance
+    to propagate past it if the try/except around it were ever removed."""
+    merchant = crud.create_merchant(session, "RetailerA")
+    _setup_rule(session, merchant=merchant, external_id="quiet-1", check_interval=1)
+    _setup_rule(
+        session,
+        merchant=merchant,
+        external_id="restocks-1",
+        check_interval=1,
+    )
+    registry = ConnectorRegistry()
+    registry.register(
+        "RetailerA",
+        FakeStoreConnector(
+            products={
+                "quiet-1": _fake_product(url="https://a.example/p/quiet-1"),
+                "restocks-1": _fake_product(
+                    url="https://a.example/p/restocks-1", price=16.99, available=False
+                ),
+            }
+        ),
+    )
+    notifier = FakeNotifier()
+
+    import app.worker as worker_module
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(worker_module, "evaluate_opportunity_intelligence", _boom)
+
+    t0 = datetime.now(UTC)
+    asyncio.run(tick(session, registry, notifier, now=t0))  # baseline for both
+
+    connector = registry.get("RetailerA")
+    connector.update_product("restocks-1", available=True)  # real restock event, unrelated rule
+    results = asyncio.run(tick(session, registry, notifier, now=t0 + timedelta(seconds=2)))
+
+    assert all(r.success for r in results)
+    assert len(notifier.sent_embeds) == 1  # the real restock still notified normally
 
 
 def test_connector_error_produces_no_notification(session: Session) -> None:
