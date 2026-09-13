@@ -257,10 +257,19 @@ async def tick(
 
 
 def _start_local_stock_check_if_due(session: Session, *, now: datetime | None = None) -> None:
-    """Fires one local-stock check pass as a background thread (see
-    local_stock/worker.py — it's synchronous, real network I/O) at most
+    """Fires one local-stock check pass as a background task at most
     once every LOCAL_STOCK_INTERVAL_SECONDS, and never two overlapping
-    passes at once (same single-flight guard as discovery)."""
+    passes at once (same single-flight guard as discovery).
+
+    P0 fix (2026-09-13): run_local_stock_tick() is awaited directly here
+    (never wrapped in asyncio.to_thread itself) — it only offloads its
+    own real network calls to a thread internally, one at a time, and
+    does every DB read/write back on this coroutine's own thread. The
+    previous version ran the *entire* function, DB writes included, on a
+    separate thread than the rest of the app's shared SQLAlchemy
+    Session — confirmed live to crash both this check and a concurrent
+    discovery task with `sqlalchemy.exc.ResourceClosedError`. See
+    local_stock/worker.py's module docstring."""
     global _local_stock_in_flight, _last_local_stock_check_at
     if _local_stock_in_flight:
         return
@@ -272,7 +281,7 @@ def _start_local_stock_check_if_due(session: Session, *, now: datetime | None = 
         return
     _local_stock_in_flight = True
     _last_local_stock_check_at = now
-    task = asyncio.ensure_future(asyncio.to_thread(run_local_stock_tick, session, now=now))
+    task = asyncio.ensure_future(run_local_stock_tick(session, now=now))
     _background_tasks.add(task)
     task.add_done_callback(_local_stock_task_done)
 
