@@ -24,6 +24,10 @@ crawl of that size on a periodic discovery cycle would be exactly the
 scope it to a smaller, relevant slice without more research than this
 session had time for. A real, documented gap, not a guessed-and-skipped
 one — see connectors/defaults.py's module docstring.
+
+Phase 30: Boulanger's product sitemap (15 files x ~20k URLs, general
+electronics — not toy-specialist) was checked and rejected for the same
+"grosse charge" reason as Cultura/E.Leclerc.
 """
 
 from __future__ import annotations

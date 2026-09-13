@@ -20,6 +20,28 @@ Micromania were investigated and are UNSUPPORTED entirely: each returned
 a confirmed bot-protection block (Akamai, DataDome, Imperva/Incapsula, or
 Cloudflare) on a plain, honest HTTP GET to a real product page — never
 attempted to bypass, per this project's standing rule.
+
+Phase 30 (real-world canary coverage, 2026-09-13): Boulanger was audited
+fresh and is genuinely reachable — a plain HTTP GET to a real product
+page (`/ref/<id>`) returns real schema.org Product JSON-LD (price, gtin13,
+availability), same shape GenericSchemaOrgConnector already handles for
+Cultura/E.Leclerc — so it's onboarded the same way, ONLINE_STOCK+PRICE
+only. Its own product sitemap (15 files x ~20k URLs, general electronics
+merchandise) was NOT wired into discovery for the same "grosse charge"
+reason as Cultura/E.Leclerc (see discovery/defaults.py). Its store pages
+carry no structured LocalBusiness/geo data reachable within this
+session's budget, so LOCAL_STORE_SEARCH/LOCAL_STOCK stay unimplemented —
+a real, documented gap, not guessed-and-skipped. Fnac, King Jouet,
+Smyths Toys, Carrefour, and Micromania were re-checked today and remain
+blocked by the exact same vendors as Phase 28 (Akamai/DataDome/
+Imperva/Cloudflare), confirmed again on both their product pages and
+robots.txt/sitemap. Smyths' own robots.txt happens to be served from a
+separate, un-blocked CDN (no product data there, just a sitemap index of
+UK/DE/other-locale catalogs — no fr-fr product sitemap listed — so this
+changes nothing about its UNSUPPORTED status). Amazon France was
+investigated for a public, key-free surface (no PA-API credentials
+requested/used) and stays ALERT_ONLY/UNSUPPORTED — see this module's
+UNSUPPORTED_RETAILERS entry for the exact reasoning.
 """
 
 from __future__ import annotations
@@ -30,6 +52,7 @@ from dataclasses import dataclass, field
 from connectors.base import BaseConnector
 from connectors.fake_store import FakeStoreConnector
 from connectors.generic_schema_org import GenericSchemaOrgConnector
+from connectors.nike_launch import NikeLaunchConnector
 from connectors.registry import ConnectorRegistry
 from connectors.shopify import ShopifyConnector
 from connectors.woocommerce import WooCommerceConnector
@@ -133,6 +156,34 @@ MERCHANTS: tuple[MerchantDefinition, ...] = (
         ),
         full_path_external_id=True,
         capabilities=_FULL_RBS_PLATFORM_CAPABILITIES,
+    ),
+    # --- Phase 30: Boulanger, audited fresh this session — see module
+    # docstring. ---
+    MerchantDefinition(
+        name="Boulanger",
+        domains=("boulanger.com", "www.boulanger.com"),
+        build_connector=lambda: GenericSchemaOrgConnector(
+            shop_domain="www.boulanger.com", merchant_name="Boulanger"
+        ),
+        full_path_external_id=True,
+        capabilities=_ONLINE_ONLY_CAPABILITIES,
+    ),
+    # --- Phase 30: a single, hardcoded scheduled-release test case — see
+    # connectors/nike_launch.py. Deliberately NOT domain-detectable
+    # (domains=()): this connector answers for exactly one launch page,
+    # never a generic Nike product URL, so scripts/watch.py's URL-based
+    # auto-detection must never route an arbitrary nike.com link here. ---
+    MerchantDefinition(
+        name="Nike SNKRS",
+        domains=(),
+        build_connector=lambda: NikeLaunchConnector(
+            launch_url=(
+                "https://www.nike.com/fr/launch/t/nike-sb-air-force-1-yuto-light-bone-and-iron-grey"
+            ),
+            style_color="IO8439-100",
+            product_name="Nike SB Air Force 1 x Yuto 'Light Bone and Iron Grey'",
+        ),
+        capabilities=_ONLINE_ONLY_CAPABILITIES,
     ),
 )
 
