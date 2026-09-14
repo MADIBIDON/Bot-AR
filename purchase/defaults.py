@@ -61,11 +61,24 @@ def _persistent_client(timeout: float) -> httpx.Client:
     worker startup, see app/main_worker.py) and reused for the whole
     process lifetime — extends to the purchase side the same pattern
     connectors/schema_org.py already established for monitoring (Phase
-    23). Avoids paying a fresh TCP+TLS handshake (~90ms+ measured, Phase
-    33) on every single revalidate()/checkout() network call. Safe to
-    share across the worker's threads (httpx.Client's connection pool is
-    thread-safe — same justification as connectors/schema_org.py)."""
-    return httpx.Client(timeout=timeout)
+    23). Avoids paying a fresh TCP+TLS handshake (~90-150ms measured,
+    Phase 33/34) on every single revalidate()/checkout() network call.
+    Safe to share across the worker's threads (httpx.Client's connection
+    pool is thread-safe — same justification as connectors/schema_org.py).
+
+    keepalive_expiry=120 (httpx's own default is 5s) so a connection
+    survives between two checks of the same merchant during a
+    high-frequency release window (engine/release_awareness.py's
+    fast/high-frequency intervals are 30-60s) — an honest, partial
+    answer to "TLS already established": it helps once real polling
+    activity is already flowing through this same client, not a
+    standalone keep-alive ping run ahead of an otherwise-idle drop
+    (not built this session — a still-cold first call after a long idle
+    stretch pays the full handshake cost, which this project's own
+    100ms target explicitly scopes to the WARM case only)."""
+    return httpx.Client(
+        timeout=timeout, limits=httpx.Limits(max_keepalive_connections=5, keepalive_expiry=120.0)
+    )
 
 
 def build_default_purchase_registry() -> PurchaseConnectorRegistry:
