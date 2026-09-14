@@ -233,6 +233,9 @@ async def main() -> None:
         print(f"Running {N_RUNS} FULL attempt_purchase() integration runs...")
         light_ms: list[float] = []
         precise_ms: list[float] = []
+        identity_ms: list[float] = []
+        claim_ms: list[float] = []
+        decision_ms: list[float] = []
         for rule in rules:
             observation = ProductObservation(
                 merchant="BenchMerchant",
@@ -260,6 +263,9 @@ async def main() -> None:
             trace = outcome.trace
             light_ms.append(trace.t0_to_dispatch_ms)
             precise_ms.append((dispatch_box[0] - trace.stock_received_ns) / 1_000_000)
+            identity_ms.append(trace.t0_to_identity_ms)
+            claim_ms.append(trace.t0_to_claim_ms)
+            decision_ms.append(trace.t0_to_decision_ms)
 
         stop_event.set()
         await background_task
@@ -267,6 +273,9 @@ async def main() -> None:
         client.close()
 
     print("\n=== FULL PRODUCTION ORCHESTRATION: T0 -> checkout dispatch ===")
+    _report("T0 -> identity_validated", identity_ms)
+    _report("T0 -> claim_acquired", claim_ms)
+    _report("T0 -> decision_completed", decision_ms)
     _report("light (production instrumentation)", light_ms)
     _report("precise (transport-hooked ground truth)", precise_ms)
     p95 = _percentile(precise_ms, 0.95)
