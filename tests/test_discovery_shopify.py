@@ -122,6 +122,29 @@ def test_merchant_without_ucp_raises_unavailable(monkeypatch: pytest.MonkeyPatch
         source.search("ETB Chaos Ascendant")
 
 
+def test_network_error_during_profile_discovery_raises_discovery_error_not_crash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 33 fix: a real, live, recurring failure — httpcore.ReadError
+    ("Connection reset by peer") fetching the .well-known/ucp profile —
+    used to raise the base ucp.client.UCPError, uncaught here, which fell
+    through to app/discovery.py's catch-all and got logged as an alarming
+    "crashed" ERROR instead of the same routine WARNING a search_catalog
+    network blip already gets (see test_tool_call_failure_raises_discovery_error
+    below). Must now raise DiscoveryError, not propagate as UCPError."""
+
+    def fake_request(method: str, url: str, **kwargs: object) -> httpx.Response:
+        raise httpx.ReadError("[Errno 54] Connection reset by peer")
+
+    monkeypatch.setattr(httpx, "request", fake_request)
+    source = ShopifyUCPDiscoverySource(
+        shop_domain="kairyu.fr", merchant_name="Kairyu", agent_profile_url=PROFILE_URL
+    )
+
+    with pytest.raises(DiscoveryError):
+        source.search("ETB Chaos Ascendant")
+
+
 def test_tool_call_failure_raises_discovery_error(monkeypatch: pytest.MonkeyPatch) -> None:
     error_body = {
         "jsonrpc": "2.0",

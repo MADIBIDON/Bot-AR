@@ -814,7 +814,9 @@ def cmd_purchase_test(args: argparse.Namespace) -> int:
     policy = load_purchase_policy()
     intent = build_purchase_intent(rule, result.observation, result.match_result)
     total_cost = intent.observed_price * intent.quantity
-    has_active, since_last, spent_today = build_decision_context(session, intent)
+    has_active, since_last, spent_today, blocking_for_product = build_decision_context(
+        session, intent
+    )
     merchant_domains = domains_for_merchant(intent.merchant)
 
     decision = evaluate_purchase_intent(
@@ -828,6 +830,7 @@ def cmd_purchase_test(args: argparse.Namespace) -> int:
         has_active_attempt=has_active,
         seconds_since_last_attempt=since_last,
         spent_today=spent_today,
+        blocking_attempts_for_product=blocking_for_product,
     )
 
     print("DRY RUN")

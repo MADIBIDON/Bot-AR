@@ -5,7 +5,7 @@ Every function takes an explicit Session — no global/implicit session state.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
@@ -104,11 +104,24 @@ def list_products(session: Session, *, status: str | None = None) -> list[Produc
     return list(session.scalars(stmt))
 
 
+def _with_resale_stamp(fields: dict[str, object]) -> dict[str, object]:
+    """Phase 33 section 21: whenever a caller sets estimated_resale_price
+    without also explicitly stamping resale_updated_at itself (tests
+    backdating one on purpose still work), auto-stamp it here — the one
+    place update_product/update_watch_rule both go through, so a manual
+    resale price can never silently go stale-and-unmarked no matter which
+    of the many call sites (CLI edit/edit-product, this session's own
+    one-off scripts, a future importer) set it."""
+    if "estimated_resale_price" in fields and "resale_updated_at" not in fields:
+        fields = {**fields, "resale_updated_at": datetime.now(UTC)}
+    return fields
+
+
 def update_product(session: Session, product_id: int, **fields: object) -> Product | None:
     product = session.get(Product, product_id)
     if product is None:
         return None
-    for key, value in fields.items():
+    for key, value in _with_resale_stamp(fields).items():
         if not hasattr(product, key):
             raise AttributeError(f"Product has no field {key!r}")
         setattr(product, key, value)
@@ -235,7 +248,7 @@ def update_watch_rule(session: Session, watch_rule_id: int, **fields: object) ->
         new_product_id = fields.get("product_id", rule.product_id)
         new_listing_id = fields.get("listing_id", rule.listing_id)
         _validate_listing_belongs_to_product(session, new_product_id, new_listing_id)
-    for key, value in fields.items():
+    for key, value in _with_resale_stamp(fields).items():
         if not hasattr(rule, key):
             raise AttributeError(f"WatchRule has no field {key!r}")
         setattr(rule, key, value)
@@ -547,6 +560,42 @@ def get_active_purchase_attempt_for_listing(
     return session.scalars(stmt).first()
 
 
+def list_active_purchase_attempts(session: Session) -> list[PurchaseAttempt]:
+    """Phase 33 section 24: every PurchaseAttempt still in an ACTIVE
+    status, across every listing/product — used at worker startup to
+    reconcile ones orphaned by a crash/restart mid-checkout (see
+    purchase/engine.py::reconcile_orphaned_purchase_attempts). A real,
+    live process can only ever leave a row here if it died between
+    marking it CREATED/VALIDATING/CHECKOUT_STARTED and reaching a
+    terminal status — this table has never had a real row created at all
+    yet (PURCHASES_ENABLED has stayed false this whole project), so today
+    this always returns an empty list; the reconciliation exists so that
+    stays true even after a real attempt starts happening."""
+    stmt = select(PurchaseAttempt).where(PurchaseAttempt.status.in_(_ACTIVE_PURCHASE_STATUS_VALUES))
+    return list(session.scalars(stmt))
+
+
+_BLOCKING_PURCHASE_STATUS_VALUES = (*_ACTIVE_PURCHASE_STATUS_VALUES, "purchased")
+
+
+def get_blocking_purchase_attempts_for_product(
+    session: Session, product_id: int
+) -> list[PurchaseAttempt]:
+    """Phase 33: the product-wide idempotency check — is there already an
+    in-flight OR already-successful attempt for *any* Listing of this
+    Product (any merchant)? Complements
+    get_active_purchase_attempt_for_listing (still checked too, for the
+    per-listing cooldown/retry semantics) — see purchase/engine.py and
+    database/models.py::PurchaseAttempt for why the per-listing guard
+    alone isn't enough once the same product is watched on several
+    retailers at once."""
+    stmt = select(PurchaseAttempt).where(
+        PurchaseAttempt.product_id == product_id,
+        PurchaseAttempt.status.in_(_BLOCKING_PURCHASE_STATUS_VALUES),
+    )
+    return list(session.scalars(stmt))
+
+
 def get_most_recent_purchase_attempt_for_listing(
     session: Session, listing_id: int
 ) -> PurchaseAttempt | None:
@@ -564,6 +613,7 @@ def create_purchase_attempt(
     *,
     watch_rule_id: int,
     listing_id: int,
+    product_id: int,
     status: str,
     observed_price: Decimal,
     max_price_allowed: Decimal,
@@ -572,6 +622,7 @@ def create_purchase_attempt(
     attempt = PurchaseAttempt(
         watch_rule_id=watch_rule_id,
         listing_id=listing_id,
+        product_id=product_id,
         status=status,
         observed_price=observed_price,
         max_price_allowed=max_price_allowed,

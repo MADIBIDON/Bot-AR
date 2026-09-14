@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from database import crud
 
 
-def _seed_rule(session: Session) -> tuple[int, int]:
+def _seed_rule(session: Session) -> tuple[int, int, int]:
     product = crud.create_product(session, "ETB Chaos Ascendant FR")
     merchant = crud.create_merchant(session, "Kairyu")
     listing = crud.create_listing(
@@ -26,22 +26,23 @@ def _seed_rule(session: Session) -> tuple[int, int]:
         max_quantity=1,
         max_price=Decimal("60"),
     )
-    return rule.id, listing.id
+    return rule.id, listing.id, product.id
 
 
 def test_no_active_attempt_by_default(session: Session) -> None:
-    _rule_id, listing_id = _seed_rule(session)
+    _rule_id, listing_id, _product_id = _seed_rule(session)
 
     assert crud.get_active_purchase_attempt_for_listing(session, listing_id) is None
 
 
 def test_active_attempt_found_for_in_flight_statuses(session: Session) -> None:
-    rule_id, listing_id = _seed_rule(session)
+    rule_id, listing_id, product_id = _seed_rule(session)
     for status in ("created", "validating", "checkout_started"):
         crud.create_purchase_attempt(
             session,
             watch_rule_id=rule_id,
             listing_id=listing_id,
+            product_id=product_id,
             status=status,
             observed_price=Decimal("59.90"),
             max_price_allowed=Decimal("60"),
@@ -56,12 +57,13 @@ def test_active_attempt_found_for_in_flight_statuses(session: Session) -> None:
 
 
 def test_terminal_statuses_are_not_active(session: Session) -> None:
-    rule_id, listing_id = _seed_rule(session)
+    rule_id, listing_id, product_id = _seed_rule(session)
     for status in ("purchased", "failed", "human_action_required", "cancelled"):
         crud.create_purchase_attempt(
             session,
             watch_rule_id=rule_id,
             listing_id=listing_id,
+            product_id=product_id,
             status=status,
             observed_price=Decimal("59.90"),
             max_price_allowed=Decimal("60"),
@@ -71,11 +73,12 @@ def test_terminal_statuses_are_not_active(session: Session) -> None:
 
 
 def test_update_purchase_attempt_unknown_field_raises(session: Session) -> None:
-    rule_id, listing_id = _seed_rule(session)
+    rule_id, listing_id, product_id = _seed_rule(session)
     attempt = crud.create_purchase_attempt(
         session,
         watch_rule_id=rule_id,
         listing_id=listing_id,
+        product_id=product_id,
         status="created",
         observed_price=Decimal("59.90"),
         max_price_allowed=Decimal("60"),
@@ -95,11 +98,12 @@ def test_update_missing_attempt_returns_none(session: Session) -> None:
 
 
 def test_sum_purchased_total_only_counts_purchased_status(session: Session) -> None:
-    rule_id, listing_id = _seed_rule(session)
+    rule_id, listing_id, product_id = _seed_rule(session)
     crud.create_purchase_attempt(
         session,
         watch_rule_id=rule_id,
         listing_id=listing_id,
+        product_id=product_id,
         status="failed",
         observed_price=Decimal("59.90"),
         max_price_allowed=Decimal("60"),
@@ -109,6 +113,7 @@ def test_sum_purchased_total_only_counts_purchased_status(session: Session) -> N
         session,
         watch_rule_id=rule_id,
         listing_id=listing_id,
+        product_id=product_id,
         status="created",
         observed_price=Decimal("59.90"),
         max_price_allowed=Decimal("60"),
@@ -125,11 +130,12 @@ def test_sum_purchased_total_only_counts_purchased_status(session: Session) -> N
 
 
 def test_sum_purchased_total_excludes_old_attempts(session: Session) -> None:
-    rule_id, listing_id = _seed_rule(session)
+    rule_id, listing_id, product_id = _seed_rule(session)
     attempt = crud.create_purchase_attempt(
         session,
         watch_rule_id=rule_id,
         listing_id=listing_id,
+        product_id=product_id,
         status="purchased",
         observed_price=Decimal("59.90"),
         max_price_allowed=Decimal("60"),
@@ -150,12 +156,13 @@ def test_sum_purchased_total_with_no_attempts_is_zero(session: Session) -> None:
 
 
 def test_list_purchase_attempts_respects_limit(session: Session) -> None:
-    rule_id, listing_id = _seed_rule(session)
+    rule_id, listing_id, product_id = _seed_rule(session)
     for _ in range(3):
         crud.create_purchase_attempt(
             session,
             watch_rule_id=rule_id,
             listing_id=listing_id,
+            product_id=product_id,
             status="failed",
             observed_price=Decimal("59.90"),
             max_price_allowed=Decimal("60"),

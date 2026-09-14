@@ -386,6 +386,7 @@ def test_duplicate_active_attempt_is_refused_not_double_purchased(session: Sessi
         session,
         watch_rule_id=rule_id,
         listing_id=listing_id,
+        product_id=rule.product_id,
         status="checkout_started",
         observed_price=Decimal("59.90"),
         max_price_allowed=Decimal("60"),
@@ -420,6 +421,7 @@ def test_cooldown_blocks_second_attempt_after_recent_one(session: Session) -> No
         session,
         watch_rule_id=rule_id,
         listing_id=listing_id,
+        product_id=rule.product_id,
         status="failed",
         observed_price=Decimal("59.90"),
         max_price_allowed=Decimal("60"),
@@ -630,3 +632,184 @@ def test_kill_switch_blocks_strong_buy_in_stock_high_profit_opportunity(
     assert connector.checkout_calls == 0
     assert crud.list_purchase_attempts(session) == []
     assert notifier.sent_embeds == []
+
+
+def test_kill_switch_turned_off_mid_attempt_still_aborts_before_checkout(
+    session: Session,
+) -> None:
+    """Phase 33 hardening: the top-of-function policy passed in says
+    enabled=True (so this attempt gets past every earlier gate, all the
+    way through a successful revalidate()) — but policy_provider (what
+    app/worker.py wires to purchase.config.load_purchase_policy in
+    production) reports the switch is now off by the time checkout would
+    start. Must abort with zero calls to checkout() — "vérifié juste
+    avant tout chemin transactionnel dangereux, pas seulement au
+    démarrage."."""
+    rule_id, _ = _seed_rule(session)
+    rule = crud.get_watch_rule(session, rule_id)
+    connector = FakeConnector()
+    notifier = FakeNotifier()
+
+    def _policy_flipped_off() -> PurchasePolicy:
+        return _policy(enabled=False)
+
+    outcome = asyncio.run(
+        attempt_purchase(
+            session,
+            rule,
+            _observation(),
+            _match(),
+            _policy(enabled=True),
+            _registry(connector),
+            ("kairyu.fr",),
+            notifier,
+            policy_provider=_policy_flipped_off,
+        )
+    )
+
+    assert outcome.status == PurchaseStatus.CANCELLED
+    assert "PURCHASES_ENABLED" in outcome.reason
+    assert connector.revalidate_calls == 1  # got this far
+    assert connector.checkout_calls == 0  # but never actually checked out
+    purchased = [a for a in crud.list_purchase_attempts(session) if a.status == "purchased"]
+    assert purchased == []
+
+
+def test_stale_resale_estimate_blocks_purchase(session: Session) -> None:
+    """Phase 33 section 21: a manual resale price set 2 days ago, with
+    PURCHASE_MAX_RESALE_AGE_SECONDS set to 1 hour, must be rejected as
+    stale — never trusted forever just because it once looked good."""
+    from datetime import UTC, datetime, timedelta
+
+    from market_data.estimator import Confidence
+
+    rule_id, _ = _seed_rule(session, max_price="1000")
+    crud.update_watch_rule(
+        session,
+        rule_id,
+        max_price=None,
+        minimum_net_profit=Decimal("20"),
+        estimated_resale_price=Decimal("120"),
+        estimated_resale_trusted=True,
+    )
+    # Back-date the stamp update_watch_rule just auto-set, simulating a
+    # resale estimate that was fresh once but is now genuinely old.
+    crud.update_watch_rule(
+        session, rule_id, resale_updated_at=datetime.now(UTC) - timedelta(days=2)
+    )
+    rule = crud.get_watch_rule(session, rule_id)
+    connector = FakeConnector(
+        revalidate_result=RevalidationResult(
+            available=True,
+            price=Decimal("55.99"),
+            shipping_cost=Decimal("4.00"),
+            quantity_available=None,
+        )
+    )
+    notifier = FakeNotifier()
+    opportunity = _profitability_opportunity(rule, resale_price="120", item_price="55.99")
+
+    outcome = asyncio.run(
+        attempt_purchase(
+            session,
+            rule,
+            _observation(price="55.99"),
+            _match(),
+            _policy(max_resale_age_seconds=3600),  # 1 hour
+            _registry(connector),
+            ("kairyu.fr",),
+            notifier,
+            opportunity=opportunity,
+            resale_confidence=Confidence.HIGH,
+        )
+    )
+
+    assert outcome.status == PurchaseStatus.CANCELLED
+    assert "STALE_MARKET_DATA" in outcome.reason
+    assert connector.revalidate_calls == 0
+    assert connector.checkout_calls == 0
+
+
+def test_fresh_resale_estimate_is_not_blocked_by_staleness_policy(session: Session) -> None:
+    """Same setup, but the resale estimate was just set — must proceed
+    normally even with a strict max_resale_age_seconds configured."""
+    from market_data.estimator import Confidence
+
+    rule_id, _ = _seed_rule(session, max_price="1000")
+    crud.update_watch_rule(
+        session,
+        rule_id,
+        max_price=None,
+        minimum_net_profit=Decimal("20"),
+        estimated_resale_price=Decimal("120"),
+        estimated_resale_trusted=True,
+    )
+    rule = crud.get_watch_rule(session, rule_id)
+    assert rule.resale_updated_at is not None  # auto-stamped just now
+    connector = FakeConnector(
+        revalidate_result=RevalidationResult(
+            available=True,
+            price=Decimal("55.99"),
+            shipping_cost=Decimal("4.00"),
+            quantity_available=None,
+        )
+    )
+    notifier = FakeNotifier()
+    opportunity = _profitability_opportunity(rule, resale_price="120", item_price="55.99")
+
+    outcome = asyncio.run(
+        attempt_purchase(
+            session,
+            rule,
+            _observation(price="55.99"),
+            _match(),
+            _policy(max_resale_age_seconds=3600),
+            _registry(connector),
+            ("kairyu.fr",),
+            notifier,
+            opportunity=opportunity,
+            resale_confidence=Confidence.HIGH,
+        )
+    )
+
+    assert outcome.status == PurchaseStatus.PURCHASED
+
+
+def test_reconcile_orphaned_purchase_attempts_marks_them_failed(session: Session) -> None:
+    """Phase 33 section 24: a PurchaseAttempt stuck in checkout_started
+    (simulating a worker that died mid-attempt) must be marked failed at
+    startup, not left blocking every future attempt at that product
+    forever."""
+    from purchase.engine import reconcile_orphaned_purchase_attempts
+
+    rule_id, listing_id = _seed_rule(session)
+    rule = crud.get_watch_rule(session, rule_id)
+    stuck = crud.create_purchase_attempt(
+        session,
+        watch_rule_id=rule_id,
+        listing_id=listing_id,
+        product_id=rule.product_id,
+        status="checkout_started",
+        observed_price=Decimal("59.90"),
+        max_price_allowed=Decimal("60"),
+        quantity=1,
+    )
+
+    reconciled_count = reconcile_orphaned_purchase_attempts(session)
+
+    assert reconciled_count == 1
+    refreshed = crud.list_purchase_attempts(session)[0]
+    assert refreshed.id == stuck.id
+    assert refreshed.status == "failed"
+    assert "orphaned" in refreshed.failure_reason.lower()
+    # The product is now free for a fresh attempt.
+    assert crud.get_active_purchase_attempt_for_listing(session, listing_id) is None
+    assert crud.get_blocking_purchase_attempts_for_product(session, rule.product_id) == []
+
+
+def test_reconcile_is_a_no_op_when_nothing_is_stuck(session: Session) -> None:
+    from purchase.engine import reconcile_orphaned_purchase_attempts
+
+    _seed_rule(session)
+
+    assert reconcile_orphaned_purchase_attempts(session) == 0

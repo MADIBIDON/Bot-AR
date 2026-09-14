@@ -55,8 +55,15 @@ _CHALLENGE_MARKERS = ("cf-browser-verification", "cf-challenge", "captcha", "che
 
 def _extract_slug(url: str) -> str:
     """Fuji Store product URLs look like
-    https://fuji-store.fr/produit/<slug>/ — see connectors/woocommerce.py."""
-    return url.rstrip("/").rsplit("/", 1)[-1]
+    https://fuji-store.fr/produit/<slug>/ — see connectors/woocommerce.py.
+
+    Phase 33: strips any query string/fragment before extracting the slug
+    — defensive, same fix as purchase/merchants/shopify_ucp.py's
+    _extract_handle() (a real bug there, confirmed live against every
+    Kairyu/RelicTCG listing this session — Fuji Store URLs haven't been
+    observed with one, but there is no reason to leave the same footgun
+    here)."""
+    return url.split("?", 1)[0].split("#", 1)[0].rstrip("/").rsplit("/", 1)[-1]
 
 
 class FujiStorePurchaseConnector(PurchaseConnector):

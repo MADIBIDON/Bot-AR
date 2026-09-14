@@ -43,6 +43,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from datetime import datetime
     from decimal import Decimal
 
     from database.models import WatchRule
@@ -136,6 +137,12 @@ def effective_estimated_resale_trusted(watch_rule: WatchRule) -> bool:
     if watch_rule.estimated_resale_trusted:
         return True
     return bool(watch_rule.product is not None and watch_rule.product.estimated_resale_trusted)
+
+
+def effective_resale_updated_at(watch_rule: WatchRule) -> datetime | None:
+    """Phase 33 section 21 — see database/models.py's WatchRule/Product
+    resale_updated_at comments and purchase/engine.py's staleness gate."""
+    return _effective(watch_rule.resale_updated_at, watch_rule, "resale_updated_at")
 
 
 def is_profitability_mode(watch_rule: WatchRule) -> bool:

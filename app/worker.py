@@ -72,6 +72,7 @@ from engine.decision import effective_resale_price_mode, is_profitability_mode
 from engine.worker import run_monitoring_tick
 from local_stock.delivery import process_due_local_deliveries
 from local_stock.worker import run_local_stock_tick
+from purchase.config import load_purchase_policy
 from purchase.engine import attempt_purchase
 
 if TYPE_CHECKING:
@@ -275,6 +276,14 @@ async def tick(
                         notifier,
                         opportunity=opportunity,
                         resale_confidence=resale_confidence,
+                        # Phase 33: purchase_policy above is read once at
+                        # worker startup (see app/main_worker.py) and never
+                        # again for this process's whole lifetime — without
+                        # this, flipping PURCHASES_ENABLED off in .env
+                        # would have zero effect until a full restart.
+                        # load_purchase_policy re-reads .env fresh right
+                        # before the actual checkout call.
+                        policy_provider=load_purchase_policy,
                     )
                 )
         else:

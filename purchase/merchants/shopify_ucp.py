@@ -74,8 +74,18 @@ _TAX_TOTAL_TYPE = "tax"
 
 def _extract_handle(url: str) -> str:
     """Shopify product URLs look like
-    https://<shop>/products/<handle> — see connectors/shopify.py."""
-    return url.rstrip("/").rsplit("/", 1)[-1]
+    https://<shop>/products/<handle> — see connectors/shopify.py.
+
+    Phase 33 P0 fix (found live, this session): a URL with a preselected
+    variant (https://<shop>/products/<handle>?variant=<id> — exactly what
+    discovery/shopify_ucp.py's own real, live candidates carry, and every
+    Kairyu/RelicTCG Listing this project discovered this session has one)
+    used to have the whole "?variant=..." query string swallowed into the
+    handle, which then could never match a real catalog handle — every
+    revalidate() call for any of those real, valid listings failed with a
+    false StaleListingError. The query string (and any URL fragment) is
+    stripped before splitting on "/" now."""
+    return url.split("?", 1)[0].split("#", 1)[0].rstrip("/").rsplit("/", 1)[-1]
 
 
 def _minor_to_decimal(amount: int) -> Decimal:

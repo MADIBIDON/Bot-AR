@@ -94,6 +94,12 @@ class Product(Base):
     minimum_roi_pct: Mapped[Decimal | None] = mapped_column(Numeric(6, 2), default=None)
     minimum_resale_confidence: Mapped[str | None] = mapped_column(default=None)
     estimated_resale_trusted: Mapped[bool] = mapped_column(default=False, nullable=False)
+    # Phase 33 section 21: when estimated_resale_price was last actually
+    # set — see database/crud.py::update_product's auto-stamping and
+    # purchase/engine.py's STALE_MARKET_DATA gate. None for market mode
+    # (freshness there is a `market_data` concern, not this field's) or
+    # for a Product that has never had a manual resale price configured.
+    resale_updated_at: Mapped[datetime | None] = mapped_column(default=None)
 
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
@@ -254,6 +260,8 @@ class WatchRule(Base):
     minimum_roi_pct: Mapped[Decimal | None] = mapped_column(Numeric(6, 2), default=None)
     minimum_resale_confidence: Mapped[str | None] = mapped_column(default=None)
     estimated_resale_trusted: Mapped[bool] = mapped_column(default=False, nullable=False)
+    # Phase 33 section 21 — see Product.resale_updated_at's own comment.
+    resale_updated_at: Mapped[datetime | None] = mapped_column(default=None)
 
     # Phase 31 — Opportunity Intelligence. last_alert_tier remembers the
     # most recent engine.alerting.AlertTier this rule was notified (or
@@ -441,6 +449,21 @@ class PurchaseAttempt(Base):
     safe because app/pidfile.py already guarantees a single worker
     process, so nothing else can interleave on the same event loop
     between the check and the write.
+
+    Phase 33 audit finding (real, confirmed gap — fixed here): the guard
+    above is scoped to one *listing*, not one *product*. The same product
+    is routinely watched on several Listings across different merchants
+    (this project's whole multi-retailer point) — two of them detecting
+    stock 20ms apart each pass their own listing-scoped check cleanly and
+    would both be free to buy, a genuine double-purchase risk the spec
+    explicitly calls out. product_id (denormalized from watch_rule.
+    product_id at insert time — see purchase/engine.py) plus
+    uq_one_active_or_purchased_attempt_per_product below closes that at
+    the database level: at most one row per product_id may ever be in an
+    active or purchased state at once, across every listing. This is a
+    real backstop (SQLite enforces it, not just Python reasoning) on top
+    of the same "no await between check and insert" argument, now applied
+    product-wide (see purchase/engine.py's product-level count check).
     """
 
     __tablename__ = "purchase_attempts"
@@ -456,11 +479,20 @@ class PurchaseAttempt(Base):
         CheckConstraint(
             "max_price_allowed > 0", name="ck_purchase_attempt_max_price_allowed_positive"
         ),
+        Index(
+            "uq_one_active_or_purchased_attempt_per_product",
+            "product_id",
+            unique=True,
+            sqlite_where=text(
+                "status IN ('created', 'validating', 'checkout_started', 'purchased')"
+            ),
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     watch_rule_id: Mapped[int] = mapped_column(ForeignKey("watch_rules.id"), nullable=False)
     listing_id: Mapped[int] = mapped_column(ForeignKey("listings.id"), nullable=False)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), nullable=False)
 
     status: Mapped[str] = mapped_column(nullable=False)
 

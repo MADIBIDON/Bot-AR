@@ -162,6 +162,7 @@ _PROFITABILITY_THRESHOLD_COLUMNS = {
     "minimum_roi_pct": "NUMERIC(6, 2)",
     "minimum_resale_confidence": "TEXT",
     "estimated_resale_trusted": "BOOLEAN NOT NULL DEFAULT 0",
+    "resale_updated_at": "DATETIME",  # Phase 33 section 21
 }
 
 # Phase 31 — Opportunity Intelligence. See WatchRule's own field comments
@@ -170,6 +171,28 @@ _WATCH_RULE_ALERTING_COLUMNS = {
     "last_alert_tier": "TEXT",
     "scheduled_release_at": "DATETIME",
 }
+
+# Phase 33 — cross-listing purchase idempotency. See PurchaseAttempt's own
+# docstring in database/models.py for why this closes a real gap (one
+# active/purchased attempt per *product*, not just per listing).
+_PURCHASE_ATTEMPT_PRODUCT_COLUMN = {"product_id": "INTEGER NOT NULL DEFAULT 0"}
+_PURCHASE_ATTEMPT_PRODUCT_INDEX_SQL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_one_active_or_purchased_attempt_per_product "
+    "ON purchase_attempts(product_id) "
+    "WHERE status IN ('created', 'validating', 'checkout_started', 'purchased')"
+)
+
+
+def _ensure_purchase_attempt_product_index(engine: Engine) -> None:
+    """Idempotent: CREATE UNIQUE INDEX IF NOT EXISTS is a no-op on a
+    database that already has it (every fresh database, via
+    Base.metadata.create_all; every restart after this phase first ran
+    the migration below)."""
+    if not str(engine.url).startswith("sqlite"):
+        return
+    with engine.connect() as conn:
+        conn.exec_driver_sql(_PURCHASE_ATTEMPT_PRODUCT_INDEX_SQL)
+        conn.commit()
 
 
 def create_all(engine: Engine) -> None:
@@ -180,6 +203,8 @@ def create_all(engine: Engine) -> None:
     _ensure_columns(engine, "products", _PROFITABILITY_THRESHOLD_COLUMNS)
     _ensure_columns(engine, "watch_rules", _PROFITABILITY_THRESHOLD_COLUMNS)
     _ensure_columns(engine, "watch_rules", _WATCH_RULE_ALERTING_COLUMNS)
+    _ensure_columns(engine, "purchase_attempts", _PURCHASE_ATTEMPT_PRODUCT_COLUMN)
+    _ensure_purchase_attempt_product_index(engine)
 
 
 def get_session_factory(engine: Engine) -> sessionmaker[Session]:

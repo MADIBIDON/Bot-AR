@@ -56,10 +56,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING
+
+from sqlalchemy.exc import IntegrityError
 
 from database import crud
 from database.time_utils import ensure_utc
@@ -67,6 +70,7 @@ from engine.decision import (
     MIN_FINANCIAL_MATCH_CONFIDENCE,
     effective_max_price,
     effective_minimum_resale_confidence,
+    effective_resale_updated_at,
     is_profitability_mode,
 )
 from engine.opportunity import (
@@ -146,6 +150,8 @@ def evaluate_purchase_intent(
     spent_today: Decimal,
     opportunity: OpportunityResult | None = None,
     resale_confidence: Confidence | None = None,
+    blocking_attempts_for_product: int = 0,
+    now: datetime | None = None,
 ) -> PurchaseDecision:
     """Every check fails closed: any missing or ambiguous signal refuses
     the purchase. Order matches the spec (Phase 19, item 16), checked
@@ -157,7 +163,16 @@ def evaluate_purchase_intent(
     Product level); every other watch keeps the original price-only gate
     exactly as before. Both default to None so existing callers/tests
     that never pass them are unaffected as long as they aren't in
-    profitability mode."""
+    profitability mode.
+
+    blocking_attempts_for_product (Phase 33): count of active-or-purchased
+    PurchaseAttempt rows across *every* Listing of this same Product (not
+    just this one) — see database/models.py::PurchaseAttempt and
+    database/crud.py::get_blocking_purchase_attempts_for_product. Defaults
+    to 0 (existing callers/tests unaffected) but every real caller
+    (attempt_purchase below) always passes the real count: the same
+    product briefly in stock at several retailers at once must never
+    result in more than one purchase."""
 
     def _reject(reason: str) -> PurchaseDecision:
         return PurchaseDecision(
@@ -193,6 +208,18 @@ def evaluate_purchase_intent(
         return _reject(f"Total cost {total_cost} exceeds this watch rule's max_price {max_price}.")
 
     if profitability_mode:
+        resale_updated_at = effective_resale_updated_at(watch_rule)
+        if (
+            policy.max_resale_age_seconds is not None
+            and resale_updated_at is not None
+            and (now or datetime.now(UTC)) - ensure_utc(resale_updated_at)
+            > timedelta(seconds=policy.max_resale_age_seconds)
+        ):
+            return _reject(
+                f"STALE_MARKET_DATA: resale estimate last updated "
+                f"{ensure_utc(resale_updated_at).isoformat()}, older than "
+                f"PURCHASE_MAX_RESALE_AGE_SECONDS={policy.max_resale_age_seconds}s."
+            )
         recommendation, recommendation_reason = recommend_purchase(
             opportunity,
             resale_confidence or Confidence.LOW,
@@ -220,6 +247,13 @@ def evaluate_purchase_intent(
     if has_active_attempt:
         return _reject(
             f"An active purchase attempt already exists for listing {intent.listing_id}."
+        )
+
+    if blocking_attempts_for_product > 0:
+        return _reject(
+            f"Product {intent.product_id} already has an active or completed purchase "
+            f"attempt on another listing — max one successful purchase per product, "
+            f"enforced across all retailers."
         )
 
     if (
@@ -253,15 +287,21 @@ def _spent_today(session: Session, now: datetime) -> Decimal:
 
 def build_decision_context(
     session: Session, intent: PurchaseIntent, *, now: datetime | None = None
-) -> tuple[bool, float | None, Decimal]:
+) -> tuple[bool, float | None, Decimal, int]:
     """Everything evaluate_purchase_intent() needs that only the DB can
-    answer — read-only, safe to call from a dry run too."""
+    answer — read-only, safe to call from a dry run too. The 4th element
+    (Phase 33) is the product-wide blocking-attempt count — see
+    evaluate_purchase_intent's docstring and
+    database/crud.py::get_blocking_purchase_attempts_for_product."""
     now = now or datetime.now(UTC)
     active_attempt = crud.get_active_purchase_attempt_for_listing(session, intent.listing_id)
     has_active = active_attempt is not None
     since_last = _seconds_since_last_attempt(session, intent.listing_id, now)
     spent_today = _spent_today(session, now)
-    return has_active, since_last, spent_today
+    blocking_for_product = len(
+        crud.get_blocking_purchase_attempts_for_product(session, intent.product_id)
+    )
+    return has_active, since_last, spent_today, blocking_for_product
 
 
 @dataclass(frozen=True, slots=True)
@@ -288,10 +328,22 @@ async def attempt_purchase(
     now: datetime | None = None,
     opportunity: OpportunityResult | None = None,
     resale_confidence: Confidence | None = None,
+    policy_provider: Callable[[], PurchasePolicy] | None = None,
 ) -> PurchaseOutcome:
     """Real attempt only — never call this for a dry run. Safe to run as
     a background asyncio task: any exception here is caught and reported
     (never propagated), and it never touches other WatchRules' state.
+
+    policy_provider (Phase 33): when given, called fresh immediately
+    before checkout to re-read the kill switch — `policy` above is only a
+    snapshot from the top of this call, and real network I/O
+    (revalidate(), possibly several seconds against a slow merchant)
+    happens in between. Defaults to None (reuse `policy` unchanged,
+    exactly the old behavior) so every test/caller that constructs a
+    PurchasePolicy test double directly — never via real environment
+    variables — is unaffected; app/worker.py (the real caller) passes
+    purchase.config.load_purchase_policy so production genuinely re-reads
+    .env, not a stale in-memory snapshot.
 
     opportunity/resale_confidence (Phase 25) come pre-computed from the
     caller (app/worker.py already computes them for the alert embed via
@@ -304,7 +356,9 @@ async def attempt_purchase(
     intent = build_purchase_intent(watch_rule, observation, match_result, now=now)
     total_cost = intent.observed_price * intent.quantity
     max_price = effective_max_price(watch_rule)
-    has_active, since_last, spent_today = build_decision_context(session, intent, now=now)
+    has_active, since_last, spent_today, blocking_for_product = build_decision_context(
+        session, intent, now=now
+    )
 
     decision = evaluate_purchase_intent(
         watch_rule=watch_rule,
@@ -319,6 +373,8 @@ async def attempt_purchase(
         spent_today=spent_today,
         opportunity=opportunity,
         resale_confidence=resale_confidence,
+        blocking_attempts_for_product=blocking_for_product,
+        now=now,
     )
     if not decision.proceed:
         logger.info("watch_rule=%s purchase skipped: %s", watch_rule.id, decision.reason)
@@ -332,22 +388,54 @@ async def attempt_purchase(
         intent.quantity,
     )
 
-    # Row created immediately after the has_active_attempt check above,
-    # with no `await` in between either here or inside evaluate_purchase_
-    # intent() (pure, no I/O) — the idempotency lock for this listing.
-    attempt = crud.create_purchase_attempt(
-        session,
-        watch_rule_id=watch_rule.id,
-        listing_id=watch_rule.listing_id,
-        status=PurchaseStatus.CREATED.value,
-        observed_price=intent.observed_price,
-        # max_price_allowed is NOT NULL and CHECK > 0; None (profitability
-        # mode with no hard_max_total set — Phase 25) has no fixed ceiling
-        # to record, so this uses intent's own value, which
-        # build_purchase_intent() already resolved the same way.
-        max_price_allowed=intent.max_price_allowed,
-        quantity=intent.quantity,
-    )
+    # Row created immediately after the has_active_attempt/blocking-for-
+    # product checks above, with no `await` in between either here or
+    # inside evaluate_purchase_intent() (pure, no I/O) — the idempotency
+    # lock, now enforced both per-listing and product-wide (Phase 33).
+    # uq_one_active_or_purchased_attempt_per_product (database/models.py)
+    # is a real DB-level backstop for this same invariant — see the
+    # IntegrityError handling a few lines below.
+    try:
+        attempt = crud.create_purchase_attempt(
+            session,
+            watch_rule_id=watch_rule.id,
+            listing_id=watch_rule.listing_id,
+            product_id=intent.product_id,
+            status=PurchaseStatus.CREATED.value,
+            observed_price=intent.observed_price,
+            # max_price_allowed is NOT NULL and CHECK > 0; None
+            # (profitability mode with no hard_max_total set — Phase 25)
+            # has no fixed ceiling to record, so this uses intent's own
+            # value, which build_purchase_intent() already resolved the
+            # same way.
+            max_price_allowed=intent.max_price_allowed,
+            quantity=intent.quantity,
+        )
+    except IntegrityError:
+        # Defense-in-depth only — see uq_one_active_or_purchased_attempt_
+        # per_product's own comment in database/models.py. The Python-
+        # level blocking_attempts_for_product check above is expected to
+        # catch every real case (no `await` between that check and this
+        # insert, in this project's single-event-loop architecture); this
+        # branch existing at all means that reasoning was somehow wrong,
+        # which is exactly why the constraint is a real DB index and not
+        # just a comment. Roll back so this session's own transaction
+        # isn't left in a failed state, then report a clean rejection —
+        # never an unhandled exception out of a purchase attempt.
+        session.rollback()
+        logger.warning(
+            "watch_rule=%s purchase attempt insert blocked by the database-level "
+            "one-per-product constraint — another listing won the race",
+            watch_rule.id,
+        )
+        return PurchaseOutcome(
+            status=PurchaseStatus.CANCELLED,
+            reason=(
+                f"Product {intent.product_id} already claimed by another listing's purchase "
+                "attempt (database-level constraint)."
+            ),
+            intent=intent,
+        )
 
     try:
         connector = connector_registry.get(intent.merchant)
@@ -455,6 +543,25 @@ async def attempt_purchase(
                 f"Profitability check failed on the revalidated total {revalidated_total}: "
                 f"{revalidated_reason}",
             )
+
+    # Phase 33 hardening: re-read the kill switch fresh, immediately
+    # before the one genuinely transactional step in this whole function.
+    # `policy` above is a snapshot from the top of this call — real
+    # network I/O (revalidate(), possibly several seconds against a slow
+    # merchant) happened since then. Checked here, not only at the top:
+    # "juste avant tout chemin transactionnel dangereux, pas seulement au
+    # démarrage." See policy_provider's own docstring above for why this
+    # doesn't just call load_purchase_policy() directly.
+    fresh_policy = policy_provider() if policy_provider is not None else policy
+    if not fresh_policy.enabled:
+        return await _finish(
+            session,
+            notifier,
+            attempt.id,
+            intent,
+            PurchaseStatus.CANCELLED,
+            "PURCHASES_ENABLED was turned off during this attempt — aborting before checkout.",
+        )
 
     crud.update_purchase_attempt(session, attempt.id, status=PurchaseStatus.CHECKOUT_STARTED.value)
     await _notify_purchase(notifier, "PURCHASE STARTED", intent, reason="Checkout in progress.")
@@ -567,3 +674,39 @@ async def _notify_purchase(
         await notifier.send_embed(embed)
     except Exception:  # noqa: BLE001 - a Discord failure must never crash a purchase attempt
         pass
+
+
+def reconcile_orphaned_purchase_attempts(session: Session, *, now: datetime | None = None) -> int:
+    """Phase 33 section 24 ("worker restart during checkout preparation"):
+    a PurchaseAttempt left in CREATED/VALIDATING/CHECKOUT_STARTED means
+    the process died mid-attempt — we genuinely don't know whether a real
+    checkout got submitted on the merchant's side or not, so the only
+    safe move is to mark it FAILED (never PURCHASED, never silently
+    retried) and let a fresh check re-evaluate the product from scratch.
+    Without this, get_active_purchase_attempt_for_listing/
+    get_blocking_purchase_attempts_for_product would treat that orphaned
+    row as still "in flight" forever, permanently blocking every future
+    attempt at that product across every retailer — a real, if not yet
+    triggered, gap (PURCHASES_ENABLED has stayed false this whole
+    project, so no real PurchaseAttempt row has ever existed to orphan).
+    Call once, at worker startup, before the first tick. Returns how many
+    rows were reconciled (0 on every normal, clean-shutdown startup)."""
+    now = now or datetime.now(UTC)
+    orphaned = crud.list_active_purchase_attempts(session)
+    for attempt in orphaned:
+        crud.update_purchase_attempt(
+            session,
+            attempt.id,
+            status=PurchaseStatus.FAILED.value,
+            failure_reason=(
+                "Orphaned by a worker restart while this attempt was in progress "
+                f"(status was {attempt.status!r}) — outcome on the merchant's side is "
+                "unknown, never assumed successful, never auto-resumed."
+            ),
+        )
+        logger.warning(
+            "purchase_attempt=%s reconciled at startup: was %s, marked failed (orphaned)",
+            attempt.id,
+            attempt.status,
+        )
+    return len(orphaned)

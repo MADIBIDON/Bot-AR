@@ -146,6 +146,43 @@ def test_resolve_variant_and_create_checkout_success(monkeypatch: pytest.MonkeyP
     assert result.shipping_cost is None  # no PURCHASE_SHIPPING_POSTAL_CODE/CONTACT_EMAIL set
 
 
+def test_url_with_variant_query_string_still_resolves(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Phase 33 P0 fix: every real Kairyu/RelicTCG Listing this project
+    has ever discovered (discovery/shopify_ucp.py's own real candidates)
+    carries a "?variant=<id>" suffix on its URL — the handle extraction
+    used to swallow that whole query string into the handle, so it could
+    never match a real catalog handle, and every one of those real,
+    valid listings would have failed revalidate() with a false
+    StaleListingError."""
+    search = _rpc_result(
+        {
+            "products": [_product(_HANDLE, [_variant(_VARIANT_ID, 7490)])],
+            "pagination": {"has_next_page": False},
+            "messages": [],
+        }
+    )
+    checkout = _checkout_response(
+        totals=[
+            {"type": "subtotal", "amount": 7490, "display_text": "Subtotal"},
+            {"type": "total", "amount": 7490, "display_text": "Total"},
+        ]
+    )
+    monkeypatch.setattr(httpx, "request", _router(search_result=search, checkout_result=checkout))
+
+    connector = ShopifyUCPPurchaseConnector(shop_domain="kairyu.fr", agent_profile_url=PROFILE_URL)
+    intent = _intent(
+        url=(
+            "https://kairyu.fr/products/scelle-elite-trainer-box-me04-chaos-ascendant-fr"
+            "?variant=57591808033103"
+        )
+    )
+
+    result = connector.revalidate(intent)
+
+    assert result.available is True
+    assert result.price == Decimal("74.90")
+
+
 def test_shipping_and_tax_included_when_update_checkout_configured(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

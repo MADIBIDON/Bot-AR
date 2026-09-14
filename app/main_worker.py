@@ -42,6 +42,7 @@ from notifications.discord.client import DiscordNotifier
 from notifications.discord.config import load_discord_config
 from purchase.config import load_purchase_policy
 from purchase.defaults import build_default_purchase_registry
+from purchase.engine import reconcile_orphaned_purchase_attempts
 
 PID_FILE = Path("data") / "worker.pid"
 LOG_FILE = Path("logs") / "worker.log"
@@ -92,6 +93,16 @@ async def main() -> None:
     engine = get_engine()
     create_all(engine)
     session = get_session_factory(engine)()
+
+    # Phase 33 section 24: a PurchaseAttempt left CREATED/VALIDATING/
+    # CHECKOUT_STARTED means the previous process died mid-attempt — never
+    # assume it succeeded, never leave it silently blocking every future
+    # attempt at that product forever. Always 0 today (PURCHASES_ENABLED
+    # has stayed false this whole project, so no real attempt has ever
+    # existed to orphan) — this is what keeps that true after one does.
+    reconciled = reconcile_orphaned_purchase_attempts(session)
+    if reconciled:
+        logger.warning("reconciled %d orphaned purchase attempt(s) from a previous run", reconciled)
 
     registry = build_default_registry()
     market_registry = _build_market_registry()

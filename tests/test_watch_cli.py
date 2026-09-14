@@ -1199,6 +1199,7 @@ def test_purchases_lists_recorded_attempts(
         session,
         watch_rule_id=rule_id,
         listing_id=listing_id,
+        product_id=crud.get_watch_rule(session, rule_id).product_id,
         status="failed",
         observed_price=Decimal("59.90"),
         max_price_allowed=Decimal("60"),

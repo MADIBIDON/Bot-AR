@@ -24,6 +24,13 @@ class PurchasePolicy:
     max_daily_eur: Decimal | None
     allowed_merchant_domains: frozenset[str]
     cooldown_seconds: int
+    # Phase 33 section 21: None means "no limit" (every existing
+    # WatchRule/Product/test unaffected). When set, a profitability-mode
+    # purchase whose resale estimate is older than this many seconds is
+    # rejected as STALE_MARKET_DATA — see purchase/engine.py's
+    # evaluate_purchase_intent and database/models.py's WatchRule.
+    # resale_updated_at / Product.resale_updated_at.
+    max_resale_age_seconds: int | None = None
 
 
 def _read_env(name: str) -> str | None:
@@ -75,10 +82,26 @@ def _parse_cooldown_seconds() -> int:
     return value
 
 
+def _parse_max_resale_age_seconds() -> int | None:
+    raw = _read_env("PURCHASE_MAX_RESALE_AGE_SECONDS")
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"PURCHASE_MAX_RESALE_AGE_SECONDS must be a whole number of seconds, got {raw!r}"
+        ) from None
+    if value <= 0:
+        raise ValueError(f"PURCHASE_MAX_RESALE_AGE_SECONDS must be strictly positive, got {value}")
+    return value
+
+
 def load_purchase_policy() -> PurchasePolicy:
     enabled = (_read_env("PURCHASES_ENABLED") or "").lower() == "true"
     return PurchasePolicy(
         enabled=enabled,
+        max_resale_age_seconds=_parse_max_resale_age_seconds(),
         max_order_eur=_parse_decimal_env("PURCHASE_MAX_ORDER_EUR"),
         max_daily_eur=_parse_decimal_env("PURCHASE_MAX_DAILY_EUR"),
         allowed_merchant_domains=_parse_allowed_merchants(),

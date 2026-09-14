@@ -53,6 +53,18 @@ class ShopifyUCPDiscoverySource(RetailDiscoverySource):
             endpoint = discover(self._shop_domain, timeout=self._timeout).mcp_endpoint
         except UCPServiceUnavailableError as exc:
             raise DiscoveryUnavailableError(f"{self._merchant_name}: {exc}") from exc
+        except UCPError as exc:
+            # Phase 33 fix: a transient network/timeout failure fetching
+            # the UCP profile (found live — httpcore.ReadError, "Connection
+            # reset by peer", recurring every few hours) raises the base
+            # UCPError, not UCPServiceUnavailableError — left uncaught
+            # here, it fell through to app/discovery.py's catch-all
+            # `except Exception`, logged as an alarming "crashed" ERROR
+            # instead of the same routine WARNING a search_catalog network
+            # blip already gets below. Never crashed the worker or blocked
+            # other merchants (per-merchant isolation already worked) —
+            # this only fixes the log severity/classification.
+            raise DiscoveryError(f"{self._merchant_name}: {exc}") from exc
 
         try:
             result = call_tool(
