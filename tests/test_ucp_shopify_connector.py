@@ -589,3 +589,38 @@ def test_connector_uses_provided_client_for_discover_and_call_tool(
     # Second call must reuse the cached mcp_endpoint (no second discover).
     connector.revalidate(_intent())
     assert calls.count("https://kairyu.fr/.well-known/ucp") == 1
+
+
+def test_warm_up_resolves_the_endpoint_via_the_provided_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(httpx, "request", lambda *a, **kw: (_ for _ in ()).throw(AssertionError()))
+    calls: list[str] = []
+
+    class _FakeClient:
+        def request(self, method: str, url: str, **kwargs: object) -> httpx.Response:
+            calls.append(url)
+            return httpx.Response(200, json=_DISCOVERY_BODY, request=httpx.Request(method, url))
+
+    connector = ShopifyUCPPurchaseConnector(
+        shop_domain="kairyu.fr", agent_profile_url=PROFILE_URL, client=_FakeClient()
+    )
+
+    connector.warm_up()
+
+    assert calls == ["https://kairyu.fr/.well-known/ucp"]
+    # Second warm_up (or a real revalidate right after) must not re-discover.
+    connector.warm_up()
+    assert calls == ["https://kairyu.fr/.well-known/ucp"]
+
+
+def test_warm_up_never_raises_when_merchant_is_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_request(method: str, url: str, **kwargs: object) -> httpx.Response:
+        return httpx.Response(503, request=httpx.Request(method, url))
+
+    monkeypatch.setattr(httpx, "request", fake_request)
+    connector = ShopifyUCPPurchaseConnector(shop_domain="kairyu.fr", agent_profile_url=PROFILE_URL)
+
+    connector.warm_up()  # must not raise

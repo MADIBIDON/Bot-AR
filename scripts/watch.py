@@ -108,6 +108,7 @@ from notifications.discord.client import DiscordNotifier
 from notifications.discord.config import load_discord_config
 from purchase.config import load_purchase_policy
 from purchase.engine import build_decision_context, build_purchase_intent, evaluate_purchase_intent
+from purchase.prepared_runtime import get_default_cache
 
 PID_FILE = Path("data") / "worker.pid"
 
@@ -515,6 +516,10 @@ def cmd_edit(args: argparse.Namespace) -> int:
     updated = crud.update_watch_rule(session, args.id, **fields)
     changes = ", ".join(f"{key}={value}" for key, value in fields.items())
     print(f"watch_rule={updated.id} updated: {changes}")
+    # Phase 35 section 5: a config edit can change a field
+    # PreparedDropRuntimeCache snapshotted (e.g. max_price) — never leave
+    # a stale cached runtime behind.
+    get_default_cache().invalidate(updated.id)
     return 0
 
 
@@ -1111,6 +1116,12 @@ def cmd_edit_product(args: argparse.Namespace) -> int:
     updated = crud.update_product(session, args.id, **fields)
     changes = ", ".join(f"{key}={value}" for key, value in fields.items())
     print(f"product={updated.id} updated: {changes}")
+    # Phase 35 section 5: a Product-level edit can change what every
+    # WatchRule under it effectively resolves to (max_price/target_price
+    # fall back to the Product) — invalidate all of them, not just one.
+    cache = get_default_cache()
+    for rule in crud.list_watch_rules(session, product_id=updated.id):
+        cache.invalidate(rule.id)
     return 0
 
 

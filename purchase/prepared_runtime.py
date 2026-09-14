@@ -104,3 +104,74 @@ def build_prepared_drop_runtime(
         merchant_domains=merchant_domains,
         connector=connector,
     )
+
+
+class PreparedDropRuntimeCache:
+    """Phase 35 sections 4/5: an in-memory cache of PreparedDropRuntime,
+    keyed by watch_rule_id — built once (one DB read) on first use, then
+    reused for every subsequent stock signal for the same rule (a
+    multi-retailer flicker, or a repeated OUT->IN->OUT) until explicitly
+    invalidated. Process-local only (this project runs a single worker
+    process, app/pidfile.py) — never persisted, never shared.
+
+    What is safe to keep cached (STATIC/SEMI-STATIC, per section 5):
+    EAN/MPN/external_id, quantity, max_price_allowed, merchant identity,
+    the WatchRule reference itself. What this cache deliberately never
+    stores, and what a caller must always fetch fresh: current stock,
+    current price, shipping/tax, the kill switch (see
+    purchase/engine.py's policy_provider — always re-read from the
+    environment, never from a PreparedDropRuntime snapshot), and the
+    purchase claim itself (database/crud.py's real atomic-claim
+    functions, never short-circuited by this cache).
+
+    Call invalidate()/invalidate_all() whenever a DropManifest re-import
+    or a scripts/watch.py edit/edit-product changes a cached rule's
+    static fields — see app/drop_manifest.py and scripts/watch.py for
+    the real call sites."""
+
+    def __init__(self) -> None:
+        self._entries: dict[int, PreparedDropRuntime] = {}
+
+    def get_or_build(
+        self,
+        session: Session,
+        watch_rule_id: int,
+        *,
+        connector: PurchaseConnector,
+        policy: PurchasePolicy,
+        merchant_domains: tuple[str, ...],
+    ) -> PreparedDropRuntime:
+        cached = self._entries.get(watch_rule_id)
+        if cached is not None:
+            return cached
+        runtime = build_prepared_drop_runtime(
+            session,
+            watch_rule_id,
+            connector=connector,
+            policy=policy,
+            merchant_domains=merchant_domains,
+        )
+        self._entries[watch_rule_id] = runtime
+        return runtime
+
+    def invalidate(self, watch_rule_id: int) -> None:
+        self._entries.pop(watch_rule_id, None)
+
+    def invalidate_all(self) -> None:
+        self._entries.clear()
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def __contains__(self, watch_rule_id: int) -> bool:
+        return watch_rule_id in self._entries
+
+
+_default_cache = PreparedDropRuntimeCache()
+
+
+def get_default_cache() -> PreparedDropRuntimeCache:
+    """The one process-wide cache instance real callers share — a
+    dedicated instance (not this one) is preferable in a test, so
+    parallel tests never see each other's cached entries."""
+    return _default_cache

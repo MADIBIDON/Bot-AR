@@ -55,14 +55,14 @@ already makes — never anything that performs a market lookup itself.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING
-
-from sqlalchemy.exc import IntegrityError
 
 from database import crud
 from database.time_utils import ensure_utc
@@ -83,6 +83,7 @@ from market_data.estimator import Confidence
 from notifications.discord.formatter import format_purchase_embed
 from purchase.base import AutomatedCheckoutUnsupportedError, HumanActionRequiredError
 from purchase.config import is_merchant_allowed
+from purchase.fast_path import HotPathTrace, run_hot_path
 from purchase.models import PurchaseDecision, PurchaseIntent, PurchaseStatus
 from purchase.registry import PurchaseConnectorNotRegisteredError
 
@@ -313,6 +314,10 @@ class PurchaseOutcome:
     total_cost: Decimal | None = None
     shipping_cost: Decimal | None = None
     order_reference: str | None = None
+    # Phase 35 section 8: light, secret-free timing instrumentation —
+    # None only for callers/tests that never went through attempt_purchase
+    # (e.g. a pure dry run never sets this).
+    trace: HotPathTrace | None = None
 
 
 async def attempt_purchase(
@@ -353,32 +358,33 @@ async def attempt_purchase(
     profitability-mode watch; every other watch ignores both.
     """
     now = now or datetime.now(UTC)
-    intent = build_purchase_intent(watch_rule, observation, match_result, now=now)
-    total_cost = intent.observed_price * intent.quantity
-    max_price = effective_max_price(watch_rule)
-    has_active, since_last, spent_today, blocking_for_product = build_decision_context(
-        session, intent, now=now
-    )
+    stock_received_ns = time.perf_counter_ns()
 
-    decision = evaluate_purchase_intent(
-        watch_rule=watch_rule,
-        intent=intent,
-        policy=policy,
-        merchant_domains=merchant_domains,
-        match_confidence=match_result.confidence,
-        available=observation.available,
-        total_cost=total_cost,
-        has_active_attempt=has_active,
-        seconds_since_last_attempt=since_last,
-        spent_today=spent_today,
+    # Phase 35: the decision+claim sequence itself now lives in
+    # purchase/fast_path.py::run_hot_path — this is the ONE call site,
+    # so a legacy inline copy of this logic can never silently diverge
+    # from it again.
+    hot = run_hot_path(
+        session,
+        watch_rule,
+        observation,
+        match_result,
+        policy,
+        merchant_domains,
         opportunity=opportunity,
         resale_confidence=resale_confidence,
-        blocking_attempts_for_product=blocking_for_product,
         now=now,
+        stock_received_ns=stock_received_ns,
     )
-    if not decision.proceed:
+    intent = hot.intent
+    max_price = hot.max_price
+    decision = hot.decision
+
+    if not hot.proceed:
         logger.info("watch_rule=%s purchase skipped: %s", watch_rule.id, decision.reason)
-        return PurchaseOutcome(status=decision.status, reason=decision.reason, intent=intent)
+        return PurchaseOutcome(
+            status=decision.status, reason=decision.reason, intent=intent, trace=hot.trace
+        )
 
     logger.info(
         "watch_rule=%s purchase intent created merchant=%s price=%s qty=%s",
@@ -387,55 +393,7 @@ async def attempt_purchase(
         intent.observed_price,
         intent.quantity,
     )
-
-    # Row created immediately after the has_active_attempt/blocking-for-
-    # product checks above, with no `await` in between either here or
-    # inside evaluate_purchase_intent() (pure, no I/O) — the idempotency
-    # lock, now enforced both per-listing and product-wide (Phase 33).
-    # uq_one_active_or_purchased_attempt_per_product (database/models.py)
-    # is a real DB-level backstop for this same invariant — see the
-    # IntegrityError handling a few lines below.
-    try:
-        attempt = crud.create_purchase_attempt(
-            session,
-            watch_rule_id=watch_rule.id,
-            listing_id=watch_rule.listing_id,
-            product_id=intent.product_id,
-            status=PurchaseStatus.CREATED.value,
-            observed_price=intent.observed_price,
-            # max_price_allowed is NOT NULL and CHECK > 0; None
-            # (profitability mode with no hard_max_total set — Phase 25)
-            # has no fixed ceiling to record, so this uses intent's own
-            # value, which build_purchase_intent() already resolved the
-            # same way.
-            max_price_allowed=intent.max_price_allowed,
-            quantity=intent.quantity,
-        )
-    except IntegrityError:
-        # Defense-in-depth only — see uq_one_active_or_purchased_attempt_
-        # per_product's own comment in database/models.py. The Python-
-        # level blocking_attempts_for_product check above is expected to
-        # catch every real case (no `await` between that check and this
-        # insert, in this project's single-event-loop architecture); this
-        # branch existing at all means that reasoning was somehow wrong,
-        # which is exactly why the constraint is a real DB index and not
-        # just a comment. Roll back so this session's own transaction
-        # isn't left in a failed state, then report a clean rejection —
-        # never an unhandled exception out of a purchase attempt.
-        session.rollback()
-        logger.warning(
-            "watch_rule=%s purchase attempt insert blocked by the database-level "
-            "one-per-product constraint — another listing won the race",
-            watch_rule.id,
-        )
-        return PurchaseOutcome(
-            status=PurchaseStatus.CANCELLED,
-            reason=(
-                f"Product {intent.product_id} already claimed by another listing's purchase "
-                "attempt (database-level constraint)."
-            ),
-            intent=intent,
-        )
+    attempt = hot.attempt
 
     try:
         connector = connector_registry.get(intent.merchant)
@@ -447,9 +405,19 @@ async def attempt_purchase(
             failure_reason=str(exc),
         )
         await _notify_purchase(notifier, "PURCHASE FAILED", intent, reason=str(exc))
-        return PurchaseOutcome(status=PurchaseStatus.FAILED, reason=str(exc), intent=intent)
+        return PurchaseOutcome(
+            status=PurchaseStatus.FAILED, reason=str(exc), intent=intent, trace=hot.trace
+        )
 
     crud.update_purchase_attempt(session, attempt.id, status=PurchaseStatus.VALIDATING.value)
+    # Phase 35 section 8: the practical, lightweight production proxy for
+    # T6 ("first checkout network request dispatched") — captured right
+    # before handing off to the connector, not a heavy transport-level
+    # hook wired into every real connector permanently. See
+    # scripts/benchmark_100ms_warm_path.py / the Phase 35 integration
+    # test for a precise, transport-hooked measurement of the real gap
+    # between this timestamp and the actual socket write.
+    trace = dataclasses.replace(hot.trace, checkout_dispatch_ns=time.perf_counter_ns())
 
     try:
         revalidated = await asyncio.to_thread(connector.revalidate, intent)
@@ -461,13 +429,22 @@ async def attempt_purchase(
             intent,
             PurchaseStatus.AUTOMATED_CHECKOUT_UNSUPPORTED,
             str(exc),
+            trace=trace,
         )
     except HumanActionRequiredError as exc:
         return await _finish(
-            session, notifier, attempt.id, intent, PurchaseStatus.HUMAN_ACTION_REQUIRED, str(exc)
+            session,
+            notifier,
+            attempt.id,
+            intent,
+            PurchaseStatus.HUMAN_ACTION_REQUIRED,
+            str(exc),
+            trace=trace,
         )
     except Exception as exc:  # noqa: BLE001 - a connector bug must never crash the worker
-        return await _finish(session, notifier, attempt.id, intent, PurchaseStatus.FAILED, str(exc))
+        return await _finish(
+            session, notifier, attempt.id, intent, PurchaseStatus.FAILED, str(exc), trace=trace
+        )
 
     shipping = revalidated.shipping_cost if revalidated.shipping_cost is not None else Decimal("0")
     tax = revalidated.tax_amount if revalidated.tax_amount is not None else Decimal("0")
@@ -480,6 +457,7 @@ async def attempt_purchase(
             intent,
             PurchaseStatus.CANCELLED,
             "Stock disappeared during revalidation.",
+            trace=trace,
         )
     insufficient_stock = (
         revalidated.quantity_available is not None
@@ -494,6 +472,7 @@ async def attempt_purchase(
             PurchaseStatus.CANCELLED,
             f"Only {revalidated.quantity_available} unit(s) available at checkout, "
             f"needed {intent.quantity}.",
+            trace=trace,
         )
     if max_price is not None and revalidated_total > max_price:
         return await _finish(
@@ -504,6 +483,7 @@ async def attempt_purchase(
             PurchaseStatus.CANCELLED,
             f"Revalidated total cost {revalidated_total} exceeds max_price "
             f"{max_price} (price or shipping changed before checkout).",
+            trace=trace,
         )
     if policy.max_order_eur is not None and revalidated_total > policy.max_order_eur:
         return await _finish(
@@ -514,6 +494,7 @@ async def attempt_purchase(
             PurchaseStatus.CANCELLED,
             f"Revalidated total cost {revalidated_total} exceeds PURCHASE_MAX_ORDER_EUR "
             f"{policy.max_order_eur}.",
+            trace=trace,
         )
 
     if is_profitability_mode(watch_rule) and opportunity is not None:
@@ -542,6 +523,7 @@ async def attempt_purchase(
                 PurchaseStatus.CANCELLED,
                 f"Profitability check failed on the revalidated total {revalidated_total}: "
                 f"{revalidated_reason}",
+                trace=trace,
             )
 
     # Phase 33 hardening: re-read the kill switch fresh, immediately
@@ -561,6 +543,7 @@ async def attempt_purchase(
             intent,
             PurchaseStatus.CANCELLED,
             "PURCHASES_ENABLED was turned off during this attempt — aborting before checkout.",
+            trace=trace,
         )
 
     crud.update_purchase_attempt(session, attempt.id, status=PurchaseStatus.CHECKOUT_STARTED.value)
@@ -576,13 +559,22 @@ async def attempt_purchase(
             intent,
             PurchaseStatus.AUTOMATED_CHECKOUT_UNSUPPORTED,
             str(exc),
+            trace=trace,
         )
     except HumanActionRequiredError as exc:
         return await _finish(
-            session, notifier, attempt.id, intent, PurchaseStatus.HUMAN_ACTION_REQUIRED, str(exc)
+            session,
+            notifier,
+            attempt.id,
+            intent,
+            PurchaseStatus.HUMAN_ACTION_REQUIRED,
+            str(exc),
+            trace=trace,
         )
     except Exception as exc:  # noqa: BLE001 - a connector bug must never crash the worker
-        return await _finish(session, notifier, attempt.id, intent, PurchaseStatus.FAILED, str(exc))
+        return await _finish(
+            session, notifier, attempt.id, intent, PurchaseStatus.FAILED, str(exc), trace=trace
+        )
 
     if not result.success:
         return await _finish(
@@ -592,6 +584,7 @@ async def attempt_purchase(
             intent,
             PurchaseStatus.FAILED,
             result.failure_reason or "Checkout reported failure with no reason given.",
+            trace=trace,
         )
 
     crud.update_purchase_attempt(
@@ -627,6 +620,7 @@ async def attempt_purchase(
         total_cost=result.total_cost,
         shipping_cost=result.shipping_cost,
         order_reference=result.order_reference,
+        trace=trace,
     )
 
 
@@ -637,6 +631,8 @@ async def _finish(
     intent: PurchaseIntent,
     status: PurchaseStatus,
     reason: str,
+    *,
+    trace: HotPathTrace | None = None,
 ) -> PurchaseOutcome:
     crud.update_purchase_attempt(session, attempt_id, status=status.value, failure_reason=reason)
     logger.info("purchase_attempt=%s status=%s reason=%s", attempt_id, status.value, reason)
@@ -647,7 +643,9 @@ async def _finish(
         PurchaseStatus.CANCELLED: "PURCHASE FAILED",
     }.get(status, "PURCHASE FAILED")
     await _notify_purchase(notifier, title, intent, reason=reason)
-    return PurchaseOutcome(status=status, reason=reason, intent=intent, attempt_id=attempt_id)
+    return PurchaseOutcome(
+        status=status, reason=reason, intent=intent, attempt_id=attempt_id, trace=trace
+    )
 
 
 async def _notify_purchase(

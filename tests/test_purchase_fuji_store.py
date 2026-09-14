@@ -525,3 +525,33 @@ def test_connector_uses_provided_client_instead_of_httpx_request(
 
     assert result.available is True
     assert len(calls) >= 3
+
+
+def test_warm_up_makes_one_read_only_products_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(httpx, "request", lambda *a, **kw: (_ for _ in ()).throw(AssertionError()))
+    calls: list[tuple[str, str]] = []
+
+    class _FakeClient:
+        def request(self, method: str, url: str, **kwargs: object) -> httpx.Response:
+            calls.append((method, url))
+            return _product_response(url, has_options=False)
+
+    connector = FujiStorePurchaseConnector(client=_FakeClient())
+
+    connector.warm_up()
+
+    assert len(calls) == 1
+    assert calls[0][0] == "GET"
+    assert "/products" in calls[0][1]
+
+
+def test_warm_up_never_raises_when_merchant_is_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_request(method: str, url: str, **kwargs: object) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=httpx.Request(method, url))
+
+    monkeypatch.setattr(httpx, "request", fake_request)
+    connector = FujiStorePurchaseConnector()
+
+    connector.warm_up()  # must not raise

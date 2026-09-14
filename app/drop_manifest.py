@@ -69,6 +69,7 @@ from urllib.parse import urlparse
 from connectors.base import ConnectorError, ProductNotFoundError
 from connectors.defaults import find_merchant_for_domain
 from database import crud
+from purchase.prepared_runtime import get_default_cache
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
@@ -288,6 +289,11 @@ def import_drop_manifest(
                 update_fields["scheduled_release_at"] = entry.release_at
             if update_fields:
                 crud.update_watch_rule(session, rule.id, **update_fields)
+            # Phase 35 section 5: a (re-)import can change fields a
+            # PreparedDropRuntimeCache entry already snapshotted for this
+            # rule — never leave a stale cached runtime behind, whether
+            # this rule is new or reused.
+            get_default_cache().invalidate(rule.id)
 
             results.append(
                 DropImportResult(

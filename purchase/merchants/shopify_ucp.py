@@ -116,6 +116,20 @@ class ShopifyUCPPurchaseConnector(PurchaseConnector):
         # behavior this connector's whole test suite monkeypatches.
         self._client = client
 
+    def warm_up(self) -> None:
+        """Phase 35 section 14: establishes the persistent connection
+        (and, incidentally, resolves+caches the MCP endpoint) ahead of a
+        known drop via the exact same discover() call _endpoint() already
+        makes on first real use — no new network pattern, read-only,
+        never a cart/checkout. Never raises: a merchant temporarily
+        unreachable during warm-up is not a purchase-path failure, just a
+        missed optimization — the real attempt will simply pay the cold
+        cost when it happens."""
+        try:
+            self._endpoint()
+        except AutomatedCheckoutUnsupportedError:
+            pass
+
     def _endpoint(self) -> str:
         if self._mcp_endpoint is None:
             try:

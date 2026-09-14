@@ -84,6 +84,17 @@ class FujiStorePurchaseConnector(PurchaseConnector):
         # behavior, which this file's whole test suite monkeypatches.
         self._client = client
 
+    def warm_up(self) -> None:
+        """Phase 35 section 14: one cheap, read-only GET against the
+        public WooCommerce Store API (a single-product search — never a
+        cart, never a reservation) to establish the persistent
+        connection ahead of a known drop. Never raises: any failure here
+        is a missed optimization, not a purchase-path error."""
+        try:
+            self._request("GET", "/products", params={"per_page": 1}, headers=self._headers)
+        except PurchaseError:
+            pass
+
     def _request(self, method: str, path: str, **kwargs: object) -> httpx.Response:
         send = self._client.request if self._client is not None else httpx.request
         try:

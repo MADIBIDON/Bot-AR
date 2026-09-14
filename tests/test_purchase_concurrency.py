@@ -102,12 +102,12 @@ def _match() -> MatchResult:
     return MatchResult(matched=True, confidence=100, method="ean_exact", reason="test")
 
 
-def _policy() -> PurchasePolicy:
+def _policy(*, n_domains: int = 60) -> PurchasePolicy:
     return PurchasePolicy(
         enabled=True,
         max_order_eur=None,
         max_daily_eur=None,
-        allowed_merchant_domains=frozenset({f"retailer{i}.example" for i in range(60)}),
+        allowed_merchant_domains=frozenset({f"retailer{i}.example" for i in range(n_domains)}),
         cooldown_seconds=0,
     )
 
@@ -122,6 +122,8 @@ async def _run_concurrent_attempts(session: Session, product_id: int, n: int) ->
         )
     notifier = FakeNotifier()
 
+    policy = _policy(n_domains=n)
+
     async def _one(rule) -> object:
         merchant = rule.listing.merchant.name
         return await attempt_purchase(
@@ -129,7 +131,7 @@ async def _run_concurrent_attempts(session: Session, product_id: int, n: int) ->
             rule,
             _observation(merchant, "59.90"),
             _match(),
-            _policy(),
+            policy,
             registry,
             (f"{merchant.lower()}.example",),
             notifier,
@@ -172,6 +174,32 @@ def test_fifty_concurrent_attempts_same_product_exactly_one_winner(session: Sess
     # confirms no second row was left in-flight.
     blocking = crud.get_blocking_purchase_attempts_for_product(session, product_id)
     assert len(blocking) == 1
+
+
+def test_hundred_concurrent_attempts_same_product_exactly_one_winner(session: Session) -> None:
+    """Phase 35 section 10: re-run of the race test AFTER the fast-path
+    integration (attempt_purchase() now delegates to
+    purchase/fast_path.py::run_hot_path — see purchase/engine.py), bumped
+    to 100 simultaneous retailers per the new spec. Exactly one purchase
+    may ever succeed and connector.checkout() may only ever be invoked
+    once, even against a real (if in-memory) SQLite database."""
+    n = 100
+    product_id = _seed_same_product_on_n_listings(session, n)
+
+    outcomes = asyncio.run(_run_concurrent_attempts(session, product_id, n))
+
+    statuses = [o.status for o in outcomes]
+    assert statuses.count(PurchaseStatus.PURCHASED) == 1
+    assert statuses.count(PurchaseStatus.CANCELLED) == n - 1
+
+    all_attempts = crud.list_purchase_attempts(session)
+    purchased_rows = [a for a in all_attempts if a.status == "purchased"]
+    assert len(purchased_rows) == 1
+    blocking = crud.get_blocking_purchase_attempts_for_product(session, product_id)
+    assert len(blocking) == 1
+    # Every outcome carries a trace — proof every one of the 100 went
+    # through the real fast path, not a hypothetical shortcut.
+    assert all(o.trace is not None for o in outcomes)
 
 
 def test_database_level_constraint_is_real_not_just_a_comment(session: Session) -> None:

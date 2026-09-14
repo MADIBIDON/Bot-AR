@@ -43,6 +43,7 @@ from notifications.discord.config import load_discord_config
 from purchase.config import load_purchase_policy
 from purchase.defaults import build_default_purchase_registry
 from purchase.engine import reconcile_orphaned_purchase_attempts
+from purchase.warmup import warm_up_purchase_connectors
 
 PID_FILE = Path("data") / "worker.pid"
 LOG_FILE = Path("logs") / "worker.log"
@@ -108,6 +109,14 @@ async def main() -> None:
     market_registry = _build_market_registry()
     market_cache = TTLCache()
     purchase_registry = build_default_purchase_registry()
+    # Phase 35 section 14: one non-transactional touch per real purchase
+    # connector at startup, establishing its persistent connection ahead
+    # of whatever drop happens next — never a cart, never an order. A
+    # periodic/scheduled-release-triggered re-warm is not built yet (the
+    # connection's own keepalive_expiry, Phase 34, covers reuse across
+    # closely-spaced checks; a long idle stretch before a distant drop
+    # will still pay the cold cost — see purchase/defaults.py).
+    warm_up_purchase_connectors(purchase_registry)
     discovery_registry = build_default_discovery_registry()
     purchase_policy = load_purchase_policy()
     if purchase_policy.enabled:

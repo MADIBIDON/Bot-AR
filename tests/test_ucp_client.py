@@ -393,3 +393,33 @@ def test_call_tool_uses_provided_client_instead_of_httpx_request(
     )
 
     assert calls == ["https://kairyushop.myshopify.com/api/ucp/mcp"]
+
+
+# --- Phase 35 section 22: safety regression with a persistent client ---
+
+
+def test_discover_with_persistent_client_timeout_is_a_clean_ucp_error() -> None:
+    """A merchant timeout must be a clean UCPError even when a real,
+    persistent (Phase 34) client is used — never an unhandled crash."""
+
+    class _TimingOutClient:
+        def request(self, method: str, url: str, **kwargs: object) -> httpx.Response:
+            raise httpx.TimeoutException("timed out", request=httpx.Request(method, url))
+
+    with pytest.raises(UCPError, match="timeout"):
+        discover("kairyu.fr", client=_TimingOutClient())
+
+
+def test_discover_with_persistent_client_connection_failure_is_a_clean_ucp_error() -> None:
+    """Simulates the persistent client's own connection pool failing
+    (e.g. the underlying socket was reset) — must still be converted to
+    UCPError, never propagate as a raw httpx exception."""
+
+    class _BrokenPoolClient:
+        def request(self, method: str, url: str, **kwargs: object) -> httpx.Response:
+            raise httpx.ConnectError(
+                "connection pool exhausted/reset", request=httpx.Request(method, url)
+            )
+
+    with pytest.raises(UCPError, match="network error"):
+        discover("kairyu.fr", client=_BrokenPoolClient())

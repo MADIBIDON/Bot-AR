@@ -15,12 +15,14 @@ from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
+import app.worker as worker_module
 from app.worker import tick
 from connectors.fake_store import FakeStoreConnector
 from connectors.registry import ConnectorRegistry
 from database import crud
-from purchase.base import PurchaseConnector
+from purchase.base import CheckoutResult, PurchaseConnector
 from purchase.config import PurchasePolicy
+from purchase.models import RevalidationResult
 from purchase.registry import PurchaseConnectorRegistry
 
 
@@ -45,6 +47,37 @@ class SlowFailingConnector(PurchaseConnector):
 
     def checkout(self, intent, revalidated):
         raise AssertionError("checkout should never be reached in this test")
+
+
+class FakeSucceedingConnector(PurchaseConnector):
+    """Phase 35 section 9: a real (if fake) end-to-end success —
+    revalidate() and checkout() both complete cleanly so the full worker
+    -> attempt_purchase() -> run_hot_path() -> connector chain can be
+    observed all the way through."""
+
+    def __init__(self) -> None:
+        self.revalidate_calls = 0
+        self.checkout_calls = 0
+
+    def revalidate(self, intent):
+        self.revalidate_calls += 1
+        return RevalidationResult(
+            available=True,
+            price=intent.observed_price,
+            shipping_cost=Decimal("0"),
+            quantity_available=None,
+        )
+
+    def checkout(self, intent, revalidated):
+        self.checkout_calls += 1
+        return CheckoutResult(
+            success=True,
+            order_reference="FAKE-ORDER-1",
+            final_price=revalidated.price,
+            shipping_cost=Decimal("0"),
+            total_cost=revalidated.price,
+            failure_reason=None,
+        )
 
 
 def _setup_rule(session: Session, *, max_price: str = "60") -> None:
@@ -186,3 +219,115 @@ def test_tick_returns_without_waiting_for_slow_purchase_attempt(session: Session
     elapsed = asyncio.run(scenario())
 
     assert elapsed < 0.15  # tick() returned well before the connector's 0.3s sleep finished
+
+
+def test_worker_tick_routes_a_real_instock_signal_through_the_fast_path(
+    monkeypatch, session: Session
+) -> None:
+    """Phase 35 section 9: proves a real, simulated worker tick — not
+    just an isolated fast_path benchmark — actually drives a stock-
+    positive signal through attempt_purchase()'s delegated run_hot_path()
+    all the way to a connector's checkout(). outcome.trace is only ever
+    populated inside run_hot_path/attempt_purchase, so its presence here
+    is direct proof the real fast path executed."""
+    _setup_rule(session)
+    connector = FakeStoreConnector(products={"etb-1": _fake_product()})
+    fake_purchase_connector = FakeSucceedingConnector()
+    notifier = FakeNotifier()
+
+    from purchase.engine import attempt_purchase as real_attempt_purchase
+
+    captured: list[object] = []
+
+    async def _spy(*args: object, **kwargs: object) -> object:
+        outcome = await real_attempt_purchase(*args, **kwargs)
+        captured.append(outcome)
+        return outcome
+
+    monkeypatch.setattr("app.worker.attempt_purchase", _spy)
+    # app/worker.py's real wiring passes policy_provider=load_purchase_policy
+    # (Phase 33 P0#3's fresh kill-switch re-check), which reads the REAL
+    # .env — PURCHASES_ENABLED=false throughout this whole project,
+    # including every test run. This test uses fake connectors and a
+    # fake merchant domain (no real transaction risk either way), and
+    # exists specifically to prove the fast path reaches a real
+    # checkout() call — so it substitutes its own enabled synthetic
+    # policy for that one re-read, exactly like
+    # scripts/benchmark_purchase_pipeline.py already does; it never
+    # touches or bypasses the real environment variable.
+    monkeypatch.setattr("app.worker.load_purchase_policy", _policy)
+
+    async def scenario() -> None:
+        registry = ConnectorRegistry()
+        registry.register("Kairyu", connector)
+        t0 = datetime.now(UTC)
+        await tick(session, registry, notifier, now=t0)  # baseline, no event yet
+        connector.update_product("etb-1", price=55.0)
+        await tick(
+            session,
+            registry,
+            notifier,
+            now=t0 + timedelta(seconds=2),
+            purchase_registry=_purchase_registry(fake_purchase_connector),
+            purchase_policy=_policy(),
+        )
+        await _drain_background_tasks()
+
+    asyncio.run(scenario())
+
+    assert len(captured) == 1
+    outcome = captured[0]
+    assert outcome.trace is not None
+    assert outcome.trace.claim_acquired_ns is not None
+    assert outcome.trace.stock_received_ns <= outcome.trace.claim_acquired_ns
+    assert outcome.trace.checkout_dispatch_ns is not None
+    assert fake_purchase_connector.revalidate_calls == 1
+    assert fake_purchase_connector.checkout_calls == 1
+    assert outcome.status.value == "purchased"
+
+
+def test_worker_tick_fails_loudly_if_the_hot_path_is_bypassed(
+    monkeypatch, session: Session
+) -> None:
+    """The explicit "must fail if rerouted to the legacy path" proof: if
+    attempt_purchase() ever stops delegating to run_hot_path (e.g. a
+    future edit inlines the decision+claim logic again), this sentinel
+    can never fire and the assertion below fails."""
+    _setup_rule(session)
+    connector = FakeStoreConnector(products={"etb-1": _fake_product()})
+    notifier = FakeNotifier()
+
+    class _LegacyPathProof(Exception):
+        pass
+
+    def _sentinel(*args: object, **kwargs: object) -> object:
+        raise _LegacyPathProof("run_hot_path was actually called")
+
+    monkeypatch.setattr("purchase.engine.run_hot_path", _sentinel)
+
+    captured_exceptions: list[BaseException] = []
+
+    async def scenario() -> None:
+        registry = ConnectorRegistry()
+        registry.register("Kairyu", connector)
+        t0 = datetime.now(UTC)
+        await tick(session, registry, notifier, now=t0)
+        connector.update_product("etb-1", price=55.0)
+        await tick(
+            session,
+            registry,
+            notifier,
+            now=t0 + timedelta(seconds=2),
+            purchase_registry=_purchase_registry(FakeSucceedingConnector()),
+            purchase_policy=_policy(),
+        )
+        pending = list(worker_module._background_tasks)
+        await _drain_background_tasks()
+        for task in pending:
+            if task.done() and not task.cancelled() and task.exception() is not None:
+                captured_exceptions.append(task.exception())
+
+    asyncio.run(scenario())
+
+    assert len(captured_exceptions) == 1
+    assert isinstance(captured_exceptions[0], _LegacyPathProof)

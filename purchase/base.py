@@ -67,6 +67,19 @@ class CheckoutResult:
 
 
 class PurchaseConnector(ABC):
+    def warm_up(self) -> None:
+        """Phase 35 section 14: an OPTIONAL, non-transactional touch that
+        establishes/refreshes this connector's persistent connection
+        ahead of a known drop — never a cart, never a reservation, never
+        an order. Default: no-op (safe for any connector that has
+        nothing worth pre-warming, e.g. purchase/merchants/unsupported.py,
+        which must never make a network call at all). A real connector
+        overrides this with the cheapest possible read-only call that
+        reuses its own persistent client. Must never raise — a warm-up
+        failure is a missed optimization, not a purchase-path error; see
+        purchase/warmup.py for the caller that enforces this."""
+        return None
+
     @abstractmethod
     def revalidate(self, intent: PurchaseIntent) -> RevalidationResult:
         """Re-fetches the product (and, ideally, puts it in a cart to
