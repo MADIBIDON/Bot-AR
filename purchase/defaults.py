@@ -38,17 +38,34 @@ guess a profile URL.
 
 from __future__ import annotations
 
+import httpx
+
 from config.settings import get_ucp_agent_profile_url
 from connectors.defaults import MERCHANTS
+from purchase.merchants.fuji_store import DEFAULT_TIMEOUT_SECONDS as _FUJI_TIMEOUT_SECONDS
 from purchase.merchants.fuji_store import FujiStorePurchaseConnector
 from purchase.merchants.shopify_ucp import ShopifyUCPPurchaseConnector
 from purchase.merchants.unsupported import UnsupportedPurchaseConnector
 from purchase.registry import PurchaseConnectorRegistry
+from ucp.client import DEFAULT_TIMEOUT_SECONDS as _UCP_TIMEOUT_SECONDS
 
 _UCP_SHOP_DOMAINS = {
     "Kairyu": "kairyu.fr",
     "RelicTCG": "www.relictcg.com",
 }
+
+
+def _persistent_client(timeout: float) -> httpx.Client:
+    """Phase 34 (100ms warm-path target): one persistent, connection-
+    pooled httpx.Client per real purchase connector, built once here (at
+    worker startup, see app/main_worker.py) and reused for the whole
+    process lifetime — extends to the purchase side the same pattern
+    connectors/schema_org.py already established for monitoring (Phase
+    23). Avoids paying a fresh TCP+TLS handshake (~90ms+ measured, Phase
+    33) on every single revalidate()/checkout() network call. Safe to
+    share across the worker's threads (httpx.Client's connection pool is
+    thread-safe — same justification as connectors/schema_org.py)."""
+    return httpx.Client(timeout=timeout)
 
 
 def build_default_purchase_registry() -> PurchaseConnectorRegistry:
@@ -57,13 +74,17 @@ def build_default_purchase_registry() -> PurchaseConnectorRegistry:
 
     for merchant in MERCHANTS:
         if merchant.name == "Fuji Store":
-            registry.register(merchant.name, FujiStorePurchaseConnector())
+            registry.register(
+                merchant.name,
+                FujiStorePurchaseConnector(client=_persistent_client(_FUJI_TIMEOUT_SECONDS)),
+            )
         elif merchant.name in _UCP_SHOP_DOMAINS and agent_profile_url:
             registry.register(
                 merchant.name,
                 ShopifyUCPPurchaseConnector(
                     shop_domain=_UCP_SHOP_DOMAINS[merchant.name],
                     agent_profile_url=agent_profile_url,
+                    client=_persistent_client(_UCP_TIMEOUT_SECONDS),
                 ),
             )
         else:

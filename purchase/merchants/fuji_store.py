@@ -73,16 +73,21 @@ class FujiStorePurchaseConnector(PurchaseConnector):
         shop_domain: str = DEFAULT_SHOP_DOMAIN,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         user_agent: str = DEFAULT_USER_AGENT,
+        client: httpx.Client | None = None,
     ) -> None:
         self._base_url = f"https://{shop_domain}/{_STORE_API}"
         self._timeout = timeout
         self._headers = {"User-Agent": user_agent, "Content-Type": "application/json"}
+        # Phase 34 (100ms warm-path target): same persistent-client
+        # pattern as purchase/merchants/shopify_ucp.py — None (default)
+        # preserves this connector's exact per-call httpx.request()
+        # behavior, which this file's whole test suite monkeypatches.
+        self._client = client
 
     def _request(self, method: str, path: str, **kwargs: object) -> httpx.Response:
+        send = self._client.request if self._client is not None else httpx.request
         try:
-            response = httpx.request(
-                method, f"{self._base_url}{path}", timeout=self._timeout, **kwargs
-            )
+            response = send(method, f"{self._base_url}{path}", timeout=self._timeout, **kwargs)
         except httpx.TimeoutException as exc:
             raise PurchaseError(f"timeout calling Fuji Store Store API {path}") from exc
         except httpx.RequestError as exc:

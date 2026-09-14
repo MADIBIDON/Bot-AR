@@ -66,21 +66,43 @@ class UCPToolCallError(UCPError):
         self.kind = kind
 
 
-def _request(method: str, url: str, *, timeout: float, **kwargs: object) -> httpx.Response:
+def _request(
+    method: str,
+    url: str,
+    *,
+    timeout: float,
+    client: httpx.Client | None = None,
+    **kwargs: object,
+) -> httpx.Response:
+    """client=None (the default) preserves the exact per-call
+    httpx.request() behavior this module's whole test suite monkeypatches
+    directly. Phase 34: real purchase connectors pass their own
+    persistent, connection-pooled httpx.Client (built once at worker
+    startup, see purchase/defaults.py) to avoid paying a fresh TCP+TLS
+    handshake on every single discover()/call_tool() — measured at
+    ~90ms+ per call in Phase 33 against a real HTTPS endpoint."""
     headers = {"User-Agent": DEFAULT_USER_AGENT, **kwargs.pop("headers", {})}  # type: ignore[arg-type]
+    send = client.request if client is not None else httpx.request
     try:
-        return httpx.request(method, url, timeout=timeout, headers=headers, **kwargs)
+        return send(method, url, timeout=timeout, headers=headers, **kwargs)
     except httpx.TimeoutException as exc:
         raise UCPError(f"timeout calling {url}") from exc
     except httpx.RequestError as exc:
         raise UCPError(f"network error calling {url}: {exc}") from exc
 
 
-def discover(shop_domain: str, *, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> UCPDiscovery:
+def discover(
+    shop_domain: str,
+    *,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    client: httpx.Client | None = None,
+) -> UCPDiscovery:
     """GET https://<shop_domain>/.well-known/ucp — the business profile.
     Raises UCPServiceUnavailableError if the store doesn't publish one or
     doesn't expose an MCP shopping transport."""
-    response = _request("GET", f"https://{shop_domain}/.well-known/ucp", timeout=timeout)
+    response = _request(
+        "GET", f"https://{shop_domain}/.well-known/ucp", timeout=timeout, client=client
+    )
     if response.status_code == 404:
         raise UCPServiceUnavailableError(f"{shop_domain} does not publish a UCP profile.")
     if response.status_code >= 400:
@@ -150,6 +172,7 @@ def call_tool(
     *,
     agent_profile_url: str,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    client: httpx.Client | None = None,
 ) -> dict:
     """Calls one UCP/MCP shopping tool (search_catalog, create_cart,
     create_checkout, get_checkout, update_checkout, complete_checkout,
@@ -177,6 +200,7 @@ def call_tool(
         timeout=timeout,
         headers={"Content-Type": "application/json"},
         json=payload,
+        client=client,
     )
     if response.status_code == 429:
         raise UCPToolCallError("Rate limited (429) by the merchant's UCP/MCP endpoint.", code=429)

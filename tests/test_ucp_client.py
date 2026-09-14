@@ -337,3 +337,59 @@ def test_call_tool_timeout_raises_ucp_error(monkeypatch: pytest.MonkeyPatch) -> 
             {"catalog": {"query": "x"}},
             agent_profile_url="https://example.com/profile.json",
         )
+
+
+# --- Phase 34: persistent-client injection -----------------------------
+
+
+def test_discover_uses_provided_client_instead_of_httpx_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller-provided persistent client must actually be used for
+    dispatch — never silently ignored in favor of the fresh-connection-
+    per-call httpx.request() path."""
+
+    def fail_if_called(*args: object, **kwargs: object) -> httpx.Response:
+        raise AssertionError("httpx.request must not be called when a client is provided")
+
+    monkeypatch.setattr(httpx, "request", fail_if_called)
+
+    calls: list[tuple[str, str]] = []
+
+    class _FakeClient:
+        def request(self, method: str, url: str, **kwargs: object) -> httpx.Response:
+            calls.append((method, url))
+            return httpx.Response(
+                200, json=_REAL_KAIRYU_UCP_BODY, request=httpx.Request(method, url)
+            )
+
+    discover("kairyu.fr", client=_FakeClient())
+
+    assert calls == [("GET", "https://kairyu.fr/.well-known/ucp")]
+
+
+def test_call_tool_uses_provided_client_instead_of_httpx_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_if_called(*args: object, **kwargs: object) -> httpx.Response:
+        raise AssertionError("httpx.request must not be called when a client is provided")
+
+    monkeypatch.setattr(httpx, "request", fail_if_called)
+
+    calls: list[str] = []
+
+    class _FakeClient:
+        def request(self, method: str, url: str, **kwargs: object) -> httpx.Response:
+            calls.append(url)
+            body = {"jsonrpc": "2.0", "id": "1", "result": {"structuredContent": {}}}
+            return httpx.Response(200, json=body, request=httpx.Request(method, url))
+
+    call_tool(
+        "https://kairyushop.myshopify.com/api/ucp/mcp",
+        "search_catalog",
+        {"catalog": {"query": "x"}},
+        agent_profile_url="https://example.com/profile.json",
+        client=_FakeClient(),
+    )
+
+    assert calls == ["https://kairyushop.myshopify.com/api/ucp/mcp"]

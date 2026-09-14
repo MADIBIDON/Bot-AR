@@ -43,6 +43,8 @@ import os
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
+import httpx
+
 from config.settings import get_ucp_agent_profile_url
 from purchase.base import (
     AutomatedCheckoutUnsupportedError,
@@ -99,16 +101,27 @@ class ShopifyUCPPurchaseConnector(PurchaseConnector):
         shop_domain: str,
         agent_profile_url: str | None = None,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        client: httpx.Client | None = None,
     ) -> None:
         self._shop_domain = shop_domain
         self._agent_profile_url = agent_profile_url or get_ucp_agent_profile_url()
         self._timeout = timeout
         self._mcp_endpoint: str | None = None
+        # Phase 34 (100ms warm-path target): a persistent, connection-
+        # pooled client — built once at worker startup (see
+        # purchase/defaults.py) and reused for this connector's whole
+        # lifetime — avoids a fresh TCP+TLS handshake on every single
+        # discover()/call_tool(), measured at ~90ms+ per call in Phase 33.
+        # None (the default) preserves the exact per-call httpx.request()
+        # behavior this connector's whole test suite monkeypatches.
+        self._client = client
 
     def _endpoint(self) -> str:
         if self._mcp_endpoint is None:
             try:
-                self._mcp_endpoint = discover(self._shop_domain, timeout=self._timeout).mcp_endpoint
+                self._mcp_endpoint = discover(
+                    self._shop_domain, timeout=self._timeout, client=self._client
+                ).mcp_endpoint
             except UCPServiceUnavailableError as exc:
                 raise AutomatedCheckoutUnsupportedError(str(exc)) from exc
         return self._mcp_endpoint
@@ -125,6 +138,7 @@ class ShopifyUCPPurchaseConnector(PurchaseConnector):
                 arguments,
                 agent_profile_url=self._agent_profile_url,
                 timeout=self._timeout,
+                client=self._client,
             )
         except UCPProfileUnreachableError as exc:
             raise PurchaseError(f"our own UCP agent profile is unreachable: {exc}") from exc

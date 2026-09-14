@@ -549,3 +549,43 @@ def test_full_pipeline_cancels_when_total_exceeds_max_price(
     )
 
     assert outcome.status == PurchaseStatus.CANCELLED
+
+
+# --- Phase 34: persistent-client injection -----------------------------
+
+
+def test_connector_uses_provided_client_for_discover_and_call_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A persistent client passed at construction must actually carry
+    both the one-time discover() and every call_tool() — never silently
+    fall back to a fresh httpx.request() connection per call."""
+
+    def fail_if_called(*args: object, **kwargs: object) -> httpx.Response:
+        raise AssertionError("httpx.request must not be called when a client is provided")
+
+    monkeypatch.setattr(httpx, "request", fail_if_called)
+
+    search = _rpc_result({"products": [_product(_HANDLE, [_variant(_VARIANT_ID, 7490)])]})
+    checkout = _checkout_response(totals=[{"type": "subtotal", "amount": 7490}])
+    router = _router(search_result=search, checkout_result=checkout)
+
+    calls: list[str] = []
+
+    class _FakeClient:
+        def request(self, method: str, url: str, **kwargs: object) -> httpx.Response:
+            calls.append(url)
+            return router(method, url, **kwargs)
+
+    fake_client = _FakeClient()
+    connector = ShopifyUCPPurchaseConnector(
+        shop_domain="kairyu.fr", agent_profile_url=PROFILE_URL, client=fake_client
+    )
+
+    connector.revalidate(_intent())
+
+    assert calls[0] == "https://kairyu.fr/.well-known/ucp"
+    assert any(c == MCP_ENDPOINT for c in calls[1:])
+    # Second call must reuse the cached mcp_endpoint (no second discover).
+    connector.revalidate(_intent())
+    assert calls.count("https://kairyu.fr/.well-known/ucp") == 1

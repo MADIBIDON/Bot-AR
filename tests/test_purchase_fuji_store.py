@@ -486,3 +486,42 @@ def test_full_pipeline_reaches_human_action_required_for_payment(
     attempts = crud.list_purchase_attempts(session)
     assert attempts[0].status == "human_action_required"
     assert "HUMAN ACTION REQUIRED" in [e.title for e in notifier.sent_embeds]
+
+
+# --- Phase 34: persistent-client injection -----------------------------
+
+
+def test_connector_uses_provided_client_instead_of_httpx_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A persistent client passed at construction must actually carry
+    every request — never silently fall back to a fresh
+    httpx.request() connection per call."""
+
+    def fail_if_called(*args: object, **kwargs: object) -> httpx.Response:
+        raise AssertionError("httpx.request must not be called when a client is provided")
+
+    monkeypatch.setattr(httpx, "request", fail_if_called)
+
+    calls: list[str] = []
+
+    def router(method: str, url: str, **kwargs: object) -> httpx.Response:
+        calls.append(url)
+        if "/products" in url:
+            return _product_response(url)
+        if url.endswith("/cart") and method == "GET":
+            return _empty_cart_get_response(url)
+        if url.endswith("/cart/add-item"):
+            return _cart_response(url, method="POST")
+        raise AssertionError(f"unexpected request: {method} {url}")
+
+    class _FakeClient:
+        def request(self, method: str, url: str, **kwargs: object) -> httpx.Response:
+            return router(method, url, **kwargs)
+
+    connector = FujiStorePurchaseConnector(client=_FakeClient())
+
+    result = connector.revalidate(_intent())
+
+    assert result.available is True
+    assert len(calls) >= 3
