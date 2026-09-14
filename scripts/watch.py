@@ -1187,6 +1187,36 @@ def cmd_stores(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_drop_manifest(args: argparse.Namespace) -> int:
+    """Phase 33 section 6: import a JSON drop manifest — see
+    app/drop_manifest.py's module docstring for the exact schema. Never
+    creates a PurchaseAttempt, never touches PURCHASES_ENABLED."""
+    from app.drop_manifest import DropManifestError, import_drop_manifest, load_drop_manifest
+
+    try:
+        entries = load_drop_manifest(args.path)
+    except (DropManifestError, OSError, ValueError) as exc:
+        print(f"Could not load manifest {args.path!r}: {exc}")
+        return 1
+
+    session = _get_session()
+    results = import_drop_manifest(session, entries)
+
+    ok = 0
+    for result in results:
+        if result.status == "error":
+            print(f"[ERROR]   {result.canonical_name}: {result.detail}")
+            continue
+        ok += 1
+        print(
+            f"[{result.status.upper():<7}] {result.canonical_name} -> "
+            f"product={result.product_id} watch_rule={result.watch_rule_id} "
+            f"listing={result.listing_id} ({result.detail})"
+        )
+    print(f"\n{ok}/{len(results)} entries imported successfully.")
+    return 0 if ok == len(results) else 1
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     session = _get_session()
     _print_retailer_capabilities()
@@ -1325,6 +1355,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     status_parser = subparsers.add_parser("status", help="Show overall system status.")
     status_parser.set_defaults(func=cmd_status)
+
+    drop_manifest_parser = subparsers.add_parser(
+        "drop-manifest", help="Import a JSON drop manifest — see app/drop_manifest.py."
+    )
+    drop_manifest_parser.add_argument("path", help="Path to the manifest JSON file")
+    drop_manifest_parser.set_defaults(func=cmd_drop_manifest)
 
     stores_parser = subparsers.add_parser("stores", help="List discovered retail stores.")
     stores_parser.add_argument("--retailer", help="Filter by retailer name")
