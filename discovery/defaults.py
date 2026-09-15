@@ -28,12 +28,22 @@ one — see connectors/defaults.py's module docstring.
 Phase 30: Boulanger's product sitemap (15 files x ~20k URLs, general
 electronics — not toy-specialist) was checked and rejected for the same
 "grosse charge" reason as Cultura/E.Leclerc.
+
+Phase 36 (Pokémon 30e, Cultura-only campaign): Cultura's sitemap crawl
+stays rejected (unchanged), but a different, much lighter surface was
+found and confirmed live — the same public, unauthenticated Magento 2
+GraphQL endpoint (`/m2/graphql`) Cultura's own search page calls, one
+targeted query per discovery run, never a crawl. See
+discovery/cultura.py's module docstring for the full recon (real GET,
+no auth, real product data, real /p-<url_key>.html URL pattern
+confirmed against two distinct live listings).
 """
 
 from __future__ import annotations
 
 from config.settings import get_ucp_agent_profile_url
 from connectors.defaults import MERCHANTS
+from discovery.cultura import CulturaSearchDiscoverySource
 from discovery.registry import DiscoveryRegistry
 from discovery.shopify_ucp import ShopifyUCPDiscoverySource
 from discovery.sitemap import SitemapDiscoverySource
@@ -85,6 +95,12 @@ def build_default_discovery_registry() -> DiscoveryRegistry:
                     merchant_name=merchant.name,
                 ),
             )
+        elif merchant.name == "Cultura":
+            # Phase 36: a single, targeted search query against Cultura's
+            # own public Magento GraphQL endpoint — not the 3.75-4.35M
+            # SKU sitemap crawl already rejected above. See
+            # discovery/cultura.py's module docstring.
+            registry.register(merchant.name, CulturaSearchDiscoverySource())
         # Merchants with none of the above are simply not registered —
         # the orchestrator (app/discovery.py) reports
         # DISCOVERY_UNAVAILABLE for any unregistered merchant and
