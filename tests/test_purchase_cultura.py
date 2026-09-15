@@ -89,7 +89,11 @@ def _create_cart_response() -> dict:
 
 
 def _add_to_cart_response(
-    *, quantity_available: int | None = 1, row_total: float = 55.99, cart_error: str | None = None
+    *,
+    quantity_available: int | None = 1,
+    row_total: float = 55.99,
+    cart_error: str | None = None,
+    quantity: int = 1,
 ) -> dict:
     return {
         "data": {
@@ -101,7 +105,7 @@ def _add_to_cart_response(
                     if cart_error
                     else [
                         {
-                            "quantity": 1,
+                            "quantity": quantity,
                             "quantity_available": quantity_available,
                             "product": {
                                 "sku": "10816948",
@@ -252,13 +256,28 @@ def test_revalidate_scales_price_by_quantity(monkeypatch: pytest.MonkeyPatch) ->
     connector = CulturaPurchaseConnector()
     fake_post, _ = _router(
         lookup=_product_lookup_response(),
-        add=_add_to_cart_response(row_total=111.98),  # 2x 55.99
+        add=_add_to_cart_response(row_total=111.98, quantity=2),  # 2x 55.99
     )
     monkeypatch.setattr(httpx, "post", fake_post)
 
     result = connector.revalidate(_intent(quantity=2))
 
     assert result.price == Decimal("55.99")
+
+
+def test_cart_quantity_mismatch_raises_stale_listing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Phase 40 section 27: the merchant can silently cap/adjust the
+    quantity actually placed in the cart — must always abort, never
+    silently proceed with whatever quantity the merchant chose."""
+    connector = CulturaPurchaseConnector()
+    fake_post, _ = _router(
+        lookup=_product_lookup_response(),
+        add=_add_to_cart_response(quantity=1),  # merchant capped it at 1
+    )
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    with pytest.raises(StaleListingError, match="does not match"):
+        connector.revalidate(_intent(quantity=2))
 
 
 def test_no_product_found_raises_stale_listing(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -202,6 +202,29 @@ def test_hundred_concurrent_attempts_same_product_exactly_one_winner(session: Se
     assert all(o.trace is not None for o in outcomes)
 
 
+def test_thousand_concurrent_attempts_same_product_exactly_one_winner(session: Session) -> None:
+    """Phase 40 section 18: 1000 simultaneous signals for the same
+    product (the same "restocked everywhere at once" shape, just an
+    order of magnitude larger) must still yield exactly one purchase —
+    the product-wide DB constraint is what actually enforces this, not
+    the attempt count, so this is a scale check on that guarantee, not a
+    new code path."""
+    n = 1000
+    product_id = _seed_same_product_on_n_listings(session, n)
+
+    outcomes = asyncio.run(_run_concurrent_attempts(session, product_id, n))
+
+    statuses = [o.status for o in outcomes]
+    assert statuses.count(PurchaseStatus.PURCHASED) == 1
+    assert statuses.count(PurchaseStatus.CANCELLED) == n - 1
+
+    all_attempts = crud.list_purchase_attempts(session)
+    purchased_rows = [a for a in all_attempts if a.status == "purchased"]
+    assert len(purchased_rows) == 1
+    blocking = crud.get_blocking_purchase_attempts_for_product(session, product_id)
+    assert len(blocking) == 1
+
+
 def test_database_level_constraint_is_real_not_just_a_comment(session: Session) -> None:
     """Defense-in-depth check: even bypassing the Python-level gate
     entirely and inserting two 'purchased' rows for the same product_id

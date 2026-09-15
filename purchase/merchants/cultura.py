@@ -395,6 +395,17 @@ class CulturaPurchaseConnector(PurchaseConnector):
                 quantity_available=0,
             )
 
+        cart_quantity = cart_item.get("quantity")
+        if cart_quantity is not None and cart_quantity != intent.quantity:
+            # Phase 40 section 27: the merchant can silently adjust the
+            # quantity actually placed in the cart (e.g. a per-customer
+            # limit) — always re-read it and abort rather than trust the
+            # requested quantity blindly.
+            raise StaleListingError(
+                f"Cart quantity {cart_quantity} does not match the requested quantity "
+                f"{intent.quantity} — refusing to proceed."
+            )
+
         self.last_checkout_state = CulturaCheckoutState.CART_WITH_PRODUCT
         row_total = cart_item["prices"]["row_total_including_tax"]["value"]
         price = Decimal(str(row_total)) / Decimal(intent.quantity)
