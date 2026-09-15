@@ -60,7 +60,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from app.delivery import process_due_deliveries
-from app.discovery import is_discovery_due, run_discovery_for_product
+from app.discovery import effective_discovery_interval, is_discovery_due, run_discovery_for_product
 from app.notify import compute_opportunity, notify_events_if_allowed
 from app.opportunity_alerts import maybe_notify_opportunity_shift
 from app.opportunity_snapshot import evaluate_opportunity_intelligence
@@ -294,7 +294,7 @@ async def tick(
             )
 
     if discovery_registry is not None:
-        _start_discovery_if_due(session, discovery_registry, now=now)
+        _start_discovery_if_due(session, discovery_registry, notifier, now=now)
 
     _start_local_stock_check_if_due(session, now=now)
 
@@ -341,26 +341,46 @@ def _start_local_stock_check_if_due(session: Session, *, now: datetime | None = 
 
 
 def _start_discovery_if_due(
-    session: Session, discovery_registry: DiscoveryRegistry, *, now: datetime | None = None
+    session: Session,
+    discovery_registry: DiscoveryRegistry,
+    notifier: EmbedSender,
+    *,
+    now: datetime | None = None,
 ) -> None:
     """Fires discovery for at most one due Product as a background task
     — never awaited here, see module docstring. Skips if a discovery is
     already in flight (concurrency capped at 1) so it never has to share
-    a Session write with itself."""
+    a Session write with itself.
+
+    Phase 36: among every currently-due product, picks the one with the
+    SMALLEST effective_discovery_interval (i.e. the most time-sensitive
+    one — a drop-window product ramped down to 30-45s, per
+    engine/release_awareness.py) rather than plain list order. Without
+    this, a product in a real drop window could sit behind a dozen
+    ordinary 1800s-interval products that all happened to come due at
+    once (e.g. right after a worker restart, when every product's
+    last_discovery_at is still None) — "one due product per tick" would
+    then take many ticks to even reach it, defeating the whole point of
+    a fast cadence. Ties (same interval) keep list order."""
     global _discovery_in_flight
     if _discovery_in_flight:
         return
     now = now or datetime.now(UTC)
-    for product in crud.list_products(session, status="active"):
-        if not is_discovery_due(product, now):
-            continue
-        _discovery_in_flight = True
-        task = asyncio.ensure_future(
-            run_discovery_for_product(session, product, discovery_registry, now=now)
-        )
-        _background_tasks.add(task)
-        task.add_done_callback(_discovery_task_done)
-        return  # one due product per tick, regardless of outcome
+    due_products = [
+        product
+        for product in crud.list_products(session, status="active")
+        if is_discovery_due(product, now)
+    ]
+    if not due_products:
+        return
+    product = min(due_products, key=lambda p: effective_discovery_interval(p, now))
+
+    _discovery_in_flight = True
+    task = asyncio.ensure_future(
+        run_discovery_for_product(session, product, discovery_registry, now=now, notifier=notifier)
+    )
+    _background_tasks.add(task)
+    task.add_done_callback(_discovery_task_done)
 
 
 async def run_forever(

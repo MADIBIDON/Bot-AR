@@ -211,3 +211,35 @@ def format_purchase_embed(
         embed.add_field(name="Order ID", value=order_reference, inline=True)
     embed.add_field(name="Reason", value=reason, inline=False)
     return embed
+
+
+def format_discovery_embed(
+    *,
+    product_name: str,
+    merchant: str,
+    url: str,
+    price: Decimal,
+    currency: str,
+    ean: str | None,
+) -> discord.Embed:
+    """Phase 36: a brand-new auto-linked Listing found by discovery —
+    distinct from format_event_embed's "an already-monitored listing
+    changed" alert. Fired at most once per Listing (discovery only ever
+    auto-links a given merchant/external_id pair once, see
+    app/discovery.py::_get_or_create_listing). Never claims a purchase
+    happened or is imminent — direct monitoring of the exact listing
+    takes over from here."""
+    embed = discord.Embed(
+        title="🆕 New Listing Discovered",
+        url=url,
+        color=discord.Color.green(),
+    )
+    embed.add_field(name="Product", value=product_name, inline=False)
+    embed.add_field(name="Merchant", value=merchant, inline=True)
+    embed.add_field(name="Price", value=f"{price} {currency}", inline=True)
+    if ean:
+        embed.add_field(name="EAN", value=ean, inline=True)
+    embed.add_field(
+        name="Status", value="Exact EAN match — direct monitoring now active.", inline=False
+    )
+    return embed

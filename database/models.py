@@ -68,6 +68,14 @@ class Product(Base):
     # their own max_price/target_price) working unchanged.
     discovery_interval: Mapped[int] = mapped_column(default=1800, nullable=False)
     last_discovery_at: Mapped[datetime | None] = mapped_column(default=None)
+    # Phase 36 (Cultura drop-window discovery): reuses the exact same
+    # scheduled_release_at + dynamic-interval mechanism WatchRule already
+    # has (Phase 31, engine/release_awareness.py) — a Product with no
+    # known listing yet can now also ramp its DISCOVERY cadence up near a
+    # release, not just a WatchRule's monitoring cadence. None (the
+    # default) leaves discovery_interval as the sole, unchanged cadence —
+    # see app/discovery.py::is_discovery_due().
+    scheduled_release_at: Mapped[datetime | None] = mapped_column(default=None)
 
     # Phase 25 — profitability-based purchase decisions, mirrored from
     # WatchRule (Phase 15/16) so a Product Watch's many auto-discovered

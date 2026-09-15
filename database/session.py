@@ -172,6 +172,12 @@ _WATCH_RULE_ALERTING_COLUMNS = {
     "scheduled_release_at": "DATETIME",
 }
 
+# Phase 36 — Cultura drop-window discovery. Mirrors
+# _WATCH_RULE_ALERTING_COLUMNS's scheduled_release_at, one layer up (a
+# Product with no Listing/WatchRule yet still needs a dynamic DISCOVERY
+# cadence near a release — see app/discovery.py::is_discovery_due()).
+_PRODUCT_RELEASE_COLUMNS = {"scheduled_release_at": "DATETIME"}
+
 # Phase 33 — cross-listing purchase idempotency. See PurchaseAttempt's own
 # docstring in database/models.py for why this closes a real gap (one
 # active/purchased attempt per *product*, not just per listing).
@@ -201,6 +207,7 @@ def create_all(engine: Engine) -> None:
     _ensure_product_discovery_columns(engine)
     _ensure_columns(engine, "products", _PRODUCT_OPPORTUNITY_COLUMNS)
     _ensure_columns(engine, "products", _PROFITABILITY_THRESHOLD_COLUMNS)
+    _ensure_columns(engine, "products", _PRODUCT_RELEASE_COLUMNS)
     _ensure_columns(engine, "watch_rules", _PROFITABILITY_THRESHOLD_COLUMNS)
     _ensure_columns(engine, "watch_rules", _WATCH_RULE_ALERTING_COLUMNS)
     _ensure_columns(engine, "purchase_attempts", _PURCHASE_ATTEMPT_PRODUCT_COLUMN)

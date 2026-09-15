@@ -52,10 +52,12 @@ from database import crud
 from database.time_utils import ensure_utc
 from discovery.base import DiscoveryError, DiscoveryUnavailableError
 from discovery.matcher import classify_candidate
+from engine.release_awareness import dynamic_check_interval
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
 
+    from app.notify import EmbedSender
     from connectors.base import ConnectorProduct
     from database.models import Listing, Merchant, Product
     from discovery.base import RetailDiscoverySource
@@ -158,7 +160,16 @@ async def run_discovery_for_product(
     check_interval: int = DEFAULT_AUTO_LINKED_CHECK_INTERVAL_SECONDS,
     now: datetime | None = None,
     max_concurrent: int | None = None,
+    notifier: EmbedSender | None = None,
 ) -> DiscoveryRunResult:
+    """notifier (Phase 36): when given, fires exactly one Discord embed
+    per genuinely NEW auto-linked Listing (never for an already-monitored
+    one, never for a mere CANDIDATE) — see format_discovery_embed's own
+    docstring. Defaults to None so every existing caller/test is
+    unaffected; app/worker.py's real background call passes the real
+    notifier. A Discord failure here is caught and logged, never allowed
+    to fail the discovery run itself (same posture as
+    purchase/engine.py::_notify_purchase)."""
     now = now or datetime.now(UTC)
     max_concurrent = max_concurrent or max_concurrent_discovery_merchants()
     semaphore = asyncio.Semaphore(max_concurrent)
@@ -176,15 +187,43 @@ async def run_discovery_for_product(
         if raw.status != "ok":
             outcomes.append(MerchantDiscoveryOutcome(raw.merchant_name, raw.status, raw.detail))
             continue
-        candidate_results = [
-            _link_or_report(session, product, raw.merchant_name, candidate, check_interval)
-            for candidate in raw.candidates
-        ]
+        candidate_results = []
+        for candidate in raw.candidates:
+            result = _link_or_report(session, product, raw.merchant_name, candidate, check_interval)
+            candidate_results.append(result)
+            is_new_link = (
+                result.verdict == "auto_link"
+                and not result.already_monitored
+                and result.watch_rule_id is not None
+            )
+            if is_new_link and notifier is not None:
+                await _notify_new_listing(notifier, product, raw.merchant_name, candidate)
         outcomes.append(MerchantDiscoveryOutcome(raw.merchant_name, "ok", None, candidate_results))
 
     product.last_discovery_at = now
     session.commit()
     return DiscoveryRunResult(product_id=product.id, merchants=outcomes)
+
+
+async def _notify_new_listing(
+    notifier: EmbedSender, product: Product, merchant_name: str, candidate: ConnectorProduct
+) -> None:
+    from notifications.discord.formatter import format_discovery_embed
+
+    embed = format_discovery_embed(
+        product_name=product.name,
+        merchant=merchant_name,
+        url=candidate.url,
+        price=candidate.price,
+        currency=candidate.currency,
+        ean=candidate.ean,
+    )
+    try:
+        await notifier.send_embed(embed)
+    except Exception:  # noqa: BLE001 - a Discord failure must never break discovery
+        logger.exception(
+            "discovery notification failed product=%s merchant=%s", product.id, merchant_name
+        )
 
 
 def _get_or_create_merchant(session: Session, merchant_name: str) -> Merchant:
@@ -287,8 +326,25 @@ def _link_or_report(
     )
 
 
+def effective_discovery_interval(product: Product, now: datetime) -> int:
+    """Phase 36: mirrors engine/worker.py::_base_check_interval's exact
+    pattern, one layer up — a Product with a real, source-published
+    scheduled_release_at ramps its DISCOVERY cadence the same way a
+    WatchRule already ramps its monitoring cadence (Phase 31 section 12).
+    None (every product before this phase, and any without an announced
+    release time) leaves discovery_interval completely unaffected. Public
+    (not `_`-prefixed): app/worker.py's scheduler also needs this to
+    prioritize which due product to check first — see
+    _start_discovery_if_due's own docstring."""
+    if product.scheduled_release_at is None:
+        return product.discovery_interval
+    return dynamic_check_interval(
+        ensure_utc(product.scheduled_release_at), now, product.discovery_interval
+    )
+
+
 def is_discovery_due(product: Product, now: datetime) -> bool:
     if product.last_discovery_at is None:
         return True
     last = ensure_utc(product.last_discovery_at)
-    return (now - last).total_seconds() >= product.discovery_interval
+    return (now - last).total_seconds() >= effective_discovery_interval(product, now)

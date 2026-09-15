@@ -23,12 +23,15 @@ GenericSchemaOrgConnector without any further lookup.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import httpx
 
 from connectors.base import ConnectorProduct
-from discovery.base import DiscoveryError, RetailDiscoverySource
+from discovery.base import DiscoveryError, DiscoveryUnavailableError, RetailDiscoverySource
+
+_DEFAULT_RETRY_AFTER_SECONDS = 60  # used only when a 429 gives no parseable Retry-After
 
 DEFAULT_TIMEOUT_SECONDS = 8.0
 DEFAULT_USER_AGENT = "RetailOpportunityAssistant/0.1 (+public catalog search; no auto-purchase)"
@@ -65,10 +68,22 @@ class CulturaSearchDiscoverySource(RetailDiscoverySource):
         # Phase 23 pattern (connectors/schema_org.py): one persistent
         # client, built once, reused for this source's whole lifetime.
         self._client = httpx.Client(timeout=timeout, headers={"User-Agent": DEFAULT_USER_AGENT})
+        # Phase 36 section "respect absolu de 429/Retry-After": a real
+        # rate-limit response sets this, and every search() call before
+        # it elapses short-circuits WITHOUT even attempting the request —
+        # never just logged and immediately retried.
+        self._retry_not_before: datetime | None = None
 
     def search(
         self, query: str, *, ean: str | None = None, mpn: str | None = None, limit: int = 10
     ) -> list[ConnectorProduct]:
+        now = datetime.now(UTC)
+        if self._retry_not_before is not None and now < self._retry_not_before:
+            raise DiscoveryUnavailableError(
+                f"{self._merchant_name}: respecting a prior 429's Retry-After — next attempt "
+                f"not before {self._retry_not_before.isoformat()}"
+            )
+
         variables = {"currentPage": 1, "pageSize": limit, "search": query}
         try:
             response = self._client.get(
@@ -81,6 +96,13 @@ class CulturaSearchDiscoverySource(RetailDiscoverySource):
                 f"{self._merchant_name}: network error searching catalog: {exc}"
             ) from exc
 
+        if response.status_code == 429:
+            retry_seconds = _parse_retry_after_seconds(response.headers.get("Retry-After"))
+            self._retry_not_before = now + timedelta(seconds=retry_seconds)
+            raise DiscoveryError(
+                f"{self._merchant_name}: rate limited (429) — backing off {retry_seconds}s "
+                f"per its own Retry-After header"
+            )
         if response.status_code >= 400:
             raise DiscoveryError(
                 f"{self._merchant_name}: catalog search returned HTTP {response.status_code}"
@@ -121,3 +143,17 @@ class CulturaSearchDiscoverySource(RetailDiscoverySource):
             ean=item.get("ean") or None,
             mpn=item.get("sku") or None,
         )
+
+
+def _parse_retry_after_seconds(raw: str | None) -> int:
+    """Retry-After is either a plain integer (delta-seconds, the common
+    case) or an HTTP-date. Only the integer form is parsed; an HTTP-date
+    or anything unparseable falls back to a conservative fixed wait
+    rather than guessing a shorter one — never less respectful than what
+    the header actually gave when it's readable."""
+    if raw is not None:
+        try:
+            return max(1, int(raw.strip()))
+        except ValueError:
+            pass
+    return _DEFAULT_RETRY_AFTER_SECONDS

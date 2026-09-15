@@ -13,7 +13,7 @@ from decimal import Decimal
 import httpx
 import pytest
 
-from discovery.base import DiscoveryError
+from discovery.base import DiscoveryError, DiscoveryUnavailableError
 from discovery.cultura import CulturaSearchDiscoverySource
 
 
@@ -192,3 +192,62 @@ def test_real_search_response_shape_from_live_recon() -> None:
     assert result.name == "EV08 coffret Dresseur d'Elite - Pokémon"
     assert result.price == Decimal("55.99")
     assert result.available is False
+
+
+# --- Phase 36: 429 / Retry-After -----------------------------------------
+
+
+def test_429_with_retry_after_header_backs_off_for_that_long(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _source()
+    calls: list[int] = []
+
+    def fake_get(url: str, **kwargs: object) -> httpx.Response:
+        calls.append(1)
+        return httpx.Response(429, headers={"Retry-After": "30"}, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(source._client, "get", fake_get)
+
+    with pytest.raises(DiscoveryError, match="429"):
+        source.search("x")
+    assert len(calls) == 1
+
+    # Immediately retrying must NOT even attempt a second real request.
+    with pytest.raises(DiscoveryUnavailableError, match="Retry-After"):
+        source.search("x")
+    assert len(calls) == 1  # still 1 — the second call never touched the network
+
+
+def test_429_without_retry_after_uses_a_conservative_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _source()
+
+    def fake_get(url: str, **kwargs: object) -> httpx.Response:
+        return httpx.Response(429, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(source._client, "get", fake_get)
+
+    with pytest.raises(DiscoveryError, match="429"):
+        source.search("x")
+
+    assert source._retry_not_before is not None
+
+
+def test_backoff_expires_and_search_resumes(monkeypatch: pytest.MonkeyPatch) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    source = _source()
+    source._retry_not_before = datetime.now(UTC) - timedelta(seconds=1)  # already expired
+
+    def fake_get(url: str, **kwargs: object) -> httpx.Response:
+        return httpx.Response(
+            200, json=_graphql_response([_item()]), request=httpx.Request("GET", url)
+        )
+
+    monkeypatch.setattr(source._client, "get", fake_get)
+
+    results = source.search("pokemon ev08")
+
+    assert len(results) == 1
