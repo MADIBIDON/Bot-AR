@@ -1,12 +1,17 @@
-"""purchase/merchants/cultura.py — Phase 39.
+"""purchase/merchants/cultura.py — Phase 39/40.
 
 No real network for these unit tests: httpx.post is monkeypatched to
 return locally-built httpx.Response objects shaped exactly like the
 real Cultura Magento 2 GraphQL responses captured live this session
 (createEmptyCart, addSimpleProductsToCart, products-by-url_key) via a
 genuine, one-time, manual browser action — never scripted automation of
-their site. No real cart is ever created by these tests, no real order
-is ever touched.
+their site — plus the standard, publicly documented Magento 2 core
+shipping/billing mutations (Phase 40). No real cart is ever created by
+these tests, no real order is ever touched, and no test here ever
+configures a payment method or calls placeOrder. Shipping-profile tests
+use entirely fake/synthetic values via monkeypatch.setenv — never the
+real local profile in .env — matching this project's standing rule that
+real personal data never appears in a test.
 """
 
 from __future__ import annotations
@@ -18,8 +23,23 @@ import httpx
 import pytest
 
 from purchase.base import HumanActionRequiredError, PurchaseError, StaleListingError
-from purchase.merchants.cultura import CulturaPurchaseConnector
+from purchase.merchants.cultura import CulturaCheckoutState, CulturaPurchaseConnector
 from purchase.models import PurchaseIntent
+
+_FAKE_SHIPPING_ENV_VARS = {
+    "PURCHASE_SHIPPING_FIRST_NAME": "Test",
+    "PURCHASE_SHIPPING_LAST_NAME": "User",
+    "PURCHASE_SHIPPING_ADDRESS": "1 rue de Test",
+    "PURCHASE_SHIPPING_CITY": "Testville",
+    "PURCHASE_SHIPPING_POSTAL_CODE": "00000",
+    "PURCHASE_SHIPPING_COUNTRY": "FR",
+}
+
+
+def _set_fake_shipping_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name, value in _FAKE_SHIPPING_ENV_VARS.items():
+        monkeypatch.setenv(name, value)
+
 
 _URL = "https://www.cultura.com/p-pokemon-ev08-coffret-dresseur-d-elite-10816948.html"
 
@@ -99,7 +119,72 @@ def _add_to_cart_response(
     }
 
 
-def _router(*, lookup: dict, cart: dict | None = None, add: dict | None = None):
+def _shipping_address_response(
+    *, carrier_code: str = "colissimo", method_code: str = "delivery", amount: float = 4.99
+) -> dict:
+    return {
+        "data": {
+            "setShippingAddressesOnCart": {
+                "cart": {
+                    "shipping_addresses": [
+                        {
+                            "available_shipping_methods": [
+                                {
+                                    "carrier_code": carrier_code,
+                                    "method_code": method_code,
+                                    "amount": {"value": amount, "currency": "EUR"},
+                                    "available": True,
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        }
+    }
+
+
+def _shipping_method_response(
+    *, carrier_code: str = "colissimo", method_code: str = "delivery", amount: float = 4.99
+) -> dict:
+    return {
+        "data": {
+            "setShippingMethodsOnCart": {
+                "cart": {
+                    "shipping_addresses": [
+                        {
+                            "selected_shipping_method": {
+                                "carrier_code": carrier_code,
+                                "method_code": method_code,
+                                "amount": {"value": amount, "currency": "EUR"},
+                            }
+                        }
+                    ]
+                }
+            }
+        }
+    }
+
+
+def _billing_address_response() -> dict:
+    return {
+        "data": {
+            "setBillingAddressOnCart": {
+                "cart": {"billing_address": {"firstname": "Test", "lastname": "User"}}
+            }
+        }
+    }
+
+
+def _router(
+    *,
+    lookup: dict,
+    cart: dict | None = None,
+    add: dict | None = None,
+    shipping_address: dict | None = None,
+    shipping_method: dict | None = None,
+    billing_address: dict | None = None,
+):
     calls: list[str] = []
 
     def fake_post(url: str, *, json: dict, **kwargs: object) -> httpx.Response:
@@ -109,6 +194,18 @@ def _router(*, lookup: dict, cart: dict | None = None, add: dict | None = None):
             body = lookup
         elif "createEmptyCart" in query:
             body = cart or _create_cart_response()
+        elif "setShippingAddressesOnCart" in query:
+            if shipping_address is None:
+                raise AssertionError("unexpected setShippingAddressesOnCart call")
+            body = shipping_address
+        elif "setShippingMethodsOnCart" in query:
+            if shipping_method is None:
+                raise AssertionError("unexpected setShippingMethodsOnCart call")
+            body = shipping_method
+        elif "setBillingAddressOnCart" in query:
+            if billing_address is None:
+                raise AssertionError("unexpected setBillingAddressOnCart call")
+            body = billing_address
         elif "addSimpleProductsToCart" in query:
             body = add or _add_to_cart_response()
         else:
@@ -232,6 +329,217 @@ def test_unknown_quantity_available_defaults_to_available(
     result = connector.revalidate(_intent())
 
     assert result.available is True
+
+
+# --- Phase 40: shipping / billing state machine -------------------------
+
+
+def test_revalidate_resolves_real_shipping_cost_when_profile_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_fake_shipping_profile(monkeypatch)
+    connector = CulturaPurchaseConnector()
+    fake_post, calls = _router(
+        lookup=_product_lookup_response(),
+        shipping_address=_shipping_address_response(amount=4.99),
+        shipping_method=_shipping_method_response(amount=4.99),
+        billing_address=_billing_address_response(),
+    )
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    result = connector.revalidate(_intent())
+
+    assert result.available is True
+    assert result.shipping_cost == Decimal("4.99")
+    assert connector.last_checkout_state == CulturaCheckoutState.BILLING_ADDRESS_SET
+    assert len(calls) == 6  # lookup, cart, add, shipping addr, shipping method, billing
+
+
+def test_revalidate_leaves_shipping_none_when_profile_not_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in _FAKE_SHIPPING_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    connector = CulturaPurchaseConnector()
+    # No shipping/billing fixtures given — _router raises AssertionError
+    # if the connector ever calls one of those mutations, so this test
+    # doubles as proof no shipping call happens without a local profile.
+    fake_post, _ = _router(lookup=_product_lookup_response())
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    result = connector.revalidate(_intent())
+
+    assert result.shipping_cost is None
+    assert connector.last_checkout_state == CulturaCheckoutState.CART_WITH_PRODUCT
+
+
+def test_shipping_failure_degrades_gracefully_without_breaking_revalidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shipping-step hiccup (GraphQL error) must never turn a
+    successful cart-level revalidation into a false rejection."""
+    _set_fake_shipping_profile(monkeypatch)
+    connector = CulturaPurchaseConnector()
+
+    def fake_post(url: str, *, json: dict, **kwargs: object) -> httpx.Response:
+        query = json["query"]
+        if "products(filter" in query:
+            body = _product_lookup_response()
+        elif "createEmptyCart" in query:
+            body = _create_cart_response()
+        elif "addSimpleProductsToCart" in query:
+            body = _add_to_cart_response()
+        elif "setShippingAddressesOnCart" in query:
+            return httpx.Response(
+                200,
+                json={"errors": [{"message": "Address unusable"}]},
+                request=httpx.Request("POST", url),
+            )
+        else:
+            raise AssertionError(f"unexpected query: {query[:60]}")
+        return httpx.Response(200, json=body, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    result = connector.revalidate(_intent())
+
+    assert result.available is True
+    assert result.price == Decimal("55.99")
+    assert result.shipping_cost is None
+    assert connector.last_checkout_state == CulturaCheckoutState.CART_WITH_PRODUCT
+
+
+def test_picks_cheapest_available_shipping_method(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_fake_shipping_profile(monkeypatch)
+    connector = CulturaPurchaseConnector()
+    shipping_response = {
+        "data": {
+            "setShippingAddressesOnCart": {
+                "cart": {
+                    "shipping_addresses": [
+                        {
+                            "available_shipping_methods": [
+                                {
+                                    "carrier_code": "cheap_but_unavailable",
+                                    "method_code": "x",
+                                    "amount": {"value": 0.01, "currency": "EUR"},
+                                    "available": False,
+                                },
+                                {
+                                    "carrier_code": "express",
+                                    "method_code": "y",
+                                    "amount": {"value": 9.99, "currency": "EUR"},
+                                    "available": True,
+                                },
+                                {
+                                    "carrier_code": "standard",
+                                    "method_code": "z",
+                                    "amount": {"value": 4.99, "currency": "EUR"},
+                                    "available": True,
+                                },
+                            ]
+                        }
+                    ]
+                }
+            }
+        }
+    }
+    fake_post, calls = _router(
+        lookup=_product_lookup_response(),
+        shipping_address=shipping_response,
+        shipping_method=_shipping_method_response(carrier_code="standard", amount=4.99),
+        billing_address=_billing_address_response(),
+    )
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    result = connector.revalidate(_intent())
+
+    assert result.shipping_cost == Decimal("4.99")
+    method_call = next(c for c in calls if "setShippingMethodsOnCart" in c)
+    assert method_call  # the mutation was actually invoked
+
+
+def test_checkout_never_calls_a_payment_or_order_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defensive proof, not just a docstring claim: even after shipping
+    and billing succeed, checkout() must still raise
+    HumanActionRequiredError, and no call this connector ever makes may
+    mention a payment/order mutation."""
+    _set_fake_shipping_profile(monkeypatch)
+    connector = CulturaPurchaseConnector()
+    fake_post, calls = _router(
+        lookup=_product_lookup_response(),
+        shipping_address=_shipping_address_response(),
+        shipping_method=_shipping_method_response(),
+        billing_address=_billing_address_response(),
+    )
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    result = connector.revalidate(_intent())
+    with pytest.raises(HumanActionRequiredError):
+        connector.checkout(_intent(), result)
+
+    assert connector.last_checkout_state == CulturaCheckoutState.PAYMENT_HUMAN_REQUIRED
+    forbidden = ("setPaymentMethodOnCart", "placeOrder", "VaultCardPaymentToken", "adyenPayment")
+    for call in calls:
+        for term in forbidden:
+            assert term not in call
+
+
+def test_check_payment_readiness_reaches_billing_when_shipping_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_fake_shipping_profile(monkeypatch)
+    connector = CulturaPurchaseConnector()
+    fake_post, _ = _router(
+        lookup=_product_lookup_response(),
+        shipping_address=_shipping_address_response(),
+        shipping_method=_shipping_method_response(),
+        billing_address=_billing_address_response(),
+    )
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    readiness = connector.check_payment_readiness(_URL)
+
+    assert readiness.checkout_state == CulturaCheckoutState.BILLING_ADDRESS_SET
+    assert readiness.shipping_cost == Decimal("4.99")
+    assert readiness.reason is None
+
+
+def test_check_payment_readiness_reports_reason_when_product_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connector = CulturaPurchaseConnector()
+
+    def fake_post(url: str, *, json: dict, **kwargs: object) -> httpx.Response:
+        return httpx.Response(
+            200, json={"data": {"products": {"items": []}}}, request=httpx.Request("POST", url)
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    readiness = connector.check_payment_readiness(_URL)
+
+    assert readiness.checkout_state == CulturaCheckoutState.EMPTY_CART
+    assert readiness.reason is not None
+    assert "no longer exists" in readiness.reason
+
+
+def test_check_payment_readiness_reports_cart_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connector = CulturaPurchaseConnector()
+    fake_post, _ = _router(
+        lookup=_product_lookup_response(),
+        add=_add_to_cart_response(cart_error="out of stock"),
+    )
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    readiness = connector.check_payment_readiness(_URL)
+
+    assert readiness.checkout_state == CulturaCheckoutState.CART_UNAVAILABLE
+    assert readiness.reason is not None
 
 
 def test_checkout_always_raises_human_action_required() -> None:
@@ -420,4 +728,4 @@ def test_full_attempt_purchase_reaches_human_action_required(
     )
 
     assert outcome.status.value == "human_action_required"
-    assert "HUMAN ACTION REQUIRED" in [e.title for e in notifier.sent_embeds]
+    assert "🟠 HUMAN ACTION REQUIRED" in [e.title for e in notifier.sent_embeds]

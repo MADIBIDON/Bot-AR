@@ -158,8 +158,8 @@ def test_purchase_success_persists_and_notifies(session: Session) -> None:
     assert attempts[0].status == "purchased"
     assert attempts[0].order_reference == "ORDER-123"
     titles = [e.title for e in notifier.sent_embeds]
-    assert "PURCHASE STARTED" in titles
-    assert "PURCHASE SUCCESS" in titles
+    assert "⚡ AUTO PURCHASE STARTED" in titles
+    assert "✅ PURCHASED" in titles
 
 
 def test_purchase_disabled_creates_no_attempt_row(session: Session) -> None:
@@ -212,7 +212,7 @@ def test_checkout_unsupported_reports_status_and_alerts(session: Session) -> Non
     assert outcome.status == PurchaseStatus.AUTOMATED_CHECKOUT_UNSUPPORTED
     attempts = crud.list_purchase_attempts(session)
     assert attempts[0].status == "automated_checkout_unsupported"
-    assert "AUTOMATED CHECKOUT UNSUPPORTED" in [e.title for e in notifier.sent_embeds]
+    assert "🚨 BUY NOW" in [e.title for e in notifier.sent_embeds]
 
 
 def test_captcha_during_revalidation_yields_human_action_required(session: Session) -> None:
@@ -237,7 +237,7 @@ def test_captcha_during_revalidation_yields_human_action_required(session: Sessi
     )
 
     assert outcome.status == PurchaseStatus.HUMAN_ACTION_REQUIRED
-    assert "HUMAN ACTION REQUIRED" in [e.title for e in notifier.sent_embeds]
+    assert "🟠 HUMAN ACTION REQUIRED" in [e.title for e in notifier.sent_embeds]
 
 
 def test_3ds_during_checkout_yields_human_action_required(session: Session) -> None:
@@ -376,7 +376,7 @@ def test_checkout_failure_reports_failed(session: Session) -> None:
     )
 
     assert outcome.status == PurchaseStatus.FAILED
-    assert "PURCHASE FAILED" in [e.title for e in notifier.sent_embeds]
+    assert "❌ PURCHASE FAILED" in [e.title for e in notifier.sent_embeds]
 
 
 def test_duplicate_active_attempt_is_refused_not_double_purchased(session: Session) -> None:

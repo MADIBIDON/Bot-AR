@@ -446,7 +446,7 @@ def test_full_pipeline_reaches_human_action_required(
     assert outcome.status == PurchaseStatus.HUMAN_ACTION_REQUIRED
     attempts = crud.list_purchase_attempts(session)
     assert attempts[0].status == "human_action_required"
-    assert "HUMAN ACTION REQUIRED" in [e.title for e in notifier.sent_embeds]
+    assert "🟠 HUMAN ACTION REQUIRED" in [e.title for e in notifier.sent_embeds]
 
 
 def test_full_pipeline_cancels_when_total_exceeds_max_price(

@@ -168,12 +168,20 @@ def _add_opportunity_intelligence_fields(
 
 
 _PURCHASE_TITLE_COLORS: dict[str, discord.Color] = {
-    "PURCHASE STARTED": discord.Color.blue(),
-    "PURCHASE SUCCESS": discord.Color.green(),
-    "PURCHASE FAILED": discord.Color.red(),
-    "HUMAN ACTION REQUIRED": discord.Color.orange(),
-    "AUTOMATED CHECKOUT UNSUPPORTED": discord.Color.orange(),
+    "⚡ AUTO PURCHASE STARTED": discord.Color.blue(),
+    "✅ PURCHASED": discord.Color.green(),
+    "❌ PURCHASE FAILED": discord.Color.red(),
+    "🟠 HUMAN ACTION REQUIRED": discord.Color.orange(),
+    "🚨 BUY NOW": discord.Color.gold(),
 }
+
+# Phase 40 section 22: these two statuses are exactly "automation cannot
+# finish this — a human must act right now" — both get the same
+# actionable fields (a visible direct link + an explicit next action),
+# on top of the normal lifecycle fields every purchase embed already
+# carries. Not a second embed: enriching the one that already fires
+# keeps this simple and doesn't double-notify for the same event.
+_ACTIONABLE_TITLES = frozenset({"🟠 HUMAN ACTION REQUIRED", "🚨 BUY NOW"})
 
 
 def format_purchase_embed(
@@ -209,6 +217,9 @@ def format_purchase_embed(
         embed.add_field(name="Total", value=f"{total_cost}", inline=True)
     if order_reference is not None:
         embed.add_field(name="Order ID", value=order_reference, inline=True)
+    if title in _ACTIONABLE_TITLES:
+        embed.add_field(name="Direct URL", value=intent.url, inline=False)
+        embed.add_field(name="Action", value="OPEN CHECKOUT", inline=True)
     embed.add_field(name="Reason", value=reason, inline=False)
     return embed
 

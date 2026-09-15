@@ -485,7 +485,7 @@ def test_full_pipeline_reaches_human_action_required_for_payment(
     assert outcome.status == PurchaseStatus.HUMAN_ACTION_REQUIRED
     attempts = crud.list_purchase_attempts(session)
     assert attempts[0].status == "human_action_required"
-    assert "HUMAN ACTION REQUIRED" in [e.title for e in notifier.sent_embeds]
+    assert "🟠 HUMAN ACTION REQUIRED" in [e.title for e in notifier.sent_embeds]
 
 
 # --- Phase 34: persistent-client injection -----------------------------

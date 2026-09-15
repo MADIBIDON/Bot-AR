@@ -404,7 +404,7 @@ async def attempt_purchase(
             status=PurchaseStatus.FAILED.value,
             failure_reason=str(exc),
         )
-        await _notify_purchase(notifier, "PURCHASE FAILED", intent, reason=str(exc))
+        await _notify_purchase(notifier, "❌ PURCHASE FAILED", intent, reason=str(exc))
         return PurchaseOutcome(
             status=PurchaseStatus.FAILED, reason=str(exc), intent=intent, trace=hot.trace
         )
@@ -547,7 +547,9 @@ async def attempt_purchase(
         )
 
     crud.update_purchase_attempt(session, attempt.id, status=PurchaseStatus.CHECKOUT_STARTED.value)
-    await _notify_purchase(notifier, "PURCHASE STARTED", intent, reason="Checkout in progress.")
+    await _notify_purchase(
+        notifier, "⚡ AUTO PURCHASE STARTED", intent, reason="Checkout in progress."
+    )
 
     try:
         result = await asyncio.to_thread(connector.checkout, intent, revalidated)
@@ -604,7 +606,7 @@ async def attempt_purchase(
     )
     await _notify_purchase(
         notifier,
-        "PURCHASE SUCCESS",
+        "✅ PURCHASED",
         intent,
         reason="Purchase completed.",
         final_price=result.final_price,
@@ -636,12 +638,17 @@ async def _finish(
 ) -> PurchaseOutcome:
     crud.update_purchase_attempt(session, attempt_id, status=status.value, failure_reason=reason)
     logger.info("purchase_attempt=%s status=%s reason=%s", attempt_id, status.value, reason)
+    # Phase 40 section 21/22: HUMAN_ACTION_REQUIRED and
+    # AUTOMATED_CHECKOUT_UNSUPPORTED both mean "a human must act right
+    # now" — the Discord cockpit's actionable "buy now" alert, not a
+    # plain failure. format_purchase_embed() adds the Direct URL/Action
+    # fields for exactly these two titles.
     title = {
-        PurchaseStatus.HUMAN_ACTION_REQUIRED: "HUMAN ACTION REQUIRED",
-        PurchaseStatus.AUTOMATED_CHECKOUT_UNSUPPORTED: "AUTOMATED CHECKOUT UNSUPPORTED",
-        PurchaseStatus.FAILED: "PURCHASE FAILED",
-        PurchaseStatus.CANCELLED: "PURCHASE FAILED",
-    }.get(status, "PURCHASE FAILED")
+        PurchaseStatus.HUMAN_ACTION_REQUIRED: "🟠 HUMAN ACTION REQUIRED",
+        PurchaseStatus.AUTOMATED_CHECKOUT_UNSUPPORTED: "🚨 BUY NOW",
+        PurchaseStatus.FAILED: "❌ PURCHASE FAILED",
+        PurchaseStatus.CANCELLED: "❌ PURCHASE FAILED",
+    }.get(status, "❌ PURCHASE FAILED")
     await _notify_purchase(notifier, title, intent, reason=reason)
     return PurchaseOutcome(
         status=status, reason=reason, intent=intent, attempt_id=attempt_id, trace=trace

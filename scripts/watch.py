@@ -857,6 +857,96 @@ def cmd_purchase_test(args: argparse.Namespace) -> int:
     return 0
 
 
+# Phase 40 section 8/11: a real, live, deliberately non-drop product used
+# to probe a retailer's checkout depth without ever touching a
+# drop-critical listing's own cart state.
+_PAYMENT_SETUP_PROBE_URLS = {
+    "cultura": "https://www.cultura.com/p-pokemon-ev08-coffret-dresseur-d-elite-10816948.html",
+}
+
+
+def cmd_payment_setup(args: argparse.Namespace) -> int:
+    """Non-transactional readiness probe (Phase 40 sections 8/11): goes
+    as far as this project's real connector for `retailer` can
+    legitimately go — cart, shipping, billing — and reports exactly
+    which steps are real/READY vs BLOCKED. Never places an order, never
+    touches PURCHASES_ENABLED, never persists a PurchaseAttempt."""
+    load_dotenv(override=True)
+    retailer = args.retailer.strip().lower()
+    label = retailer.upper()
+    if retailer not in _PAYMENT_SETUP_PROBE_URLS:
+        probe_url = None
+    else:
+        probe_url = args.url or _PAYMENT_SETUP_PROBE_URLS[retailer]
+
+    if probe_url is None:
+        print(f"{label} PAYMENT READINESS")
+        print()
+        print("PAYMENT_SETUP_BLOCKED")
+        print(
+            f"reason=no PurchaseConnector implements a shipping/billing path for {label} yet "
+            "— see purchase/defaults.py."
+        )
+        return 1
+
+    from purchase.merchants.cultura import CulturaCheckoutState, CulturaPurchaseConnector
+    from purchase.shipping import load_shipping_address
+
+    print(f"{label} PAYMENT READINESS")
+    print()
+    print("Account/session ......... READY (guest checkout — no login required this far)")
+
+    if load_shipping_address() is None:
+        print("Shipping ................ BLOCKED")
+        print("Billing ................. BLOCKED")
+        print("Payment token ............ NOT_IMPLEMENTED")
+        print("3DS ...................... UNKNOWN")
+        print("Final checkout ........... BLOCKED")
+        print()
+        print("PAYMENT_SETUP_BLOCKED")
+        print("reason=no local shipping profile configured — set PURCHASE_SHIPPING_* in .env")
+        return 1
+
+    connector = CulturaPurchaseConnector()
+    readiness = connector.check_payment_readiness(probe_url)
+
+    shipping_ready = readiness.checkout_state in (
+        CulturaCheckoutState.SHIPPING_ADDRESS_SET,
+        CulturaCheckoutState.SHIPPING_METHOD_SET,
+        CulturaCheckoutState.BILLING_ADDRESS_SET,
+    )
+    billing_ready = readiness.checkout_state == CulturaCheckoutState.BILLING_ADDRESS_SET
+
+    print(
+        f"Shipping ................ {'READY' if shipping_ready else 'BLOCKED'} "
+        f"(state={readiness.checkout_state.value}, cost={readiness.shipping_cost})"
+    )
+    print(f"Billing ................. {'READY' if billing_ready else 'BLOCKED'}")
+    print(
+        "Payment token ............ NOT_IMPLEMENTED (Adyen's Magento2 plugin input shape was "
+        "never independently verified — never automated regardless, see "
+        "purchase/merchants/cultura.py)"
+    )
+    print("3DS ...................... MAY_BE_REQUIRED")
+    print(
+        "Final checkout ........... BLOCKED (payment/placeOrder is never automated by this project)"
+    )
+    print()
+    if readiness.reason is not None:
+        print(f"note: {readiness.reason}")
+    if connector.last_shipping_error is not None:
+        print(f"note: shipping/billing stopped because: {connector.last_shipping_error}")
+    if billing_ready:
+        print("PAYMENT_SETUP: cart + shipping + billing are READY on a real probe product.")
+        print("Payment/placeOrder still requires a human — see the product page.")
+        return 0
+    print("PAYMENT_SETUP_BLOCKED")
+    print(
+        f"reason=shipping/billing did not complete — reached state={readiness.checkout_state.value}"
+    )
+    return 1
+
+
 def _print_discovery_result(result) -> None:
     for outcome in result.merchants:
         if outcome.status == "unavailable":
@@ -1363,6 +1453,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     purchase_test_parser.add_argument("listing_id", type=int)
     purchase_test_parser.set_defaults(func=cmd_purchase_test)
+
+    payment_setup_parser = subparsers.add_parser(
+        "payment-setup",
+        help=(
+            "Non-transactional readiness probe: how far checkout can go for one retailer "
+            "(cart/shipping/billing) — never places an order."
+        ),
+    )
+    payment_setup_parser.add_argument("retailer")
+    payment_setup_parser.add_argument(
+        "--url",
+        default=None,
+        help="Override the built-in probe product URL (must still be a real, non-drop product).",
+    )
+    payment_setup_parser.set_defaults(func=cmd_payment_setup)
 
     status_parser = subparsers.add_parser("status", help="Show overall system status.")
     status_parser.set_defaults(func=cmd_status)

@@ -7,9 +7,10 @@ from engine.alerting import AlertTier, OpportunityIntelligence
 from engine.change_detection import EventType, MonitoringEvent
 from engine.opportunity import OpportunityConfig, evaluate_opportunity
 from engine.ranking import Priority
-from notifications.discord.formatter import format_event_embed
+from notifications.discord.formatter import format_event_embed, format_purchase_embed
 from products.matcher import MatchResult
 from products.observation import ProductObservation
+from purchase.models import PurchaseIntent
 
 
 def _observation(**overrides: object) -> ProductObservation:
@@ -255,3 +256,50 @@ def test_opportunity_score_improved_event_has_its_own_title() -> None:
     )
 
     assert embed.title == "🚀 Opportunity Improved"
+
+
+# --- Phase 40 section 21/22: purchase-lifecycle Discord cockpit --------
+
+
+def _intent() -> PurchaseIntent:
+    return PurchaseIntent(
+        watch_rule_id=1,
+        product_id=1,
+        listing_id=1,
+        merchant="Cultura",
+        product_name="ETB 30e",
+        url="https://www.cultura.com/p-etb-30e.html",
+        observed_price=Decimal("59.99"),
+        max_price_allowed=Decimal("90"),
+        quantity=1,
+        match_confidence=100,
+        created_at=datetime.now(UTC),
+    )
+
+
+def test_buy_now_embed_has_direct_url_and_action_fields() -> None:
+    embed = format_purchase_embed("🚨 BUY NOW", _intent(), reason="No PurchaseConnector.")
+
+    assert _field(embed, "Direct URL") == _intent().url
+    assert _field(embed, "Action") == "OPEN CHECKOUT"
+
+
+def test_human_action_required_embed_has_direct_url_and_action_fields() -> None:
+    embed = format_purchase_embed(
+        "🟠 HUMAN ACTION REQUIRED", _intent(), reason="3-D Secure required."
+    )
+
+    assert _field(embed, "Direct URL") == _intent().url
+    assert _field(embed, "Action") == "OPEN CHECKOUT"
+
+
+def test_purchase_started_embed_has_no_action_fields() -> None:
+    """Only the two "a human must act now" titles get the actionable
+    fields — a plain lifecycle update (started/success/failed) never
+    needs a "go open the checkout" instruction."""
+    embed = format_purchase_embed(
+        "⚡ AUTO PURCHASE STARTED", _intent(), reason="Checkout in progress."
+    )
+
+    assert _field(embed, "Direct URL") is None
+    assert _field(embed, "Action") is None
