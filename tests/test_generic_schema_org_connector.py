@@ -123,3 +123,43 @@ def test_http_403_raises_connector_error(monkeypatch: pytest.MonkeyPatch) -> Non
 
     with pytest.raises(ConnectorError, match="403"):
         connector.get_product("some-path.html")
+
+
+def test_http_429_with_retry_after_embeds_a_parseable_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 38 ("respect absolu de Retry-After"): the real header value
+    must survive into the error message engine/backoff.py later parses
+    back out — never silently discarded."""
+    connector = GenericSchemaOrgConnector(
+        shop_domain="example-generic-shop.test", merchant_name="X"
+    )
+
+    def fake_get(url: str, **kwargs: object) -> httpx.Response:
+        return httpx.Response(
+            429, headers={"Retry-After": "120"}, request=httpx.Request("GET", url)
+        )
+
+    monkeypatch.setattr(connector._client, "get", fake_get)
+
+    with pytest.raises(ConnectorError, match=r"429.*retry_after=120s"):
+        connector.get_product("some-path.html")
+
+
+def test_http_429_without_retry_after_has_no_marker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No header at all — the plain 429 message is unchanged, no
+    fabricated retry_after value is ever invented."""
+    connector = GenericSchemaOrgConnector(
+        shop_domain="example-generic-shop.test", merchant_name="X"
+    )
+
+    def fake_get(url: str, **kwargs: object) -> httpx.Response:
+        return httpx.Response(429, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(connector._client, "get", fake_get)
+
+    try:
+        connector.get_product("some-path.html")
+        raise AssertionError("expected ConnectorError")
+    except ConnectorError as exc:
+        assert "retry_after" not in str(exc)

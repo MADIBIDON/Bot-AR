@@ -105,7 +105,22 @@ class SchemaOrgProductConnector(BaseConnector):
         if response.status_code == 404:
             raise ProductNotFoundError(f"product page not found: {url}")
         if response.status_code == 429:
-            raise ConnectorError(f"rate limited (429) fetching {url}")
+            retry_after = response.headers.get("Retry-After")
+            # Phase 38 ("respect absolu de Retry-After"): the real header
+            # value, when present, is embedded in a parseable
+            # `retry_after=Ns` marker — engine/backoff.py reads it back
+            # out to make sure a real Retry-After is never overridden by
+            # a shorter exponential-backoff guess. Absent (or
+            # unparseable, e.g. an HTTP-date) falls through with no
+            # marker — the caller's own exponential backoff still
+            # applies, just without a server-stated floor to respect.
+            suffix = ""
+            if retry_after is not None:
+                try:
+                    suffix = f" (retry_after={max(1, int(retry_after.strip()))}s)"
+                except ValueError:
+                    pass
+            raise ConnectorError(f"rate limited (429) fetching {url}{suffix}")
         if response.status_code == 403:
             raise ConnectorError(f"access forbidden (403) fetching {url}")
         if response.status_code >= 400:

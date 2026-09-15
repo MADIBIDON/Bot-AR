@@ -44,6 +44,7 @@ from database import crud
 from database.time_utils import ensure_utc
 from engine.backoff import BackoffTracker
 from engine.monitoring import run_check, store_check_result
+from engine.post_discovery_cadence import post_discovery_check_interval
 from engine.release_awareness import dynamic_check_interval
 
 if TYPE_CHECKING:
@@ -91,16 +92,28 @@ def jitter_seconds(watch_rule_id: int, check_interval: int) -> float:
 
 
 def _base_check_interval(watch_rule: WatchRule, now: datetime) -> int:
-    """watch_rule.check_interval, unless the rule has a real,
-    source-published scheduled_release_at (Phase 31 section 12 — e.g. the
-    Nike SNKRS launch page's own commerceStartDate) close enough to shrink
-    it. Every rule without one (the overwhelming majority) is completely
-    unaffected — this is a pure passthrough in that case."""
-    if watch_rule.scheduled_release_at is None:
-        return watch_rule.check_interval
-    return dynamic_check_interval(
-        ensure_utc(watch_rule.scheduled_release_at), now, watch_rule.check_interval
-    )
+    """watch_rule.check_interval, unless one of two dynamic rules applies
+    — every rule with neither (the overwhelming majority) is a pure
+    passthrough:
+
+    1. The rule itself has a real, source-published scheduled_release_at
+       (Phase 31 section 12 — e.g. the Nike SNKRS launch page's own
+       commerceStartDate): ramps DOWN as that future instant approaches.
+    2. Otherwise, if its Product is drop-window-flagged (Phase 36/38 —
+       Product.scheduled_release_at set, today true only for the 3
+       Pokémon 30e Cultura campaign products): ramps a fresh auto-linked
+       WatchRule's cadence back UP from a real-tested burst rate as time
+       passes since it was created — see engine/post_discovery_cadence.py."""
+    if watch_rule.scheduled_release_at is not None:
+        return dynamic_check_interval(
+            ensure_utc(watch_rule.scheduled_release_at), now, watch_rule.check_interval
+        )
+    product = watch_rule.product
+    if product is not None and product.scheduled_release_at is not None:
+        return post_discovery_check_interval(
+            ensure_utc(watch_rule.created_at), now, watch_rule.check_interval
+        )
+    return watch_rule.check_interval
 
 
 def is_due(watch_rule: WatchRule, last_observed_at: datetime | None, now: datetime) -> bool:

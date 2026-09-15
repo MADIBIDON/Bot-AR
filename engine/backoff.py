@@ -33,6 +33,11 @@ MAX_BACKOFF_SECONDS = 3600.0
 
 _RETRYABLE_MARKERS = ("429", "timeout", "network error")
 _SERVER_ERROR_RE = re.compile(r"\bHTTP 5\d\d\b")
+# Phase 38 ("respect absolu de Retry-After"): connectors/schema_org.py
+# embeds the real header value this way on a 429. Purely additive — an
+# error string without this marker (every connector/case before this
+# phase) behaves exactly as before.
+_RETRY_AFTER_RE = re.compile(r"retry_after=(\d+)s")
 
 
 def is_retryable_error(error: str) -> bool:
@@ -42,10 +47,20 @@ def is_retryable_error(error: str) -> bool:
     return bool(_SERVER_ERROR_RE.search(error))
 
 
+def _parse_retry_after_seconds(error: str) -> float | None:
+    match = _RETRY_AFTER_RE.search(error)
+    return float(match.group(1)) if match else None
+
+
 @dataclass
 class _BackoffState:
     consecutive_failures: int = 0
     blocked_until: datetime | None = None
+    # Phase 38: the actual delay just applied (exponential, or a real
+    # Retry-After if it was longer) — stored directly rather than
+    # recomputed from consecutive_failures alone, so current_delay_seconds()
+    # stays accurate even when a Retry-After raised the floor.
+    last_delay_seconds: float = 0.0
 
 
 class BackoffTracker:
@@ -72,12 +87,25 @@ class BackoffTracker:
     def record_failure(self, key: str, error: str, now: datetime) -> None:
         """No-op for a non-retryable error — those aren't this module's
         concern (e.g. a 404 shouldn't back off; it just won't ever
-        succeed differently)."""
+        succeed differently).
+
+        Phase 38: when `error` carries a real Retry-After value (see
+        connectors/schema_org.py), the computed exponential delay is
+        never allowed to be SHORTER than it — a server that explicitly
+        asked for e.g. 120s is never retried at 30s just because this was
+        only the first failure. Retry-After can still be shorter than the
+        exponential delay (a merchant known to be extra fragile after
+        repeated failures) — this only ever raises the floor, never
+        lowers it below what backing off would already do."""
         if not is_retryable_error(error):
             return
         state = self._state.setdefault(key, _BackoffState())
         state.consecutive_failures += 1
         delay = min(self._base * (2 ** (state.consecutive_failures - 1)), self._max)
+        retry_after = _parse_retry_after_seconds(error)
+        if retry_after is not None:
+            delay = max(delay, retry_after)
+        state.last_delay_seconds = delay
         state.blocked_until = now + timedelta(seconds=delay)
 
     def record_success(self, key: str) -> None:
@@ -85,6 +113,4 @@ class BackoffTracker:
 
     def current_delay_seconds(self, key: str) -> float:
         state = self._state.get(key)
-        if state is None:
-            return 0.0
-        return min(self._base * (2 ** max(state.consecutive_failures - 1, 0)), self._max)
+        return 0.0 if state is None else state.last_delay_seconds

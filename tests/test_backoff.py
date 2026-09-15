@@ -103,3 +103,41 @@ def test_backoff_is_per_rule() -> None:
 
     assert tracker.is_blocked(1, now + timedelta(seconds=1)) is True
     assert tracker.is_blocked(2, now + timedelta(seconds=1)) is False
+
+
+# --- Phase 38: real Retry-After respect ---------------------------------
+
+
+def test_retry_after_longer_than_exponential_delay_wins() -> None:
+    """A real Retry-After of 120s must never be shortened to the 30s a
+    first-failure exponential backoff would otherwise pick."""
+    tracker = BackoffTracker(base_seconds=30, max_seconds=3600)
+    now = datetime.now(UTC)
+
+    tracker.record_failure(1, "rate limited (429) fetching https://x (retry_after=120s)", now)
+
+    assert tracker.current_delay_seconds(1) == 120
+    assert tracker.is_blocked(1, now + timedelta(seconds=100)) is True
+    assert tracker.is_blocked(1, now + timedelta(seconds=121)) is False
+
+
+def test_retry_after_shorter_than_exponential_delay_does_not_shorten_it() -> None:
+    """Retry-After only ever raises the floor, never lowers it below what
+    exponential backoff already computed."""
+    tracker = BackoffTracker(base_seconds=100, max_seconds=3600)
+    now = datetime.now(UTC)
+
+    tracker.record_failure(1, "rate limited (429) fetching https://x (retry_after=5s)", now)
+
+    assert tracker.current_delay_seconds(1) == 100
+
+
+def test_429_without_retry_after_uses_plain_exponential_backoff() -> None:
+    """No marker at all (every 429 before Phase 38, or a merchant that
+    never sends the header) — behaves exactly as before."""
+    tracker = BackoffTracker(base_seconds=30, max_seconds=3600)
+    now = datetime.now(UTC)
+
+    tracker.record_failure(1, "rate limited (429) fetching https://x", now)
+
+    assert tracker.current_delay_seconds(1) == 30
