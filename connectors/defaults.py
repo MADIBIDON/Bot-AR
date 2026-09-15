@@ -42,6 +42,21 @@ changes nothing about its UNSUPPORTED status). Amazon France was
 investigated for a public, key-free surface (no PA-API credentials
 requested/used) and stays ALERT_ONLY/UNSUPPORTED — see this module's
 UNSUPPORTED_RETAILERS entry for the exact reasoning.
+
+Phase 39 (Pokémon 30e drop readiness): King Jouet's PRODUCT PAGE remains
+DataDome-blocked (re-confirmed again), but a distinct, genuinely public
+JSON endpoint (`/api/product/<ref>`) was found and verified live against
+3 real refs — real price/availability data on a plain GET, no special
+headers. Their cart/basket API IS behind the same DataDome challenge as
+the page (confirmed 403, same holding-page marker) and is never touched
+— King Jouet moves from fully UNSUPPORTED to ONLINE_STOCK+PRICE
+monitoring only, same tier as Boulanger/Cultura. Fnac and Carrefour were
+re-checked the same way (product API guesses, robots.txt, sitemap) and
+found no equivalent unprotected surface — they remain fully UNSUPPORTED.
+See connectors/king_jouet.py for the connector and the exact identity
+caveat (no EAN exposed by this API — matches on King Jouet's own
+ref/sku instead, an exact-SKU tier per products/matcher.py, not a
+downgrade to name-only matching).
 """
 
 from __future__ import annotations
@@ -52,6 +67,7 @@ from dataclasses import dataclass, field
 from connectors.base import BaseConnector
 from connectors.fake_store import FakeStoreConnector
 from connectors.generic_schema_org import GenericSchemaOrgConnector
+from connectors.king_jouet import KingJouetConnector
 from connectors.nike_launch import NikeLaunchConnector
 from connectors.registry import ConnectorRegistry
 from connectors.shopify import ShopifyConnector
@@ -185,6 +201,22 @@ MERCHANTS: tuple[MerchantDefinition, ...] = (
         ),
         capabilities=_ONLINE_ONLY_CAPABILITIES,
     ),
+    # --- Phase 39: King Jouet's PRODUCT PAGE is still DataDome-blocked
+    # (confirmed again this session), but their distinct
+    # /api/product/<ref> JSON endpoint is genuinely public — a plain,
+    # honest GET returns 200 with real price/availability data, verified
+    # live against 3 real refs; their cart/basket API (/api/cart,
+    # /api/basket) IS behind the same DataDome challenge as the page and
+    # is never touched — see connectors/king_jouet.py. external_id here
+    # is King Jouet's own bare numeric ref, not a URL path, so this entry
+    # is NOT full_path_external_id (no generic URL routing either — the
+    # ref is supplied directly, same posture as Nike SNKRS above). ---
+    MerchantDefinition(
+        name="King Jouet",
+        domains=("king-jouet.com", "www.king-jouet.com"),
+        build_connector=lambda: KingJouetConnector(),
+        capabilities=_ONLINE_ONLY_CAPABILITIES,
+    ),
 )
 
 # Phase 28: investigated and confirmed UNSUPPORTED — real bot-protection
@@ -193,7 +225,6 @@ MERCHANTS: tuple[MerchantDefinition, ...] = (
 # them honestly instead of just not mentioning them at all.
 UNSUPPORTED_RETAILERS: tuple[tuple[str, str], ...] = (
     ("Fnac", "blocked by Akamai bot protection (403 on a plain GET)"),
-    ("King Jouet", "blocked by DataDome bot protection (JS challenge required)"),
     ("Smyths Toys", "blocked by Imperva/Incapsula bot protection"),
     ("Carrefour", "blocked by Cloudflare bot protection (challenge required)"),
     ("Micromania", "blocked by Imperva/Incapsula bot protection"),

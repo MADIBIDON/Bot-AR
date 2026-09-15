@@ -302,6 +302,15 @@ def test_overall_ready_despite_ebay_missing(
     monkeypatch.setattr(healthcheck, "build_default_market_registry", raise_missing)
     monkeypatch.setattr(healthcheck, "PID_FILE", Path("/nonexistent/worker.pid"))
     monkeypatch.setattr(healthcheck, "LOG_FILE", Path("/nonexistent/worker.log"))
+    # healthcheck.run()'s first line is load_dotenv(override=True) — the
+    # REAL .env, with override=True, meaning it would otherwise leak this
+    # machine's real values into every other test in this same pytest
+    # process for the rest of the run (a real, confirmed bug this
+    # session: real PURCHASE_CONTACT_EMAIL/PURCHASE_SHIPPING_* values
+    # bled into unrelated Shopify UCP/Fuji Store tests once .env actually
+    # had non-blank values). Stubbed here exactly like
+    # tests/test_main_worker.py already does for the same call.
+    monkeypatch.setattr(healthcheck, "load_dotenv", lambda *a, **k: None)
 
     ready = asyncio.run(healthcheck.run())
 
@@ -327,6 +336,7 @@ def test_overall_not_ready_when_discord_fails(
     monkeypatch.setattr(healthcheck, "build_default_market_registry", raise_missing)
     monkeypatch.setattr(healthcheck, "PID_FILE", Path("/nonexistent/worker.pid"))
     monkeypatch.setattr(healthcheck, "LOG_FILE", Path("/nonexistent/worker.log"))
+    monkeypatch.setattr(healthcheck, "load_dotenv", lambda *a, **k: None)
 
     ready = asyncio.run(healthcheck.run())
 

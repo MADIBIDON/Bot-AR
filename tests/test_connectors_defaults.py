@@ -138,7 +138,12 @@ def test_catalog_search_capability_matches_a_real_working_source() -> None:
 
 def test_unsupported_retailers_are_documented_not_silently_dropped() -> None:
     names = {name for name, _reason in UNSUPPORTED_RETAILERS}
-    assert {"Fnac", "King Jouet", "Smyths Toys", "Carrefour", "Micromania", "Amazon"} <= names
+    # Phase 39: King Jouet moved OUT of this list — their product PAGE
+    # stays DataDome-blocked, but a distinct, genuinely public JSON
+    # endpoint was found and verified live (see connectors/king_jouet.py)
+    # — it's a real MerchantDefinition now, not fully unsupported.
+    assert {"Fnac", "Smyths Toys", "Carrefour", "Micromania", "Amazon"} <= names
+    assert "King Jouet" not in names
     for _name, reason in UNSUPPORTED_RETAILERS:
         assert reason  # every documented blocker has an actual reason, never blank
 

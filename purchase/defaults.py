@@ -42,6 +42,8 @@ import httpx
 
 from config.settings import get_ucp_agent_profile_url
 from connectors.defaults import MERCHANTS
+from purchase.merchants.cultura import DEFAULT_TIMEOUT_SECONDS as _CULTURA_TIMEOUT_SECONDS
+from purchase.merchants.cultura import CulturaPurchaseConnector
 from purchase.merchants.fuji_store import DEFAULT_TIMEOUT_SECONDS as _FUJI_TIMEOUT_SECONDS
 from purchase.merchants.fuji_store import FujiStorePurchaseConnector
 from purchase.merchants.shopify_ucp import ShopifyUCPPurchaseConnector
@@ -90,6 +92,11 @@ def build_default_purchase_registry() -> PurchaseConnectorRegistry:
             registry.register(
                 merchant.name,
                 FujiStorePurchaseConnector(client=_persistent_client(_FUJI_TIMEOUT_SECONDS)),
+            )
+        elif merchant.name == "Cultura":
+            registry.register(
+                merchant.name,
+                CulturaPurchaseConnector(client=_persistent_client(_CULTURA_TIMEOUT_SECONDS)),
             )
         elif merchant.name in _UCP_SHOP_DOMAINS and agent_profile_url:
             registry.register(

@@ -56,6 +56,14 @@ def test_default_registry_wires_fuji_store_to_real_connector() -> None:
     assert isinstance(registry.get("Fuji Store"), FujiStorePurchaseConnector)
 
 
+def test_default_registry_wires_cultura_to_real_connector() -> None:
+    from purchase.merchants.cultura import CulturaPurchaseConnector
+
+    registry = build_default_purchase_registry()
+
+    assert isinstance(registry.get("Cultura"), CulturaPurchaseConnector)
+
+
 def test_default_registry_wires_kairyu_and_relictcg_to_ucp_without_any_env_var(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
