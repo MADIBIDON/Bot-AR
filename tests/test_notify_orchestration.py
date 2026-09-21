@@ -160,12 +160,38 @@ def test_opportunity_enriches_embed_when_event_and_configured() -> None:
 
 
 def test_multiple_events_send_one_embed_each() -> None:
+    """One embed per DISTINCT event. Two identical events are the same
+    news twice and are collapsed on purpose — see notifications/dedup.py
+    and tests/test_alert_dedup.py."""
     notifier = FakeNotifier()
-    events = (_event(), _event())
+    stock_event = MonitoringEvent(
+        event_type=EventType.STOCK_AVAILABLE,
+        listing_id=1,
+        watch_rule_id=1,
+        occurred_at=datetime.now(UTC),
+        reason="test",
+        previous_value="False",
+        current_value="True",
+    )
 
-    asyncio.run(notify_events_if_allowed(_rule(), _observation(), _match(), events, notifier))
+    asyncio.run(
+        notify_events_if_allowed(
+            _rule(), _observation(), _match(), (_event(), stock_event), notifier
+        )
+    )
 
     assert len(notifier.sent_embeds) == 2
+
+
+def test_identical_repeated_event_is_sent_once() -> None:
+    """The real 16/09 flapping case, at the orchestration level."""
+    notifier = FakeNotifier()
+
+    asyncio.run(
+        notify_events_if_allowed(_rule(), _observation(), _match(), (_event(), _event()), notifier)
+    )
+
+    assert len(notifier.sent_embeds) == 1
 
 
 def test_market_mode_without_registry_sends_embed_with_no_opportunity() -> None:

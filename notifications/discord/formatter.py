@@ -16,6 +16,7 @@ import discord
 from database.time_utils import ensure_utc
 from engine.alerting import AlertTier
 from engine.change_detection import EventType
+from notifications.discord.links import format_links_field
 
 if TYPE_CHECKING:
     from engine.alerting import OpportunityIntelligence
@@ -90,17 +91,36 @@ def format_event_embed(
         # look hours late when they were seconds old. Always attach UTC.
         timestamp=ensure_utc(event.occurred_at),
     )
-    embed.add_field(name="Product", value=observation.name, inline=False)
-    embed.add_field(name="Merchant", value=observation.merchant, inline=True)
-    embed.add_field(name="Price", value=f"{observation.price} {observation.currency}", inline=True)
+    # Layout mirrors the reference drop monitors: the product name is the
+    # clickable headline, then the three facts you act on (price, id,
+    # stock), then the links. Internal diagnostics (match confidence,
+    # "market data missing") are deliberately NOT here — on a drop they
+    # are noise between you and the buy button. They stay available via
+    # `watch.py show`.
+    embed.description = f"**[{observation.name}]({observation.url})**\n{observation.merchant}"
+    if observation.image_url:
+        embed.set_thumbnail(url=observation.image_url)
+
+    price = f"{observation.price} {observation.currency}"
     if event.previous_value is not None and event.event_type in _PRICE_EVENTS_WITH_PREVIOUS:
-        embed.add_field(name="Previous price", value=event.previous_value, inline=True)
+        price = f"{price}  (avant {event.previous_value})"
+    embed.add_field(name="Price", value=price, inline=True)
+    embed.add_field(name="PID", value=observation.external_id, inline=True)
     embed.add_field(
-        name="Availability",
+        name="Status",
         value="In stock" if observation.available else "Out of stock",
         inline=True,
     )
-    embed.add_field(name="Match confidence", value=f"{match_result.confidence}%", inline=True)
+    embed.add_field(
+        name="Links",
+        value=format_links_field(
+            merchant=observation.merchant,
+            external_id=observation.external_id,
+            product_url=observation.url,
+            product_name=observation.name,
+        ),
+        inline=False,
+    )
     if opportunity is not None:
         embed.add_field(
             name="Estimated resale",

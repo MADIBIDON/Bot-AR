@@ -42,6 +42,7 @@ class ConnectorProduct:
     url: str
     ean: str | None = None
     mpn: str | None = None
+    image_url: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.price, Decimal):

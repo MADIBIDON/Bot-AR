@@ -40,3 +40,17 @@ def session(engine: Engine) -> Iterator[Session]:
         yield db_session
     finally:
         db_session.close()
+
+
+@pytest.fixture(autouse=True)
+def _reset_alert_cooldown():
+    """notifications/dedup.py keeps process-local state so a flapping
+    stock does not produce the same alert five times. That state must
+    never leak between tests — otherwise the first test to send an
+    alert silences every later one that happens to use the same rule,
+    event and price."""
+    from notifications.dedup import get_default_cooldown
+
+    get_default_cooldown()._last_sent.clear()
+    yield
+    get_default_cooldown()._last_sent.clear()

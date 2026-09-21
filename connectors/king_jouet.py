@@ -96,6 +96,17 @@ class KingJouetConnector(BaseConnector):
         )
         real_ref = data.get("ref") or ref
 
+        # Confirmed live shape: "images" is a list of absolute URLs, e.g.
+        # ["https://images.king-jouet.com/6/gu1034916_6.jpg"]. Anything
+        # else is ignored rather than guessed at — a broken thumbnail on
+        # a drop alert is noise.
+        images = data.get("images")
+        image_url = None
+        if isinstance(images, list) and images:
+            first = images[0]
+            if isinstance(first, str) and first.startswith("http"):
+                image_url = first
+
         return ConnectorProduct(
             external_id=ref,
             name=name.strip(),
@@ -106,4 +117,5 @@ class KingJouetConnector(BaseConnector):
             url=_PRODUCT_URL_TEMPLATE.format(ref=real_ref),
             ean=None,  # not exposed by this API — see module docstring
             mpn=real_ref,
+            image_url=image_url,
         )

@@ -54,9 +54,34 @@ def _field(embed, name: str) -> str | None:
 
 
 def test_embed_contains_product_and_merchant() -> None:
+    """Product name is the clickable headline and the merchant sits
+    under it — the reference drop-monitor layout."""
     embed = format_event_embed(_event(EventType.PRICE_DROP), _observation(), _match())
-    assert _field(embed, "Product") == "Duopack Evoli 30 ans"
-    assert _field(embed, "Merchant") == "FakeStore"
+    assert "Duopack Evoli 30 ans" in embed.description
+    assert "https://fake-store.example/p/fake-123" in embed.description
+    assert "FakeStore" in embed.description
+
+
+def test_embed_shows_pid_and_links() -> None:
+    embed = format_event_embed(_event(EventType.PRICE_DROP), _observation(), _match())
+    assert _field(embed, "PID") == "fake-123"
+    links = _field(embed, "Links")
+    assert "[Link](https://fake-store.example/p/fake-123)" in links
+    assert "[StockX]" in links
+
+
+def test_embed_shows_product_thumbnail_when_the_merchant_exposes_one() -> None:
+    embed = format_event_embed(
+        _event(EventType.PRICE_DROP),
+        _observation(image_url="https://images.example/p.jpg"),
+        _match(),
+    )
+    assert embed.thumbnail.url == "https://images.example/p.jpg"
+
+
+def test_embed_has_no_thumbnail_when_no_image_is_known() -> None:
+    embed = format_event_embed(_event(EventType.PRICE_DROP), _observation(), _match())
+    assert embed.thumbnail.url is None
 
 
 def test_embed_contains_price() -> None:
@@ -69,31 +94,34 @@ def test_embed_contains_url() -> None:
     assert embed.url == "https://fake-store.example/p/fake-123"
 
 
-def test_embed_contains_match_confidence() -> None:
+def test_embed_omits_internal_diagnostics() -> None:
+    """Match confidence is an internal signal. On a drop it sits between
+    the reader and the buy button, so it is deliberately not rendered —
+    it stays available via `watch.py show`."""
     embed = format_event_embed(_event(EventType.PRICE_DROP), _observation(), _match(confidence=90))
-    assert _field(embed, "Match confidence") == "90%"
+    assert _field(embed, "Match confidence") is None
 
 
 def test_price_drop_event_shows_previous_price() -> None:
     event = _event(EventType.PRICE_DROP, previous_value="16.99", current_value="13.99")
     embed = format_event_embed(event, _observation(), _match())
     assert embed.title == "💰 Price Drop"
-    assert _field(embed, "Previous price") == "16.99"
+    assert "16.99" in _field(embed, "Price")
 
 
-def test_stock_available_event_has_no_previous_price_field() -> None:
+def test_stock_available_event_has_no_previous_price() -> None:
     event = _event(EventType.STOCK_AVAILABLE, previous_value="False", current_value="True")
     embed = format_event_embed(event, _observation(available=True), _match())
     assert embed.title == "📦 Back in Stock"
-    assert _field(embed, "Previous price") is None
-    assert _field(embed, "Availability") == "In stock"
+    assert "avant" not in _field(embed, "Price")
+    assert _field(embed, "Status") == "In stock"
 
 
 def test_unavailable_observation_shows_out_of_stock() -> None:
     embed = format_event_embed(
         _event(EventType.STOCK_UNAVAILABLE), _observation(available=False), _match()
     )
-    assert _field(embed, "Availability") == "Out of stock"
+    assert _field(embed, "Status") == "Out of stock"
 
 
 def test_embed_has_timestamp() -> None:

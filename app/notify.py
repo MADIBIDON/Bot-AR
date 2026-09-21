@@ -46,6 +46,7 @@ from typing import TYPE_CHECKING, Protocol
 
 from app.delivery import attempt_delivery, create_pending_delivery
 from app.resale import resolve_resale_confidence, resolve_resale_price_for_opportunity
+from database.time_utils import ensure_utc
 from engine.alerting import build_opportunity_intelligence
 from engine.decision import (
     DecisionResult,
@@ -61,6 +62,7 @@ from engine.opportunity import (
     recommend_purchase,
 )
 from engine.ranking import OpportunityCandidate, RankingConfig, rank_opportunities
+from notifications.dedup import get_default_cooldown
 from notifications.discord.formatter import format_event_embed
 
 if TYPE_CHECKING:
@@ -287,6 +289,18 @@ async def notify_events_if_allowed(
             watch_rule, observation, match_result, opportunity, resale_confidence, resale_estimate
         )
         for event in events:
+            # Real drop-day behaviour (16/09): stock flipped ~40 times in
+            # a few hours and every flip produced an identical alert, so
+            # the same item was announced five times running. Same rule +
+            # same event + same price inside the cooldown is not news; a
+            # price change or a later restock still gets through.
+            if not get_default_cooldown().should_send(
+                watch_rule_id=watch_rule.id,
+                event_type=event.event_type.value,
+                price=str(observation.price),
+                now=ensure_utc(observation.observed_at),
+            ):
+                continue
             embed = format_event_embed(
                 event,
                 observation,
