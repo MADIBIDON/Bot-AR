@@ -134,6 +134,34 @@ MERCHANTS: tuple[MerchantDefinition, ...] = (
         ),
         capabilities=_ONLINE_WITH_SEARCH_CAPABILITIES,
     ),
+    # --- Shops seen carrying real Pokémon 30e drops on the reference
+    # monitors while this project was blind to them. Each platform was
+    # confirmed live by a plain GET to the shop's own public catalogue
+    # API before being wired up — never assumed from the URL shape. ---
+    MerchantDefinition(
+        name="Boîte à Jeux",
+        domains=("boite-a-jeux.fr", "www.boite-a-jeux.fr"),
+        build_connector=lambda: WooCommerceConnector(
+            shop_domain="boite-a-jeux.fr", merchant_name="Boîte à Jeux"
+        ),
+        capabilities=_ONLINE_WITH_SEARCH_CAPABILITIES,
+    ),
+    MerchantDefinition(
+        name="Pokuji",
+        domains=("pokuji.fr", "www.pokuji.fr"),
+        build_connector=lambda: WooCommerceConnector(
+            shop_domain="pokuji.fr", merchant_name="Pokuji"
+        ),
+        capabilities=_ONLINE_WITH_SEARCH_CAPABILITIES,
+    ),
+    MerchantDefinition(
+        name="Hikaru Distribution",
+        domains=("hikarudistribution.com", "www.hikarudistribution.com"),
+        build_connector=lambda: ShopifyConnector(
+            shop_domain="hikarudistribution.com", merchant_name="Hikaru Distribution"
+        ),
+        capabilities=_ONLINE_WITH_SEARCH_CAPABILITIES,
+    ),
     # --- Phase 28: new P1 retailers, ONLINE_STOCK/PRICE only (see module
     # docstring) — each confirmed today via a real plain HTTP GET to a
     # real product page returning genuine schema.org Product JSON-LD. ---

@@ -8,6 +8,7 @@ engine/ never imports this.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
@@ -19,6 +20,7 @@ from engine.change_detection import EventType
 from notifications.discord.links import format_links_field
 
 if TYPE_CHECKING:
+    from connectors.base import ConnectorProduct
     from engine.alerting import OpportunityIntelligence
     from engine.change_detection import MonitoringEvent
     from engine.opportunity import OpportunityResult, PurchaseRecommendation
@@ -278,4 +280,49 @@ def format_discovery_embed(
     embed.add_field(
         name="Status", value="Exact EAN match — direct monitoring now active.", inline=False
     )
+    return embed
+
+
+_CATALOG_FIND_TITLES = {
+    "new": "🆕 New Drop Found",
+    "restock": "📦 Back in Stock",
+}
+
+
+def format_catalog_find_embed(
+    *,
+    product: ConnectorProduct,
+    merchant: str,
+    keyword: str,
+    reason: str,
+) -> discord.Embed:
+    """A hit from a standing catalogue search (app/keyword_watch.py) —
+    something nobody had entered by hand. Same layout as the monitoring
+    alert so the channel reads consistently: clickable headline,
+    thumbnail, the three facts you act on, then the links."""
+    embed = discord.Embed(
+        title=_CATALOG_FIND_TITLES.get(reason, "🆕 New Drop Found"),
+        url=product.url,
+        color=discord.Color.green() if product.available else discord.Color.light_grey(),
+        timestamp=datetime.now(UTC),
+    )
+    embed.description = f"**[{product.name}]({product.url})**\n{merchant}"
+    if product.image_url:
+        embed.set_thumbnail(url=product.image_url)
+    embed.add_field(name="Price", value=f"{product.price} {product.currency}", inline=True)
+    embed.add_field(name="PID", value=product.external_id, inline=True)
+    embed.add_field(
+        name="Status", value="In stock" if product.available else "Out of stock", inline=True
+    )
+    embed.add_field(
+        name="Links",
+        value=format_links_field(
+            merchant=merchant,
+            external_id=product.external_id,
+            product_url=product.url,
+            product_name=product.name,
+        ),
+        inline=False,
+    )
+    embed.set_footer(text=f"veille : {keyword}")
     return embed

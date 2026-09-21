@@ -15,6 +15,8 @@ from sqlalchemy.orm import Session
 
 from database.models import (
     EventRecord,
+    KeywordWatch,
+    KeywordWatchSeen,
     Listing,
     LocalNotificationDelivery,
     LocalStockEvent,
@@ -902,3 +904,115 @@ def list_due_local_deliveries(
         .order_by(LocalNotificationDelivery.id)
     )
     return list(session.scalars(stmt))
+
+
+# --- Keyword (catalogue) watches ---------------------------------------
+
+
+def create_keyword_watch(
+    session: Session,
+    keyword: str,
+    *,
+    max_price: Decimal | None = None,
+    check_interval: int = 60,
+) -> KeywordWatch:
+    watch = KeywordWatch(
+        keyword=keyword.strip(), max_price=max_price, check_interval=check_interval
+    )
+    session.add(watch)
+    session.commit()
+    session.refresh(watch)
+    return watch
+
+
+def get_keyword_watch(session: Session, keyword_watch_id: int) -> KeywordWatch | None:
+    return session.get(KeywordWatch, keyword_watch_id)
+
+
+def list_keyword_watches(session: Session, *, enabled_only: bool = False) -> list[KeywordWatch]:
+    stmt = select(KeywordWatch)
+    if enabled_only:
+        stmt = stmt.where(KeywordWatch.enabled.is_(True))
+    return list(session.scalars(stmt))
+
+
+def set_keyword_watch_enabled(
+    session: Session, keyword_watch_id: int, *, enabled: bool
+) -> KeywordWatch | None:
+    watch = session.get(KeywordWatch, keyword_watch_id)
+    if watch is None:
+        return None
+    watch.enabled = enabled
+    session.commit()
+    session.refresh(watch)
+    return watch
+
+
+def delete_keyword_watch(session: Session, keyword_watch_id: int) -> bool:
+    watch = session.get(KeywordWatch, keyword_watch_id)
+    if watch is None:
+        return False
+    session.delete(watch)
+    session.commit()
+    return True
+
+
+def touch_keyword_watch(
+    session: Session, keyword_watch_id: int, *, last_searched_at: datetime
+) -> None:
+    watch = session.get(KeywordWatch, keyword_watch_id)
+    if watch is None:
+        return
+    watch.last_searched_at = last_searched_at.replace(tzinfo=None)
+    session.commit()
+
+
+def get_keyword_watch_seen(
+    session: Session, *, keyword_watch_id: int, merchant: str, external_id: str
+) -> KeywordWatchSeen | None:
+    stmt = select(KeywordWatchSeen).where(
+        KeywordWatchSeen.keyword_watch_id == keyword_watch_id,
+        KeywordWatchSeen.merchant == merchant,
+        KeywordWatchSeen.external_id == external_id,
+    )
+    return session.scalars(stmt).first()
+
+
+def upsert_keyword_watch_seen(
+    session: Session,
+    *,
+    keyword_watch_id: int,
+    merchant: str,
+    external_id: str,
+    name: str,
+    url: str,
+    price: Decimal,
+    available: bool,
+    now: datetime,
+) -> KeywordWatchSeen:
+    naive_now = now.replace(tzinfo=None)
+    existing = get_keyword_watch_seen(
+        session, keyword_watch_id=keyword_watch_id, merchant=merchant, external_id=external_id
+    )
+    if existing is None:
+        existing = KeywordWatchSeen(
+            keyword_watch_id=keyword_watch_id,
+            merchant=merchant,
+            external_id=external_id,
+            name=name,
+            url=url,
+            price=price,
+            available=available,
+            first_seen_at=naive_now,
+            last_seen_at=naive_now,
+        )
+        session.add(existing)
+    else:
+        existing.name = name
+        existing.url = url
+        existing.price = price
+        existing.available = available
+        existing.last_seen_at = naive_now
+    session.commit()
+    session.refresh(existing)
+    return existing

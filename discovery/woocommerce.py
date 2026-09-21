@@ -7,6 +7,7 @@ purchase/merchants/fuji_store.py, just called with `search=` instead of
 from __future__ import annotations
 
 from decimal import Decimal
+from html import unescape
 
 import httpx
 
@@ -84,9 +85,20 @@ class WooCommerceDiscoverySource(RetailDiscoverySource):
             and currency
         ):
             return None
+        # WooCommerce returns names HTML-escaped ("Pokémon day &#8211; FR"
+        # observed live on pokuji.fr). Unescaping here keeps the raw
+        # entity out of every downstream consumer — matcher, database and
+        # Discord alert alike.
+        images = item.get("images")
+        image_url = None
+        if isinstance(images, list) and images and isinstance(images[0], dict):
+            src = images[0].get("src")
+            if isinstance(src, str) and src.startswith("http"):
+                image_url = src
+
         return ConnectorProduct(
             external_id=slug,
-            name=name,
+            name=unescape(name),
             price=Decimal(str(price)) / (Decimal(10) ** minor_unit),
             currency=currency,
             available=bool(item.get("is_in_stock", item.get("is_purchasable", False))),
@@ -94,4 +106,5 @@ class WooCommerceDiscoverySource(RetailDiscoverySource):
             url=permalink,
             ean=None,  # WooCommerce Store API doesn't expose GTIN/EAN here
             mpn=item.get("sku") or None,
+            image_url=image_url,
         )

@@ -61,12 +61,14 @@ from typing import TYPE_CHECKING
 
 from app.delivery import process_due_deliveries
 from app.discovery import effective_discovery_interval, is_discovery_due, run_discovery_for_product
+from app.keyword_watch import notify_keyword_finds, run_keyword_watch
 from app.notify import compute_opportunity, notify_events_if_allowed
 from app.opportunity_alerts import maybe_notify_opportunity_shift
 from app.opportunity_snapshot import evaluate_opportunity_intelligence
 from app.resale import resolve_resale_confidence
 from connectors.defaults import domains_for_merchant
 from database import crud
+from database.time_utils import ensure_utc
 from engine.backoff import BackoffTracker
 from engine.decision import effective_resale_price_mode, is_profitability_mode
 from engine.worker import run_monitoring_tick
@@ -302,6 +304,7 @@ async def tick(
 
     if discovery_registry is not None:
         _start_discovery_if_due(session, discovery_registry, notifier, now=now)
+        _start_keyword_watches_if_due(session, discovery_registry, notifier, now=now)
 
     _start_local_stock_check_if_due(session, now=now)
 
@@ -345,6 +348,63 @@ def _start_local_stock_check_if_due(session: Session, *, now: datetime | None = 
     task = asyncio.ensure_future(run_local_stock_tick(session, now=now))
     _background_tasks.add(task)
     task.add_done_callback(_local_stock_task_done)
+
+
+_keyword_watch_in_flight = False
+
+
+def _keyword_watch_is_due(watch, now: datetime) -> bool:
+    if watch.last_searched_at is None:
+        return True
+    return (now - ensure_utc(watch.last_searched_at)).total_seconds() >= watch.check_interval
+
+
+def _start_keyword_watches_if_due(
+    session: Session,
+    discovery_registry: DiscoveryRegistry,
+    notifier: EmbedSender,
+    *,
+    now: datetime | None = None,
+) -> None:
+    """Runs at most one due KeywordWatch per tick, as a background task —
+    same shape and same reasoning as _start_discovery_if_due (never
+    awaited here, concurrency capped at 1 so it never shares a Session
+    write with itself)."""
+    global _keyword_watch_in_flight
+    if _keyword_watch_in_flight:
+        return
+    now = now or datetime.now(UTC)
+    due = [
+        watch
+        for watch in crud.list_keyword_watches(session, enabled_only=True)
+        if _keyword_watch_is_due(watch, now)
+    ]
+    if not due:
+        return
+    watch = due[0]
+
+    async def _run() -> None:
+        global _keyword_watch_in_flight
+        try:
+            result = await asyncio.to_thread(
+                run_keyword_watch, session, watch, discovery_registry, now=now
+            )
+            logger.info(
+                "keyword_watch=%s keyword=%r merchants=%d finds=%d failed=%d",
+                watch.id,
+                result.keyword,
+                result.searched_merchants,
+                len(result.finds),
+                len(result.failed_merchants),
+            )
+            await notify_keyword_finds(result, notifier)
+        except Exception:  # noqa: BLE001 - a watch failure must never kill the tick loop
+            logger.exception("keyword_watch=%s failed", watch.id)
+        finally:
+            _keyword_watch_in_flight = False
+
+    _keyword_watch_in_flight = True
+    _fire_and_forget(_run())
 
 
 def _start_discovery_if_due(

@@ -706,3 +706,77 @@ LOCAL_STOCK_STATES = (
     "reservation_available",
     "store_only",
 )
+
+
+class KeywordWatch(Base):
+    """A standing catalogue search: "tell me about anything matching this
+    keyword, anywhere we can search".
+
+    The rest of this schema is product-first — a Product is created by
+    hand, then Listings are discovered for it. That model is blind by
+    construction: on 16-17/09 the reference monitors announced Pokémon
+    items across a dozen shops that this bot could not physically see,
+    because nobody had typed them in. A KeywordWatch inverts it: the
+    query is the subject, and products found under it are the result.
+
+    Nothing here is Pokémon-specific — the keyword is free text, so the
+    same mechanism covers One Piece, a clothing drop, or anything else,
+    with no code change.
+    """
+
+    __tablename__ = "keyword_watches"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    keyword: Mapped[str] = mapped_column(nullable=False)
+    enabled: Mapped[bool] = mapped_column(default=True, nullable=False)
+    # Above this, a hit is recorded but never alerted on — keeps a broad
+    # keyword from drowning the channel in irrelevant expensive listings.
+    max_price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), default=None)
+    check_interval: Mapped[int] = mapped_column(default=60, nullable=False)
+    last_searched_at: Mapped[datetime | None] = mapped_column(default=None)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+    seen: Mapped[list[KeywordWatchSeen]] = relationship(
+        back_populates="keyword_watch", cascade="all, delete-orphan"
+    )
+
+    def __repr__(self) -> str:
+        return f"KeywordWatch(id={self.id!r}, keyword={self.keyword!r})"
+
+
+class KeywordWatchSeen(Base):
+    """What a KeywordWatch has already found, so the second run of a
+    search is silent instead of re-announcing the whole catalogue.
+
+    `available` is what makes a restock detectable: a row already known
+    but previously out of stock, now in stock, is real news.
+    """
+
+    __tablename__ = "keyword_watch_seen"
+    __table_args__ = (
+        UniqueConstraint(
+            "keyword_watch_id", "merchant", "external_id", name="uq_keyword_watch_seen_item"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    keyword_watch_id: Mapped[int] = mapped_column(
+        ForeignKey("keyword_watches.id", ondelete="CASCADE"), nullable=False
+    )
+    merchant: Mapped[str] = mapped_column(nullable=False)
+    external_id: Mapped[str] = mapped_column(nullable=False)
+    name: Mapped[str] = mapped_column(nullable=False)
+    url: Mapped[str] = mapped_column(nullable=False)
+    price: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
+    available: Mapped[bool] = mapped_column(nullable=False)
+    first_seen_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    last_seen_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    keyword_watch: Mapped[KeywordWatch] = relationship(back_populates="seen")
+
+    def __repr__(self) -> str:
+        return (
+            f"KeywordWatchSeen(id={self.id!r}, merchant={self.merchant!r}, "
+            f"external_id={self.external_id!r}, available={self.available!r})"
+        )

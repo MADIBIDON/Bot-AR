@@ -45,6 +45,7 @@ from config.settings import get_ucp_agent_profile_url
 from connectors.defaults import MERCHANTS
 from discovery.cultura import CulturaSearchDiscoverySource
 from discovery.registry import DiscoveryRegistry
+from discovery.shopify_public import ShopifyPublicSearchDiscoverySource
 from discovery.shopify_ucp import ShopifyUCPDiscoverySource
 from discovery.sitemap import SitemapDiscoverySource
 from discovery.woocommerce import WooCommerceDiscoverySource
@@ -55,6 +56,14 @@ _UCP_SHOP_DOMAINS = {
 }
 _WOOCOMMERCE_SHOP_DOMAINS = {
     "Fuji Store": "fuji-store.fr",
+    "Boîte à Jeux": "boite-a-jeux.fr",
+    "Pokuji": "pokuji.fr",
+}
+# Every Shopify storefront exposes /search/suggest.json, while only a
+# handful implement UCP — so this is the general Shopify discovery path
+# and _UCP_SHOP_DOMAINS stays the richer, preferred special case.
+_SHOPIFY_PUBLIC_SHOP_DOMAINS = {
+    "Hikaru Distribution": "hikarudistribution.com",
 }
 _SITEMAP_DISCOVERY_URLS = {
     "JouéClub": "https://www.joueclub.fr/Assets/Rbs/Seo/100185/fr_FR/Rbs_Catalog_Product.1.xml",
@@ -83,6 +92,14 @@ def build_default_discovery_registry() -> DiscoveryRegistry:
                 merchant.name,
                 WooCommerceDiscoverySource(
                     shop_domain=_WOOCOMMERCE_SHOP_DOMAINS[merchant.name],
+                    merchant_name=merchant.name,
+                ),
+            )
+        elif merchant.name in _SHOPIFY_PUBLIC_SHOP_DOMAINS:
+            registry.register(
+                merchant.name,
+                ShopifyPublicSearchDiscoverySource(
+                    shop_domain=_SHOPIFY_PUBLIC_SHOP_DOMAINS[merchant.name],
                     merchant_name=merchant.name,
                 ),
             )

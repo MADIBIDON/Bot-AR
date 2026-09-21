@@ -77,6 +77,7 @@ from sqlalchemy.orm import Session
 
 from app import pidfile
 from app.discovery import DEFAULT_AUTO_LINKED_CHECK_INTERVAL_SECONDS, run_discovery_for_product
+from app.keyword_watch import run_keyword_watch
 from app.notify import notify_events_if_allowed
 from app.opportunity_snapshot import build_opportunity_candidate
 from app.resale import resolve_resale_estimate
@@ -947,6 +948,89 @@ def cmd_payment_setup(args: argparse.Namespace) -> int:
     return 1
 
 
+def cmd_keywords(args: argparse.Namespace) -> int:
+    """Standing catalogue searches (app/keyword_watch.py) — the bot's
+    only way to hear about a product nobody typed in by hand."""
+    session = _get_session()
+    action = args.action
+
+    if action == "add":
+        try:
+            max_price = (
+                _parse_positive_decimal("max-price", args.max_price) if args.max_price else None
+            )
+            interval = _parse_positive_int("interval", args.interval or "60")
+        except ValueError as exc:
+            print(f"Invalid value: {exc}")
+            return 1
+        watch = crud.create_keyword_watch(
+            session, args.keyword, max_price=max_price, check_interval=interval
+        )
+        print(
+            f"keyword watch {watch.id} created: {watch.keyword!r} max_price={watch.max_price} "
+            f"interval={watch.check_interval}s"
+        )
+        return 0
+
+    if action == "list":
+        watches = crud.list_keyword_watches(session)
+        if not watches:
+            print('No keyword watches. Add one: watch.py keywords add "pokemon 30 ans"')
+            return 0
+        print(f"{'ID':<4} | {'Keyword':<32} | {'Max':>9} | {'Every':>7} | Status")
+        for w in watches:
+            seen = len(w.seen)
+            status = "ACTIVE" if w.enabled else "DISABLED"
+            cap = f"{w.max_price}EUR" if w.max_price is not None else "-"
+            print(
+                f"{w.id:<4} | {w.keyword[:32]:<32} | {cap:>9} | {w.check_interval:>6}s | "
+                f"{status} ({seen} seen)"
+            )
+        return 0
+
+    if action in ("enable", "disable"):
+        watch = crud.set_keyword_watch_enabled(
+            session, args.keyword_id, enabled=(action == "enable")
+        )
+        if watch is None:
+            print(f"No keyword watch {args.keyword_id}")
+            return 1
+        print(f"keyword watch {watch.id} {'enabled' if watch.enabled else 'disabled'}")
+        return 0
+
+    if action == "delete":
+        if crud.delete_keyword_watch(session, args.keyword_id):
+            print(f"keyword watch {args.keyword_id} deleted")
+            return 0
+        print(f"No keyword watch {args.keyword_id}")
+        return 1
+
+    if action == "run":
+        watch = crud.get_keyword_watch(session, args.keyword_id)
+        if watch is None:
+            print(f"No keyword watch {args.keyword_id}")
+            return 1
+        result = run_keyword_watch(session, watch, _build_discovery_registry())
+        print(
+            f"keyword {result.keyword!r}: {result.searched_merchants} merchant(s) searched, "
+            f"{len(result.finds)} find(s), {len(result.failed_merchants)} failed, "
+            f"{result.suppressed_over_max_price} over max_price"
+        )
+        for find in result.finds:
+            p = find.product
+            stock = "IN STOCK" if p.available else "out of stock"
+            print(
+                f"  [{find.reason:<7}] {find.merchant:<20} {p.price}{p.currency:<4} {stock:<12} "
+                f"{p.name[:44]}"
+            )
+        for merchant, error in result.failed_merchants:
+            print(f"  FAILED {merchant}: {error[:80]}")
+        return 0
+
+    print(f"Unknown action {action!r}")
+    return 1
+
+
 def _print_discovery_result(result) -> None:
     for outcome in result.merchants:
         if outcome.status == "unavailable":
@@ -1468,6 +1552,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override the built-in probe product URL (must still be a real, non-drop product).",
     )
     payment_setup_parser.set_defaults(func=cmd_payment_setup)
+
+    keywords_parser = subparsers.add_parser(
+        "keywords", help="Standing catalogue searches — hear about products nobody typed in."
+    )
+    keywords_parser.add_argument(
+        "action", choices=("add", "list", "enable", "disable", "delete", "run")
+    )
+    keywords_parser.add_argument("keyword", nargs="?", default=None)
+    keywords_parser.add_argument("--keyword-id", dest="keyword_id", type=int, default=None)
+    keywords_parser.add_argument("--max-price", dest="max_price", default=None)
+    keywords_parser.add_argument("--interval", default=None)
+    keywords_parser.set_defaults(func=cmd_keywords)
 
     status_parser = subparsers.add_parser("status", help="Show overall system status.")
     status_parser.set_defaults(func=cmd_status)
