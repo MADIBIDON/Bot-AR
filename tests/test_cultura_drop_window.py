@@ -29,7 +29,10 @@ from connectors.base import ConnectorProduct
 from database import crud
 from discovery.base import RetailDiscoverySource
 from discovery.registry import DiscoveryRegistry
-from engine.release_awareness import MIN_CHECK_INTERVAL_SECONDS
+from engine.release_awareness import (
+    LIVE_WINDOW_MIN_CHECK_INTERVAL_SECONDS,
+    MIN_CHECK_INTERVAL_SECONDS,
+)
 
 _REAL_EAN = "0196214144835"  # the real ETB 30e Anniversaire EAN given this session
 
@@ -89,7 +92,7 @@ def test_drop_window_cadence_activates_fast_discovery(session: Session) -> None:
 
     interval = effective_discovery_interval(product, now)
 
-    assert interval == MIN_CHECK_INTERVAL_SECONDS
+    assert interval == LIVE_WINDOW_MIN_CHECK_INTERVAL_SECONDS
     assert interval < product.discovery_interval  # genuinely faster than normal
 
 

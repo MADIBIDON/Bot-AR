@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 import discord
 
+from database.time_utils import ensure_utc
 from engine.alerting import AlertTier
 from engine.change_detection import EventType
 
@@ -83,7 +84,11 @@ def format_event_embed(
         title=_EVENT_TITLES.get(event.event_type, str(event.event_type)),
         url=observation.url,
         color=_EVENT_COLORS.get(event.event_type, discord.Color.blurple()),
-        timestamp=event.occurred_at,
+        # Timestamps are stored naive-UTC. discord.py treats a naive
+        # datetime as LOCAL time, which silently shifted every embed
+        # footer by the local UTC offset (-2h in CEST) — making alerts
+        # look hours late when they were seconds old. Always attach UTC.
+        timestamp=ensure_utc(event.occurred_at),
     )
     embed.add_field(name="Product", value=observation.name, inline=False)
     embed.add_field(name="Merchant", value=observation.merchant, inline=True)
@@ -202,7 +207,7 @@ def format_purchase_embed(
         title=title,
         url=intent.url,
         color=_PURCHASE_TITLE_COLORS.get(title, discord.Color.blurple()),
-        timestamp=intent.created_at,
+        timestamp=ensure_utc(intent.created_at),
     )
     embed.add_field(name="Product", value=intent.product_name, inline=False)
     embed.add_field(name="Merchant", value=intent.merchant, inline=True)

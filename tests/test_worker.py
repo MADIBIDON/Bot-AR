@@ -398,7 +398,14 @@ def test_run_forever_stops_cleanly_without_real_wait(session: Session) -> None:
 
 
 def test_default_poll_interval_is_reasonable() -> None:
-    assert 10 <= DEFAULT_POLL_INTERVAL_SECONDS <= 30
+    """The poll interval is scheduler granularity, not a request rate —
+    a tick only asks "which rules are due?". It must stay comfortably
+    BELOW the fastest per-rule interval, otherwise granularity itself
+    becomes the latency (measured 21/09: a 20s poll turned a ~33s
+    interval into 52-57s observed gaps on the drop listings)."""
+    from engine.release_awareness import LIVE_WINDOW_MIN_CHECK_INTERVAL_SECONDS
+
+    assert 1 <= DEFAULT_POLL_INTERVAL_SECONDS <= LIVE_WINDOW_MIN_CHECK_INTERVAL_SECONDS // 2
 
 
 # --- jitter ------------------------------------------------------------

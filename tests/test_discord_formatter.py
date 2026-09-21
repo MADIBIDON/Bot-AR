@@ -303,3 +303,20 @@ def test_purchase_started_embed_has_no_action_fields() -> None:
 
     assert _field(embed, "Direct URL") is None
     assert _field(embed, "Action") is None
+
+
+def test_embed_timestamp_is_utc_not_shifted_by_local_offset() -> None:
+    """Regression (21/09): occurred_at is stored naive-UTC. discord.py
+    reads a naive datetime as LOCAL time, which shifted every footer by
+    the machine's UTC offset — alerts sent seconds after a restock
+    displayed a time hours earlier, and looked badly late. The embed
+    timestamp must always carry UTC."""
+    naive_utc = datetime(2026, 9, 16, 8, 18, 54)
+    event = _event(EventType.STOCK_AVAILABLE, occurred_at=naive_utc)
+
+    embed = format_event_embed(event, _observation(), _match())
+
+    assert embed.timestamp is not None
+    assert embed.timestamp.tzinfo is not None
+    assert embed.timestamp.utcoffset().total_seconds() == 0
+    assert embed.timestamp.hour == 8  # never shifted to 06:18 or 10:18

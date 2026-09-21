@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from engine.release_awareness import (
+    LIVE_WINDOW_MIN_CHECK_INTERVAL_SECONDS,
     MIN_CHECK_INTERVAL_SECONDS,
     ReleaseFrequencyConfig,
     ReleaseState,
@@ -67,8 +68,15 @@ def test_dynamic_interval_high_frequency_at_t_minus_60_sec() -> None:
 
 
 def test_dynamic_interval_fastest_once_live() -> None:
+    """Once the window is actually live, the lower live-window floor
+    applies (not the general 30s one) — a real restock can close in
+    under two minutes, so 30s meant routinely arriving after it ended."""
     now = RELEASE_AT + timedelta(seconds=1)
-    assert dynamic_check_interval(RELEASE_AT, now, base_interval=300) == MIN_CHECK_INTERVAL_SECONDS
+    assert (
+        dynamic_check_interval(RELEASE_AT, now, base_interval=300)
+        == LIVE_WINDOW_MIN_CHECK_INTERVAL_SECONDS
+    )
+    assert LIVE_WINDOW_MIN_CHECK_INTERVAL_SECONDS < MIN_CHECK_INTERVAL_SECONDS
 
 
 def test_dynamic_interval_never_below_the_safety_floor_even_with_bad_config() -> None:

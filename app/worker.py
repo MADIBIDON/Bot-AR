@@ -90,7 +90,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_POLL_INTERVAL_SECONDS = 20
+# Scheduler granularity — NOT a request rate. Each tick only asks "which
+# rules are due now?"; a rule's own check_interval still decides when it
+# actually gets fetched, so lowering this costs the merchants nothing.
+# Measured 21/09: at 20s, a rule due at 33s was only picked up by the
+# 40s tick, and real observed gaps on the drop listings were 52-57s
+# instead of ~33s. That aliasing alone was ~20s of pure latency on every
+# restock — half our measured 8-minute lag behind the reference monitors.
+DEFAULT_POLL_INTERVAL_SECONDS = 2
 
 # Phase 29: local stock is intentionally much slower than online
 # monitoring (see local_stock/monitor.py's module docstring — one call
