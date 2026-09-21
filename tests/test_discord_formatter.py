@@ -348,3 +348,23 @@ def test_embed_timestamp_is_utc_not_shifted_by_local_offset() -> None:
     assert embed.timestamp.tzinfo is not None
     assert embed.timestamp.utcoffset().total_seconds() == 0
     assert embed.timestamp.hour == 8  # never shifted to 06:18 or 10:18
+
+
+def test_status_says_which_channel_the_stock_is_in() -> None:
+    """A King Jouet item can be orderable in a shop while the web page
+    says sold out — a bare "In stock" would send you to the wrong place."""
+    embed = format_event_embed(
+        _event(EventType.STOCK_AVAILABLE),
+        _observation(available=True, availability_detail="retrait magasin (3 magasins)"),
+        _match(),
+    )
+
+    assert _field(embed, "Status") == "In stock — retrait magasin (3 magasins)"
+
+
+def test_status_falls_back_to_plain_in_stock_without_channel_detail() -> None:
+    embed = format_event_embed(
+        _event(EventType.STOCK_AVAILABLE), _observation(available=True), _match()
+    )
+
+    assert _field(embed, "Status") == "In stock"

@@ -176,3 +176,74 @@ def test_real_response_shape_from_live_recon() -> None:
 
     assert product.price == Decimal("64.99")
     assert product.name == "Pokémon 30 ans - Coffret dresseur d'élite"
+
+
+def _availability(**flags: bool) -> dict:
+    base = {
+        "isAvailableOnWeb": False,
+        "isAvailableFromOther": False,
+        "isAvailableForShipFromStore": False,
+        "stores": [],
+    }
+    base.update(flags)
+    return base
+
+
+def _with_availability(monkeypatch, connector, availability: dict) -> object:
+    body = _real_shaped_response()
+    body["availability"] = availability
+
+    def fake_get(url: str, **kwargs: object) -> httpx.Response:
+        return httpx.Response(200, json=body, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(connector._client, "get", fake_get)
+    return connector.get_product("1034916")
+
+
+def test_web_only_stock_is_labelled_web(monkeypatch: pytest.MonkeyPatch) -> None:
+    product = _with_availability(
+        monkeypatch, KingJouetConnector(), _availability(isAvailableOnWeb=True)
+    )
+    assert product.available is True
+    assert product.availability_detail == "web"
+
+
+def test_store_pickup_only_is_not_announced_as_web_stock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """King Jouet's own guide: site and store stock are NOT synchronised.
+    Collapsing them meant alerting "in stock" with a link to a web page
+    where the item cannot be ordered."""
+    product = _with_availability(
+        monkeypatch, KingJouetConnector(), _availability(isAvailableForShipFromStore=True)
+    )
+    assert product.available is True
+    assert product.availability_detail == "retrait magasin"
+
+
+def test_both_channels_are_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    product = _with_availability(
+        monkeypatch,
+        KingJouetConnector(),
+        _availability(isAvailableOnWeb=True, isAvailableForShipFromStore=True),
+    )
+    assert product.availability_detail == "web + retrait magasin"
+
+
+def test_store_count_is_included_when_the_api_lists_stores(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    product = _with_availability(
+        monkeypatch,
+        KingJouetConnector(),
+        _availability(
+            isAvailableForShipFromStore=True, stores=[{"id": "a"}, {"id": "b"}, {"id": "c"}]
+        ),
+    )
+    assert product.availability_detail == "retrait magasin (3 magasins)"
+
+
+def test_out_of_stock_has_no_channel_detail(monkeypatch: pytest.MonkeyPatch) -> None:
+    product = _with_availability(monkeypatch, KingJouetConnector(), _availability())
+    assert product.available is False
+    assert product.availability_detail is None

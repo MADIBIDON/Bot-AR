@@ -41,6 +41,7 @@ class ProductObservation:
     mpn: str | None = None
     seller: str | None = None
     image_url: str | None = None
+    availability_detail: str | None = None
 
     def __post_init__(self) -> None:
         _require_non_empty("merchant", self.merchant)
@@ -82,6 +83,7 @@ class ProductObservation:
             mpn=product.mpn,
             seller=product.seller,
             image_url=product.image_url,
+            availability_detail=product.availability_detail,
         )
 
 

@@ -108,11 +108,14 @@ def format_event_embed(
         price = f"{price}  (avant {event.previous_value})"
     embed.add_field(name="Price", value=price, inline=True)
     embed.add_field(name="PID", value=observation.external_id, inline=True)
-    embed.add_field(
-        name="Status",
-        value="In stock" if observation.available else "Out of stock",
-        inline=True,
-    )
+    # Where the stock actually is matters as much as whether it exists:
+    # a King Jouet item can be orderable in a shop while the web page
+    # says sold out, and a plain "In stock" would send you to the wrong
+    # place. See connectors/king_jouet.py.
+    status = "In stock" if observation.available else "Out of stock"
+    if observation.available and observation.availability_detail:
+        status = f"In stock — {observation.availability_detail}"
+    embed.add_field(name="Status", value=status, inline=True)
     embed.add_field(
         name="Links",
         value=format_links_field(

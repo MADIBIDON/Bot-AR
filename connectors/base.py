@@ -43,6 +43,12 @@ class ConnectorProduct:
     ean: str | None = None
     mpn: str | None = None
     image_url: str | None = None
+    # Which channel the stock is actually in (web / store pickup /
+    # partner). Retailers routinely differ per channel — a product can
+    # be orderable in a shop while the site says sold out — and the
+    # plain `available` flag cannot express that. None = the merchant
+    # exposes no channel breakdown.
+    availability_detail: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.price, Decimal):

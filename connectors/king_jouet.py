@@ -89,11 +89,35 @@ class KingJouetConnector(BaseConnector):
         if not name or price is None:
             raise ConnectorError(f"King Jouet product {ref} response is missing name/price")
 
-        available = bool(
-            availability.get("isAvailableOnWeb")
-            or availability.get("isAvailableFromOther")
-            or availability.get("isAvailableForShipFromStore")
-        )
+        # King Jouet reports three INDEPENDENT channels, and their own
+        # buying guide is explicit that they are not synchronised: "le
+        # stock du site national et celui des magasins ne sont pas
+        # synchronisés — surveillez toujours les deux". Collapsing them
+        # into one boolean (as this did until now) means announcing
+        # "in stock" with a link to a web page where the item cannot
+        # actually be ordered. Keep `available` as the union so nothing
+        # downstream changes behaviour, but carry WHICH channel it is so
+        # the alert can say where to go.
+        on_web = bool(availability.get("isAvailableOnWeb"))
+        ship_from_store = bool(availability.get("isAvailableForShipFromStore"))
+        from_other = bool(availability.get("isAvailableFromOther"))
+        available = on_web or ship_from_store or from_other
+
+        channels = []
+        if on_web:
+            channels.append("web")
+        if ship_from_store:
+            channels.append("retrait magasin")
+        if from_other:
+            channels.append("autre vendeur")
+        stores = availability.get("stores")
+        store_count = len(stores) if isinstance(stores, list) else 0
+        availability_detail = None
+        if channels:
+            availability_detail = " + ".join(channels)
+            if store_count:
+                availability_detail += f" ({store_count} magasin{'s' if store_count > 1 else ''})"
+
         real_ref = data.get("ref") or ref
 
         # Confirmed live shape: "images" is a list of absolute URLs, e.g.
@@ -118,4 +142,5 @@ class KingJouetConnector(BaseConnector):
             ean=None,  # not exposed by this API — see module docstring
             mpn=real_ref,
             image_url=image_url,
+            availability_detail=availability_detail,
         )
