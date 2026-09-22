@@ -156,16 +156,31 @@ def test_worker_stopped_when_no_pid_file(tmp_path, monkeypatch: pytest.MonkeyPat
     assert result.detail == "STOPPED"
 
 
-def test_worker_running_when_pid_alive(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_worker_running_when_the_lock_is_held(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """RUNNING means a worker holds the lock (app/pidfile.py) — not that
+    the PID written in the file happens to be alive, which is exactly
+    what caused the 21/09 17-hour outage."""
+    from app import pidfile
+
+    pid_file = tmp_path / "worker.pid"
+    pidfile.acquire(pid_file)
+    monkeypatch.setattr(healthcheck, "PID_FILE", pid_file)
+    try:
+        result = healthcheck._check_worker()
+    finally:
+        pidfile.release(pid_file)
+
+    assert result.detail == "RUNNING"
+
+
+def test_live_pid_without_lock_is_reported_stale(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     import os
 
     pid_file = tmp_path / "worker.pid"
     pid_file.write_text(str(os.getpid()))
     monkeypatch.setattr(healthcheck, "PID_FILE", pid_file)
 
-    result = healthcheck._check_worker()
-
-    assert result.detail == "RUNNING"
+    assert healthcheck._check_worker().detail != "RUNNING"
 
 
 # --- eBay -----------------------------------------------------------------

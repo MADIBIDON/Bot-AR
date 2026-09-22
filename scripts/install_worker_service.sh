@@ -8,6 +8,18 @@
 # .venv's python — nothing is hardcoded or shared across machines.
 #
 # Safe to re-run: an existing installation is unloaded and replaced.
+#
+# Measured 16-22/09: with the previous plist the worker was idle 65% of
+# the time (100h of 153h) — the Mac idle-slept in 15-60 min cycles and
+# "Background" ProcessType let macOS throttle it further. Restocks the
+# reference monitors caught simply happened while this one was asleep.
+#   - caffeinate -i -s holds "no idle sleep" (and "no system sleep" on
+#     AC power) for exactly as long as the worker runs. Per-process, not
+#     a system setting: released the moment the worker stops.
+#   - ProcessType "Standard" instead of "Background" stops App Nap-style
+#     throttling of the worker's timers.
+# Limit: a closed lid on battery still sleeps the machine. Real 24/7
+# needs an always-on host — see deploy/.
 
 set -euo pipefail
 
@@ -40,6 +52,9 @@ cat > "$PLIST_PATH" <<PLIST
     <string>$LABEL</string>
     <key>ProgramArguments</key>
     <array>
+        <string>/usr/bin/caffeinate</string>
+        <string>-i</string>
+        <string>-s</string>
         <string>$PYTHON_BIN</string>
         <string>-m</string>
         <string>app.main_worker</string>
@@ -58,7 +73,7 @@ cat > "$PLIST_PATH" <<PLIST
     <key>StandardErrorPath</key>
     <string>$LOG_DIR/launchd-stderr.log</string>
     <key>ProcessType</key>
-    <string>Background</string>
+    <string>Standard</string>
 </dict>
 </plist>
 PLIST

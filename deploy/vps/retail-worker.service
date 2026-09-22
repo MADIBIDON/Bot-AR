@@ -1,0 +1,21 @@
+[Unit]
+Description=BOT-AR retail monitoring worker
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=botar
+WorkingDirectory=/opt/bot-ar
+ExecStart=/opt/bot-ar/.venv/bin/python -m app.main_worker
+# Always on: restart on any exit, crash or not. The worker's own flock
+# guard (app/pidfile.py) makes a restart safe even if the previous
+# process left its pid file behind.
+Restart=always
+RestartSec=10
+# Give in-flight alerts/purchase attempts time to drain on stop.
+TimeoutStopSec=30
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
