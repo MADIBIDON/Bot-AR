@@ -915,9 +915,15 @@ def create_keyword_watch(
     *,
     max_price: Decimal | None = None,
     check_interval: int = 60,
+    sealed_only: bool = True,
+    exclude_terms: str | None = None,
 ) -> KeywordWatch:
     watch = KeywordWatch(
-        keyword=keyword.strip(), max_price=max_price, check_interval=check_interval
+        keyword=keyword.strip(),
+        max_price=max_price,
+        check_interval=check_interval,
+        sealed_only=sealed_only,
+        exclude_terms=exclude_terms,
     )
     session.add(watch)
     session.commit()
@@ -1016,3 +1022,28 @@ def upsert_keyword_watch_seen(
     session.commit()
     session.refresh(existing)
     return existing
+
+
+def update_keyword_watch(
+    session: Session,
+    keyword_watch_id: int,
+    *,
+    exclude_terms: str | None = None,
+    clear_exclude_terms: bool = False,
+    max_price: Decimal | None = None,
+    check_interval: int | None = None,
+) -> KeywordWatch | None:
+    watch = session.get(KeywordWatch, keyword_watch_id)
+    if watch is None:
+        return None
+    if clear_exclude_terms:
+        watch.exclude_terms = None
+    elif exclude_terms is not None:
+        watch.exclude_terms = exclude_terms
+    if max_price is not None:
+        watch.max_price = max_price
+    if check_interval is not None:
+        watch.check_interval = check_interval
+    session.commit()
+    session.refresh(watch)
+    return watch

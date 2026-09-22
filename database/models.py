@@ -733,6 +733,11 @@ class KeywordWatch(Base):
     # keyword from drowning the channel in irrelevant expensive listings.
     max_price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), default=None)
     check_interval: Mapped[int] = mapped_column(default=60, nullable=False)
+    # Trading-card mode (default): only sealed product types alert — see
+    # app/relevance.py. Off for a clothing/sneaker watch.
+    sealed_only: Mapped[bool] = mapped_column(default=True, nullable=False)
+    # Comma-separated extra exclusion terms for this watch only.
+    exclude_terms: Mapped[str | None] = mapped_column(default=None)
     last_searched_at: Mapped[datetime | None] = mapped_column(default=None)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())

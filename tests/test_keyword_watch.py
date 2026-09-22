@@ -37,11 +37,15 @@ class _FakeNotifier:
 
 
 def _product(
-    *, external_id: str = "etb-30", price: str = "64.99", available: bool = True
+    *,
+    external_id: str = "etb-30",
+    price: str = "64.99",
+    available: bool = True,
+    name: str = "Pokémon 30 ans - Coffret dresseur d'élite",
 ) -> ConnectorProduct:
     return ConnectorProduct(
         external_id=external_id,
-        name="Coffret dresseur d'élite 30 ans",
+        name=name,
         price=Decimal(price),
         currency="EUR",
         available=available,
@@ -174,3 +178,58 @@ def test_notify_survives_a_broken_discord(session: Session) -> None:
 
     # Must not raise — a lost alert never takes the watch loop down.
     asyncio.run(notify_keyword_finds(result, _Broken()))
+
+
+# --- relevance (app/relevance.py) wired into the watch -----------------
+
+
+def test_irrelevant_hits_are_dropped_and_never_recorded(session: Session) -> None:
+    """21/09: the shop's own search returned a backpack for "pokemon 30
+    ans". It must neither alert nor pollute the seen table."""
+    watch = crud.create_keyword_watch(session, "pokemon 30 ans")
+    registry = _registry(
+        Shop=_FakeSource(
+            [
+                _product(external_id="bag", name="Sac à dos Pokémon 30 ans Pikachu"),
+                _product(external_id="etb"),
+            ]
+        )
+    )
+
+    result = run_keyword_watch(session, watch, registry)
+
+    assert [f.product.external_id for f in result.finds] == ["etb"]
+    assert result.suppressed_irrelevant == 1
+    assert (
+        crud.get_keyword_watch_seen(
+            session, keyword_watch_id=watch.id, merchant="Shop", external_id="bag"
+        )
+        is None
+    )
+
+
+def test_watch_level_exclusions_apply(session: Session) -> None:
+    watch = crud.create_keyword_watch(session, "pokemon 30 ans", exclude_terms="japonais")
+    registry = _registry(Shop=_FakeSource([_product(name="Display Pokémon 30 ans japonais")]))
+
+    assert run_keyword_watch(session, watch, registry).finds == ()
+
+
+def test_non_tcg_watch_does_not_require_a_sealed_product_type(session: Session) -> None:
+    watch = crud.create_keyword_watch(session, "nike sb yuto", sealed_only=False)
+    registry = _registry(Shop=_FakeSource([_product(name="Nike SB Air Force 1 x Yuto Light Bone")]))
+
+    assert len(run_keyword_watch(session, watch, registry).finds) == 1
+
+
+def test_same_listing_found_by_two_watches_alerts_once(session: Session) -> None:
+    first = crud.create_keyword_watch(session, "pokemon 30 ans")
+    second = crud.create_keyword_watch(session, "pokemon 30eme anniversaire")
+    item = _product(name="Coffret Pokémon 30ème Anniversaire")
+    notifier = _FakeNotifier()
+
+    for watch in (first, second):
+        result = run_keyword_watch(session, watch, _registry(Shop=_FakeSource([item])))
+        asyncio.run(notify_keyword_finds(result, notifier))
+
+    assert len(notifier.sent_embeds) == 1

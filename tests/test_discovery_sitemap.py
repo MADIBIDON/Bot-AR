@@ -235,3 +235,69 @@ def test_empty_query_returns_empty_without_any_network_call(
     monkeypatch.setattr(source._client, "get", fail)
 
     assert source.search("   ") == []
+
+
+# --- dead URLs must not starve live ones (found live 22/09) ------------
+
+_MANY_DEAD_THEN_LIVE_XML = (
+    '<?xml version="1.0"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+    + "".join(
+        f"  <url><loc>https://shop.test/pokemon-booster-old-{i}.html</loc></url>\n"
+        for i in range(5)
+    )
+    + "  <url><loc>https://shop.test/pokemon-booster-new-30e.html</loc></url>\n</urlset>"
+)
+
+
+def _flat(source: SitemapDiscoverySource, monkeypatch: pytest.MonkeyPatch, body: str) -> None:
+    monkeypatch.setattr(source._client, "get", lambda url, **kw: _xml_response(url, body))
+
+
+def test_dead_urls_are_skipped_so_live_products_get_a_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """La Grande Récré still lists long-delisted boosters. They used to
+    take all five fetch slots on every cycle, so a new product further
+    down the sitemap was never looked at."""
+    live_id = "pokemon-booster-new-30e.html"
+    connector = FakeConnector(products={live_id: _product(live_id)})
+    source = _source(connector)
+    _flat(source, monkeypatch, _MANY_DEAD_THEN_LIVE_XML)
+
+    first = source.search("pokemon booster")
+    assert first == []  # five dead pages filled every slot
+
+    source._query_cache.clear()  # let the next cycle actually search again
+    second = source.search("pokemon booster")
+
+    assert [p.external_id for p in second] == [live_id]
+
+
+def test_a_dead_url_is_not_downloaded_again_on_the_next_cycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connector = FakeConnector(products={})
+    source = _source(connector)
+    _flat(source, monkeypatch, _MANY_DEAD_THEN_LIVE_XML)
+
+    source.search("pokemon booster old")
+    fetched_once = len(connector.fetched_ids)
+    source._query_cache.clear()
+    source.search("pokemon booster old")
+
+    assert len(connector.fetched_ids) == fetched_once
+
+
+def test_identical_search_is_answered_from_memory(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No search API behind a sitemap: every search is real page
+    downloads. The catalogue watch repeats the same query every minute
+    or two, so the result is reused for a short while."""
+    live_id = "pokemon-coffret-dresseur-elite-30e-anniversaire.html"
+    connector = FakeConnector(products={live_id: _product(live_id)})
+    source = _source(connector)
+    _flat(source, monkeypatch, _FLAT_URLSET_XML)
+
+    source.search("pokemon coffret")
+    source.search("pokemon coffret")
+
+    assert connector.fetched_ids == [live_id]

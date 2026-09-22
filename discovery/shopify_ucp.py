@@ -11,6 +11,7 @@ pipeline with no new connector logic.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from connectors.base import ConnectorProduct
@@ -22,6 +23,8 @@ from ucp.client import (
     call_tool,
     discover,
 )
+
+RATE_LIMIT_PAUSE_SECONDS = 300
 
 
 def _minor_to_decimal(amount: int) -> Decimal:
@@ -41,10 +44,24 @@ class ShopifyUCPDiscoverySource(RetailDiscoverySource):
         self._merchant_name = merchant_name
         self._agent_profile_url = agent_profile_url
         self._timeout = timeout
+        # Found live 21-22/09: ucp/client.py raises on a 429, but nothing
+        # remembered it, so the very next catalogue-watch cycle (seconds
+        # later) hit the merchant again — Kairyu and RelicTCG answered
+        # 429 on nearly every cycle. A rate limit is now honoured: the
+        # source stays parked, making no request at all, until the pause
+        # has elapsed. The UCP client does not surface Retry-After, hence
+        # a fixed, conservative pause.
+        self._retry_not_before: datetime | None = None
 
     def search(
         self, query: str, *, ean: str | None = None, mpn: str | None = None, limit: int = 10
     ) -> list[ConnectorProduct]:
+        now = datetime.now(UTC)
+        if self._retry_not_before is not None and now < self._retry_not_before:
+            raise DiscoveryUnavailableError(
+                f"{self._merchant_name}: rate limited, not retrying before "
+                f"{self._retry_not_before.isoformat()}"
+            )
         if not self._agent_profile_url:
             raise DiscoveryUnavailableError(
                 f"{self._merchant_name}: PURCHASE_UCP_AGENT_PROFILE_URL is not configured."
@@ -75,6 +92,12 @@ class ShopifyUCPDiscoverySource(RetailDiscoverySource):
                 timeout=self._timeout,
             )
         except UCPError as exc:
+            if getattr(exc, "code", None) == 429:
+                self._retry_not_before = now + timedelta(seconds=RATE_LIMIT_PAUSE_SECONDS)
+                raise DiscoveryUnavailableError(
+                    f"{self._merchant_name}: rate limited (429), pausing "
+                    f"{RATE_LIMIT_PAUSE_SECONDS}s"
+                ) from exc
             raise DiscoveryError(f"{self._merchant_name} UCP search failed: {exc}") from exc
 
         products: list[ConnectorProduct] = []

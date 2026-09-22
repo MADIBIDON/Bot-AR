@@ -964,7 +964,12 @@ def cmd_keywords(args: argparse.Namespace) -> int:
             print(f"Invalid value: {exc}")
             return 1
         watch = crud.create_keyword_watch(
-            session, args.keyword, max_price=max_price, check_interval=interval
+            session,
+            args.keyword,
+            max_price=max_price,
+            check_interval=interval,
+            sealed_only=not args.all_types,
+            exclude_terms=args.exclude,
         )
         print(
             f"keyword watch {watch.id} created: {watch.keyword!r} max_price={watch.max_price} "
@@ -981,11 +986,38 @@ def cmd_keywords(args: argparse.Namespace) -> int:
         for w in watches:
             seen = len(w.seen)
             status = "ACTIVE" if w.enabled else "DISABLED"
+            mode = "sealed" if w.sealed_only else "all-types"
             cap = f"{w.max_price}EUR" if w.max_price is not None else "-"
             print(
                 f"{w.id:<4} | {w.keyword[:32]:<32} | {cap:>9} | {w.check_interval:>6}s | "
-                f"{status} ({seen} seen)"
+                f"{status} {mode} ({seen} seen)"
             )
+        return 0
+
+    if action == "edit":
+        try:
+            max_price = (
+                _parse_positive_decimal("max-price", args.max_price) if args.max_price else None
+            )
+            interval = _parse_positive_int("interval", args.interval) if args.interval else None
+        except ValueError as exc:
+            print(f"Invalid value: {exc}")
+            return 1
+        watch = crud.update_keyword_watch(
+            session,
+            args.keyword_id,
+            exclude_terms=args.exclude,
+            clear_exclude_terms=args.exclude == "",
+            max_price=max_price,
+            check_interval=interval,
+        )
+        if watch is None:
+            print(f"No keyword watch {args.keyword_id}")
+            return 1
+        print(
+            f"keyword watch {watch.id} {watch.keyword!r}: exclude={watch.exclude_terms!r} "
+            f"max_price={watch.max_price} interval={watch.check_interval}s"
+        )
         return 0
 
     if action in ("enable", "disable"):
@@ -1014,7 +1046,8 @@ def cmd_keywords(args: argparse.Namespace) -> int:
         print(
             f"keyword {result.keyword!r}: {result.searched_merchants} merchant(s) searched, "
             f"{len(result.finds)} find(s), {len(result.failed_merchants)} failed, "
-            f"{result.suppressed_over_max_price} over max_price"
+            f"{result.suppressed_over_max_price} over max_price, "
+            f"{result.suppressed_irrelevant} filtered as irrelevant"
         )
         for find in result.finds:
             p = find.product
@@ -1557,12 +1590,21 @@ def build_parser() -> argparse.ArgumentParser:
         "keywords", help="Standing catalogue searches — hear about products nobody typed in."
     )
     keywords_parser.add_argument(
-        "action", choices=("add", "list", "enable", "disable", "delete", "run")
+        "action", choices=("add", "list", "edit", "enable", "disable", "delete", "run")
     )
     keywords_parser.add_argument("keyword", nargs="?", default=None)
     keywords_parser.add_argument("--keyword-id", dest="keyword_id", type=int, default=None)
     keywords_parser.add_argument("--max-price", dest="max_price", default=None)
     keywords_parser.add_argument("--interval", default=None)
+    keywords_parser.add_argument(
+        "--all-types",
+        dest="all_types",
+        action="store_true",
+        help="Not trading cards (clothing, sneakers...): do not require a sealed product type.",
+    )
+    keywords_parser.add_argument(
+        "--exclude", default=None, help="Extra comma-separated exclusion terms for this watch."
+    )
     keywords_parser.set_defaults(func=cmd_keywords)
 
     status_parser = subparsers.add_parser("status", help="Show overall system status.")

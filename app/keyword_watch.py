@@ -30,8 +30,10 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
+from app.relevance import assess, parse_exclude_terms
 from database import crud
 from discovery.base import DiscoveryError, DiscoveryUnavailableError
+from notifications.dedup import get_default_cooldown
 from notifications.discord.formatter import format_catalog_find_embed
 
 if TYPE_CHECKING:
@@ -63,6 +65,7 @@ class KeywordWatchResult:
     failed_merchants: tuple[tuple[str, str], ...]
     finds: tuple[KeywordFind, ...]
     suppressed_over_max_price: int
+    suppressed_irrelevant: int = 0
 
 
 def _classify(
@@ -93,12 +96,14 @@ def run_keyword_watch(
     finds: list[KeywordFind] = []
     failures: list[tuple[str, str]] = []
     suppressed = 0
+    irrelevant = 0
     searched = 0
+    extra_excludes = parse_exclude_terms(watch.exclude_terms)
 
     for merchant in registry.names():
         try:
             source = registry.get(merchant)
-            results = source.search(watch.keyword, limit=10)
+            results = source.search(watch.keyword, limit=20)
             searched += 1
         except DiscoveryUnavailableError as exc:
             failures.append((merchant, str(exc)))
@@ -109,6 +114,19 @@ def run_keyword_watch(
             continue
 
         for product in results:
+            # A shop's search engine is a recall tool, not a relevance
+            # filter (21/09: "pokemon 30 ans" returned a JPN booster, a
+            # backpack and promo singles). Irrelevant hits are dropped
+            # before being recorded at all — see app/relevance.py.
+            verdict = assess(
+                product.name,
+                keyword=watch.keyword,
+                sealed_only=watch.sealed_only,
+                extra_exclude_terms=extra_excludes,
+            )
+            if not verdict.relevant:
+                irrelevant += 1
+                continue
             reason = _classify(session, watch, merchant, product)
             crud.upsert_keyword_watch_seen(
                 session,
@@ -140,6 +158,7 @@ def run_keyword_watch(
         failed_merchants=tuple(failures),
         finds=tuple(finds),
         suppressed_over_max_price=suppressed,
+        suppressed_irrelevant=irrelevant,
     )
 
 
@@ -153,6 +172,18 @@ async def notify_keyword_finds(
     raised — a lost alert must not take the watch loop down with it."""
     sent = 0
     for find in result.finds:
+        # Two watches ("pokemon 30 ans" and "pokemon 30eme anniversaire")
+        # routinely find the same listing — observed live 21/09, where
+        # every Hikaru item was recorded twice. Keyed on the listing
+        # itself, not the watch, so it alerts once whichever watch finds
+        # it first; same cooldown and price rule as monitoring alerts.
+        if not get_default_cooldown().should_send(
+            watch_rule_id=0,
+            event_type=f"catalog:{find.reason}:{find.merchant}:{find.product.external_id}",
+            price=str(find.product.price),
+            now=datetime.now(UTC),
+        ):
+            continue
         embed = format_catalog_find_embed(
             product=find.product,
             merchant=find.merchant,

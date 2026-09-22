@@ -59,6 +59,8 @@ DEFAULT_CACHE_TTL_SECONDS = 3600.0  # re-crawl at most once an hour per retailer
 _MAX_SITEMAP_FILES = 25
 _MAX_URLS_PER_SOURCE = 300_000
 _MAX_PRODUCT_PAGE_FETCHES = 5
+_DEAD_URL_TTL = timedelta(hours=6)
+_QUERY_CACHE_TTL = timedelta(minutes=10)
 
 _SITEMAP_NS = "{http://www.sitemaps.org/schemas/sitemap/0.9}"
 
@@ -83,6 +85,21 @@ class SitemapDiscoverySource(RetailDiscoverySource):
         )
         self._cached_urls: list[str] | None = None
         self._cached_at: datetime | None = None
+        # Found live 22/09: a sitemap keeps URLs of long-delisted products
+        # (La Grande Récré still lists Épée & Bouclier boosters that now
+        # redirect to a category page). Only the first
+        # _MAX_PRODUCT_PAGE_FETCHES matches are fetched, so those dead
+        # URLs took every slot on every cycle — live products further
+        # down were never looked at, and the same dead pages were
+        # re-downloaded forever. A URL that fails is now skipped for a
+        # while, freeing its slot for the next candidate.
+        self._dead_until: dict[str, datetime] = {}
+        # Every search costs up to _MAX_PRODUCT_PAGE_FETCHES real page
+        # downloads (there is no search API behind a sitemap). The
+        # catalogue watch repeats the same queries every minute or two,
+        # so identical searches are answered from memory for a short
+        # while instead of re-downloading the same pages each time.
+        self._query_cache: dict[tuple[str, int], tuple[datetime, list[ConnectorProduct]]] = {}
 
     def search(
         self, query: str, *, ean: str | None = None, mpn: str | None = None, limit: int = 10
@@ -91,6 +108,12 @@ class SitemapDiscoverySource(RetailDiscoverySource):
         if not query_words:
             return []
 
+        now = datetime.now(UTC)
+        cache_key = (" ".join(sorted(query_words)), limit)
+        cached = self._query_cache.get(cache_key)
+        if cached is not None and now - cached[0] < _QUERY_CACHE_TTL:
+            return list(cached[1])
+
         try:
             urls = self._get_catalog_urls()
         except DiscoveryError:
@@ -98,10 +121,13 @@ class SitemapDiscoverySource(RetailDiscoverySource):
         except Exception as exc:  # noqa: BLE001 - a crawl failure is a discovery failure, not a crash
             raise DiscoveryError(f"{self._merchant_name}: sitemap crawl failed: {exc}") from exc
 
-        matches = [url for url in urls if _slug_matches(url, query_words)][
-            :_MAX_PRODUCT_PAGE_FETCHES
-        ]
+        matches = [
+            url
+            for url in urls
+            if _slug_matches(url, query_words) and self._dead_until.get(url, now) <= now
+        ][:_MAX_PRODUCT_PAGE_FETCHES]
         if not matches:
+            self._query_cache[cache_key] = (now, [])
             return []
 
         products: list[ConnectorProduct] = []
@@ -110,12 +136,20 @@ class SitemapDiscoverySource(RetailDiscoverySource):
             try:
                 products.append(self._connector.get_product(external_id))
             except ProductNotFoundError:
-                continue  # sitemap entry is stale (page removed since the crawl) — not an error
+                # Sitemap entry is stale (page removed since the crawl).
+                self._dead_until[url] = now + _DEAD_URL_TTL
+                continue
             except ConnectorError as exc:
+                self._dead_until[url] = now + _DEAD_URL_TTL
                 logger.warning(
-                    "%s: sitemap match %r could not be fetched: %s", self._merchant_name, url, exc
+                    "%s: sitemap match %r could not be fetched (skipped for %dh): %s",
+                    self._merchant_name,
+                    url,
+                    _DEAD_URL_TTL.total_seconds() // 3600,
+                    exc,
                 )
                 continue
+        self._query_cache[cache_key] = (now, list(products))
         return products
 
     def _get_catalog_urls(self) -> list[str]:

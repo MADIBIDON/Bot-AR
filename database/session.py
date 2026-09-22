@@ -178,6 +178,13 @@ _WATCH_RULE_ALERTING_COLUMNS = {
 # cadence near a release — see app/discovery.py::is_discovery_due()).
 _PRODUCT_RELEASE_COLUMNS = {"scheduled_release_at": "DATETIME"}
 
+# Catalogue-watch relevance settings (app/relevance.py), added after the
+# keyword_watches table already existed in real databases.
+_KEYWORD_WATCH_RELEVANCE_COLUMNS = {
+    "sealed_only": "BOOLEAN NOT NULL DEFAULT 1",
+    "exclude_terms": "TEXT",
+}
+
 # Phase 33 — cross-listing purchase idempotency. See PurchaseAttempt's own
 # docstring in database/models.py for why this closes a real gap (one
 # active/purchased attempt per *product*, not just per listing).
@@ -208,6 +215,7 @@ def create_all(engine: Engine) -> None:
     _ensure_columns(engine, "products", _PRODUCT_OPPORTUNITY_COLUMNS)
     _ensure_columns(engine, "products", _PROFITABILITY_THRESHOLD_COLUMNS)
     _ensure_columns(engine, "products", _PRODUCT_RELEASE_COLUMNS)
+    _ensure_columns(engine, "keyword_watches", _KEYWORD_WATCH_RELEVANCE_COLUMNS)
     _ensure_columns(engine, "watch_rules", _PROFITABILITY_THRESHOLD_COLUMNS)
     _ensure_columns(engine, "watch_rules", _WATCH_RULE_ALERTING_COLUMNS)
     _ensure_columns(engine, "purchase_attempts", _PURCHASE_ATTEMPT_PRODUCT_COLUMN)
